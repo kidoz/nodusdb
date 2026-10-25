@@ -14,4 +14,6 @@ cargo bench --locked -p nodus_integration_tests --bench server_bench
 The second command runs the [server SQL workloads](workloads/server_sql.md).
 See [Run the benchmarks](../docs/how-to/run-benchmarks.md) for smoke mode and
 result-recording rules, and the [2026-10-24 server baseline](reports/server-baseline-2026-10-24.md)
-for the current measurements and evidence limits.
+for the current measurements and evidence limits. The
+[release qualification manifest](reports/release-qualification-2026-10-25.md) records
+the clean-commit local, hosted-CI, recovery, and release-gate evidence.

@@ -145,8 +145,8 @@ job always sets them, so its pass cannot be a vacuous skip.
     rejected without replacing the original. A restored node must use an isolated
     repository prefix before resuming normal archiving until automatic timeline
     allocation is implemented. The current check is not an atomic cross-writer
-    conditional put; concurrent repository writers require the distributed
-    coordination milestone, not independent node archivers pointed at one prefix.
+    conditional put; concurrent repository writers require distributed
+    coordination, not independent node archivers pointed at one prefix.
 13. On clusters that finalized the migration level, every backup create is
     journaled on the meta group before any export: one exporting job at a
     time, migrations refused while a job exports and vice versa, the job

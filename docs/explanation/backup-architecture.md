@@ -157,9 +157,9 @@ coordinator, and the coordination is the hard part:
 - Shard split, merge, and move either appear in the snapshot metadata or wait
   behind the backup barrier.
 
-The first distributed milestone supports cluster-level restore only. Database
-and table-level restore needs dependency ordering, schema filtering, and index
-validation to mature first.
+The current distributed implementation supports cluster-level restore only.
+Database and table-level restore also requires dependency ordering, schema
+filtering, and index validation.
 
 ### Job journal (implemented for single-participant exports)
 
@@ -222,44 +222,38 @@ Alert when archive lag exceeds the recovery point objective, when no completed
 backup exists inside the required window, when a restore test fails, or when
 repository verification finds checksum drift.
 
-## Roadmap
+## Current capabilities and limits
 
-Each phase has an exit gate; the gate is the point of the phase.
+**Versioned manifests.** V2/V1 preserves the old-reader boundary; level-2
+sources write security-complete V3/V2. Final manifests are the commit point and
+pending work is never listed. V2 remains readable, newer/unsupported pairs fail
+closed, and partially written backups are not restorable.
 
-**B1 — Versioned manifests (single-node scope complete).** V2/V1 preserves the
-old-reader boundary; level-2 sources write security-complete V3/V2. Final
-manifests are the commit point and pending work is never listed. *Gate passed:*
-V2 remains readable, newer/unsupported pairs fail closed, and partially written
-backups are not restorable.
+**Incremental backups.** Protected timestamps, changed versions, and tombstones
+chain to a verified parent. Full plus incremental restore covers inserts,
+updates, deletes, catalog changes, permissions, indexes, and restart persistence.
 
-**B2 — Real incremental backups (single-node scope complete).** Protected
-timestamps, changed versions, and tombstones chain to a verified parent. *Gate
-passed:* full plus incremental restore passes for inserts, updates, deletes,
-catalog changes, permissions, indexes, and restart persistence.
+**WAL archiving.** Per-segment indexes, lineage, checksum verification,
+retention-gated cleanup, idempotent publication, and graceful shutdown archiving
+exist. PITR selects the required segment range and rejects gaps or corrupted
+segments before execution. Automatic destination timelines and archive-lag
+metrics remain incomplete.
 
-**B3 — WAL archive contract (partial).** Per-segment indexes, lineage, checksum
-verification, retention-gated cleanup, idempotent publication, and graceful
-shutdown archiving exist. Automatic destination timelines and archive-lag
-metrics remain. *Gate passed locally:* PITR selects the required segment range
-and rejects gaps or corrupted segments before execution.
+**Restore.** Restore validates inputs, refuses non-empty or clustered
+destinations, fences mutation, supports same-identity retry, and checks catalog,
+rows, permissions, and indexes through drills. A formal resumable job state
+machine and automatic restored timeline are not yet available.
 
-**B4 — Restore engine (partial).** Restore validates inputs, refuses non-empty
-or clustered destinations, fences mutation, supports same-identity retry, and
-checks catalog, rows, permissions, and indexes through drills. *Remaining:* a
-formal resumable job state machine and automatic restored timeline.
+**Scheduling and job control.** Scheduled backups, pause, resume, cancel, retry,
+inspection, durable job state, and CLI/admin job controls are not yet available.
 
-**B5 — Scheduler and job control.** Scheduled backups, pause, resume, cancel,
-retry, inspect, durable job state, CLI and admin controls. *Gate:* jobs survive
-restart, cancellation is explicit, every transition is audited.
+**Distributed backup.** The meta-group job journal, backup/migration barrier,
+per-shard object layout with manifest coverage, and fresh-cluster restore are
+implemented; a three-node mTLS cluster backup covers every shard exactly once.
+Exports do not yet run through per-shard participants on their own nodes, and
+locality-aware destinations remain incomplete.
 
-**B6 — Distributed backup (partially landed).** The meta-group job journal,
-backup/migration barrier, per-shard object layout with manifest coverage, and
-fresh-cluster restore are implemented; a three-node mTLS cluster backup covers
-every shard exactly once. *Remaining:* exports distributed across per-shard
-participants on their own nodes, and locality-aware destinations.
-
-**B7 — Restore drills and policy (partial).** Filesystem and live-S3 drills
-persist JSON/Prometheus reports with measured recovery time and observed data
-loss; alerts cover missing, stale, and failed drills. *Remaining:* built-in
-scheduling and a policy that denies production-ready status based on drill
-evidence.
+**Restore drills and policy.** Filesystem and live-S3 drills persist
+JSON/Prometheus reports with measured recovery time and observed data loss;
+alerts cover missing, stale, and failed drills. Built-in drill scheduling and
+policy enforcement based on drill evidence remain incomplete.

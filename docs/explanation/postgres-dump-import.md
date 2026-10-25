@@ -133,18 +133,18 @@ completely?" becomes a question with a machine-readable answer, and "clean
 import" gets a precise definition — an empty `lossy` array and an empty
 `failures` array.
 
-## Delivery, and what is left
+## Supported behavior and remaining limits
 
-1. **Phase 1 — the library and a CLI command.** Splitter, classifier, rewriter,
-   constraint folding, batched replay, and the report. *Done.*
-2. **Phase 2 — inline `COPY` decoding.** The text and CSV decoder, so stock
-   plain dumps import without `--inserts`. *Done.*
-3. **Phase 3 — server-side `COPY FROM STDIN`.** The wire handler decodes frames
-   and routes rows to the executor under one transaction per `COPY`, and the
-   admin endpoint accepts a streamed dump body. *Done.*
-4. **Phase 4 — fidelity.** Model sequences and identity, deferred foreign keys,
-   and first-class `DATE`, `TIMESTAMP`, `NUMERIC`, and `UUID` types. *Not
-   started.* Each item independently removes an entry from the lossy list.
+The importer provides statement splitting, classification, rewriting,
+constraint folding, batched replay, and a versioned report through the library
+and CLI. Its text and CSV decoder imports stock plain dumps without `--inserts`.
+The wire handler also decodes `COPY FROM STDIN` frames and routes rows to the
+executor under one transaction per `COPY`; the admin endpoint accepts a streamed
+dump body.
+
+Sequences and identity, deferred foreign keys, and first-class `DATE`,
+`TIMESTAMP`, `NUMERIC`, and `UUID` handling remain incomplete. Each can currently
+contribute an entry to the report's lossy list.
 
 Two limitations are worth naming because they surprise people. Column defaults
 are now modelled in the catalog, but the importer still strips them, because a

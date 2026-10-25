@@ -5,21 +5,21 @@ newer reader. Both contain the bootstrap-authentication and local WAL-retention
 fixes. The older reader still lacks admission commands; patching these defects
 must not erase the protocol boundary being tested.
 
-The October 19, 2026 pinned-pair run **passed all thirteen checkpoints in 277.55 seconds**
-with `passed: true`, `matrix_completed: true` and an empty blocker list. The
-October 24 working-tree candidate run at commit
-`45106f9ffabe8f9fe58dd912004fdeaf6d30a69c` plus patch
-`58ef1210f32520ca6533ef66900cdc8e008cecf92f186b82da6734c3267a4925`
-(binary `5892ac94d7e12f83b5fc3c42cd34ab0cb2f4144cae1229861ea56516eba6615e`)
-also **passed all thirteen checkpoints in 278.416 seconds**, with the same
-acceptance fields and no blockers. The candidate includes the level-3 migration
-and cluster-backup work plus the prepared-query and transaction-lock fixes; the
-matrix proves the level 1→2 flows and record formats are unchanged for mixed
-binaries. The pinned run did not use `--candidate`; neither run used
-`--diagnose`. Both snapshot directions, executable rollback before admission,
-admission refusals, four-node admission and crash/restart recovery passed. All
-five committed rows survived; the aborted row remained absent. No
-snapshot-login restart was needed.
+The October 25 clean candidate run at commit
+`c3f31f942b32afe22143d52e3e796728ba738df3` with an empty source patch **passed
+all thirteen checkpoints**, with `passed: true`, `matrix_completed: true`, no
+blockers, and no diagnostic restarts. Its binary SHA-256 is
+`80fcdd79a46fe1889a36452a824ef37d5da706bbb26254ed8cdf3c9410b6fbf9`. Both
+snapshot directions, executable rollback before admission, admission refusals,
+four-node admission, and crash/restart recovery passed. All five committed rows
+survived; the aborted row remained absent. See the
+[release qualification manifest](../../benchmarks/reports/release-qualification-2026-10-25.md).
+
+The October 19 pinned-pair run also passed all thirteen checkpoints in 277.55
+seconds. The October 24 working-tree candidate at commit `45106f9f` plus patch
+`58ef1210f32520ca6533ef66900cdc8e008cecf92f186b82da6734c3267a4925` passed in
+278.416 seconds. Those earlier runs qualify only their recorded sources; the
+clean October 25 candidate is the current release-qualification evidence.
 
 The maintenance baseline now includes the bounded atomic purge/recovery fix and a
 torn-recovery repair that drops a snapshot descriptor older than the reconciled
