@@ -15,7 +15,7 @@ jobs:
       - name: Install cargo-afl
         run: cargo install cargo-afl --locked --version 0.18.2
       - name: Build AFL runtime for the selected Rust compiler
-        run: cargo afl config --build
+        run: cargo afl config --build --force
       - name: Build fuzzer targets
         run: cd tests/fuzz && cargo afl build --locked
       - name: Seed AFL inputs
