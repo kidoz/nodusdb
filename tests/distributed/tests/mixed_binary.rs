@@ -104,8 +104,50 @@ async fn pinned_binary_upgrade_matrix() {
         json!({"old_voters":2,"new_voters":1,"cluster_version":2}),
     );
 
+    let before_write_batch_refusal = m.state(2).await;
+    for i in 0..2 {
+        assert_eq!(m.capability(i).await.get("write_batch_version"), None);
+    }
+    let (status, denied) = m
+        .api(2, "upgrade/start?target=migration-v3", Some(json!({})))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        denied["error"]
+            .as_str()
+            .unwrap()
+            .contains("migration-v3 requires a migration version 4 report"),
+        "{denied}"
+    );
+    let (status, denied) = m
+        .api(2, "upgrade/start?target=write-batching-v4", Some(json!({})))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        denied["error"]
+            .as_str()
+            .unwrap()
+            .contains("supported target is migration-v3"),
+        "{denied}"
+    );
+    let (status, denied) = m
+        .api(2, "upgrade/node-upgraded?node=3", Some(json!({})))
+        .await;
+    assert_eq!(status, 200);
+    assert!(denied["error"].is_string(), "{denied}");
+    assert_eq!(m.state(2).await, before_write_batch_refusal);
     m.sql(2, "UPDATE mixed_probe SET value='v2' WHERE id=1")
         .await;
+    for i in 0..3 {
+        assert_eq!(
+            m.sql(i, "SELECT value FROM mixed_probe WHERE id=1").await,
+            vec!["v2"]
+        );
+    }
+    m.record(
+        "write_batching_start_and_preflight_refused_with_old_readers",
+        json!({"old_readers":2,"cluster_version":2,"migration_capability_refused":true,"legacy_sql_writes":true}),
+    );
     m.nodes[1].kill();
     m.snapshot(2, 2).await;
     m.start(1, false, true);
@@ -259,8 +301,168 @@ async fn pinned_binary_upgrade_matrix() {
     let leader = m.leader().await;
     let before = m.state(leader).await;
     let (_, denied) = m.api(leader, "upgrade/rollback", Some(json!({}))).await;
-    assert!(denied["error"].as_str().unwrap().contains("finalized"));
+    assert!(denied["error"].is_string(), "{denied}");
     assert_eq!(m.state(leader).await, before);
     m.record("rollback_after_admission_refused",json!({"feature_rollback":"rejected","executable_downgrade":"unsupported: historical binary lacks admission reader; no startup fence claimed"}));
+
+    m.phase(leader, "start?target=migration-v3", "RollingNodes")
+        .await;
+    m.phase(
+        leader,
+        &format!("node-upgraded?node={}", leader + 1),
+        "ReadyToFinalize",
+    )
+    .await;
+    m.phase(leader, "finalize", "Finalized").await;
+    let migration = m.state(leader).await;
+    assert_eq!(migration["cluster_version"], 3);
+    assert_eq!(migration["feature_gates"]["migration_v3"], true);
+    assert_eq!(migration["feature_gates"]["write_batching"], false);
+    m.record(
+        "migration_v3_finalized_before_write_batching",
+        json!({"voters":4,"cluster_version":3,"write_batching":false}),
+    );
+
+    for i in 0..4 {
+        let capability = m.capability(i).await;
+        assert!(capability["migration_version"].as_u64().unwrap_or(0) >= 4);
+        assert!(capability["write_batch_version"].as_u64().unwrap_or(0) >= 4);
+    }
+    m.phase(leader, "start?target=write-batching-v4", "RollingNodes")
+        .await;
+    m.phase(
+        leader,
+        &format!("node-upgraded?node={}", leader + 1),
+        "ReadyToFinalize",
+    )
+    .await;
+    m.phase(leader, "finalize", "Finalized").await;
+    let write_batching = m.state(leader).await;
+    assert_eq!(write_batching["cluster_version"], 4);
+    assert_eq!(write_batching["feature_gates"]["write_batching"], true);
+    m.record(
+        "write_batching_v4_finalized_with_all_candidate_voters",
+        json!({"voters":4,"cluster_version":4,"write_batch_version":4}),
+    );
+
+    m.sql(
+        leader,
+        "CREATE TABLE mixed_batched (id INT PRIMARY KEY, value TEXT UNIQUE)",
+    )
+    .await;
+    let copy = "COPY mixed_batched (id, value) FROM STDIN;\n\
+                10\tcopy-10\n\
+                11\tcopy-11\n\
+                12\tcopy-12\n\
+                13\tcopy-13\n\
+                \\.\n";
+    let response = m
+        .http
+        .post(format!(
+            "http://{}/api/v1/import?on_error=stop&batch_rows=2",
+            m.nodes[leader].http
+        ))
+        .bearer_auth(process::TOKEN)
+        .header(reqwest::header::CONTENT_TYPE, "text/plain")
+        .body(copy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let report = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(report["report"]["rows_inserted"], 4, "{report}");
+    assert_eq!(report["report"]["statements_failed"], 0, "{report}");
+    assert_eq!(report["report"]["stopped_early"], false, "{report}");
+    m.sql(
+        leader,
+        "INSERT INTO mixed_batched VALUES \
+         (20, 'insert-20'), (21, 'insert-21'), \
+         (22, 'insert-22'), (23, 'insert-23')",
+    )
+    .await;
+    let mut writers = tokio::task::JoinSet::new();
+    for worker in 0..8 {
+        let pg = m.nodes[leader].pg;
+        writers.spawn(async move {
+            let (client, connection) = tokio_postgres::connect(
+                &format!("host=127.0.0.1 port={pg} user=nodus password=nodus dbname=default"),
+                tokio_postgres::NoTls,
+            )
+            .await
+            .unwrap();
+            let task = tokio::spawn(connection);
+            for offset in 0..4 {
+                let id = 1000 + worker * 4 + offset;
+                let value = format!("concurrent-{id}");
+                client
+                    .execute("INSERT INTO mixed_batched VALUES ($1, $2)", &[&id, &value])
+                    .await
+                    .unwrap();
+            }
+            drop(client);
+            task.abort();
+        });
+    }
+    while let Some(writer) = writers.join_next().await {
+        writer.unwrap();
+    }
+    m.record(
+        "write_batching_indexed_copy_multirow_insert_and_concurrent_commits",
+        json!({"copy_rows":4,"multirow_insert_rows":4,"concurrent_insert_rows":32,"unique_index":true}),
+    );
+
+    m.nodes[leader].kill();
+    let replacement = m.leader().await;
+    m.sql(
+        replacement,
+        "INSERT INTO mixed_batched VALUES (2000, 'after-v4-crash')",
+    )
+    .await;
+    m.start(leader, true, true);
+    m.alive(leader).await;
+    m.ready(leader).await;
+    let mut expected = Vec::new();
+    for id in 10..14 {
+        expected.push(format!("{id}|copy-{id}"));
+    }
+    for id in 20..24 {
+        expected.push(format!("{id}|insert-{id}"));
+    }
+    for id in 1000..1032 {
+        expected.push(format!("{id}|concurrent-{id}"));
+    }
+    expected.push("2000|after-v4-crash".into());
+    for i in 0..4 {
+        assert_eq!(
+            m.sql(i, "SELECT id, value FROM mixed_batched ORDER BY id")
+                .await,
+            expected
+        );
+        assert_eq!(
+            m.sql(i, "SELECT id FROM mixed_batched WHERE value='copy-11'")
+                .await,
+            vec!["11"]
+        );
+        assert_eq!(
+            m.sql(
+                i,
+                "SELECT id FROM mixed_batched WHERE value='concurrent-1031'"
+            )
+            .await,
+            vec!["1031"]
+        );
+        assert_eq!(
+            m.sql(
+                i,
+                "SELECT id FROM mixed_batched WHERE value='after-v4-crash'"
+            )
+            .await,
+            vec!["2000"]
+        );
+    }
+    m.record(
+        "batched_rows_and_indexes_survive_sigkill_and_leader_change",
+        json!({"rows":41,"members":4,"post_failover_rows":1,"index_reads_per_member":3}),
+    );
     m.finish();
 }

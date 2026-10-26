@@ -157,7 +157,7 @@ def main():
         raise SystemExit(f"FAIL: {error}; see {out / 'test.log'} and {out / 'results.json'}") from error
     result = json.loads((out / "results.json").read_text())
     require(result["passed"] is True and result["matrix_completed"] is True
-            and len(result["checks"]) == 13 and not result["blockers"], "incomplete or blocked matrix")
+            and len(result["checks"]) == 18 and not result["blockers"], "incomplete or blocked matrix")
     print(f"PASS: {len(result['checks'])} checkpoints; see {out / 'results.json'}", flush=True)
 
 
