@@ -209,9 +209,10 @@ impl WalEngine for FileWalEngine {
             use nodus_common::versioned::{Envelope, decode};
             match decode(&data) {
                 Envelope::Versioned { version, payload } if version == WAL_RECORD_VERSION => {
-                    if let Ok(record) = serde_json::from_slice(payload) {
-                        records.push(record);
-                    }
+                    let record = serde_json::from_slice(payload).map_err(|error| {
+                        anyhow::anyhow!("failed to decode WAL record version {version}: {error}")
+                    })?;
+                    records.push(record);
                 }
                 Envelope::Versioned { version, .. } => {
                     anyhow::bail!(
@@ -357,6 +358,28 @@ mod tests {
         write_legacy_frame(&path, &future);
 
         assert!(FileWalEngine::new(&path).unwrap().recover().is_err());
+    }
+
+    #[test]
+    fn recover_rejects_undecodable_supported_version_payloads() {
+        for payload in [b"{}".as_slice(), br#"{"V1":{"UnknownRecord":{}}}"#] {
+            let file = NamedTempFile::new().unwrap();
+            let path = file.path().to_path_buf();
+            let engine = FileWalEngine::new(&path).unwrap();
+            engine.append(checkpoint(1)).unwrap();
+            engine.sync().unwrap();
+            let data = nodus_common::versioned::encode(WAL_RECORD_VERSION, payload);
+            write_legacy_frame(&path, &data);
+            engine.append(checkpoint(2)).unwrap();
+            engine.sync().unwrap();
+
+            let error = engine.recover().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("failed to decode WAL record version 1")
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

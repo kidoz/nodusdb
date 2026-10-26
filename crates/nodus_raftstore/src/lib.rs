@@ -615,15 +615,15 @@ impl RaftMetaStore {
     }
 
     /// Reads the persisted vote. Distinguishes a genuine first boot (key
-    /// absent) from a storage read failure: the error is propagated so the
-    /// caller fails closed. Dropping a persisted vote would let a restarted
+    /// absent) from a storage read or decode failure: the error is propagated so
+    /// the caller fails closed. Dropping a persisted vote would let a restarted
     /// node vote again in the same term — a double-vote election-safety
     /// violation.
     fn load_vote(&self) -> anyhow::Result<Option<Vote<u64>>> {
-        Ok(self
-            .kv
+        self.kv
             .get(RAFT_VOTE_KEY, u64::MAX)?
-            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok())))
+            .map(|bytes| decode_raft_json(&bytes, "vote"))
+            .transpose()
     }
 
     fn delete_entry(&self, index: u64) -> anyhow::Result<()> {
@@ -641,11 +641,16 @@ impl RaftMetaStore {
         };
         for pair in self.kv.scan(range, u64::MAX)? {
             let pair = pair?;
-            if let Some(entry) = decode_raft(&pair.value)
-                .and_then(|p| serde_json::from_slice::<Entry<NodusTypeConfig>>(p).ok())
-            {
-                out.insert(entry.log_id.index, entry);
-            }
+            let payload = decode_raft(&pair.value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported persisted Raft log envelope at key {:?}",
+                    pair.key
+                )
+            })?;
+            let entry = serde_json::from_slice::<Entry<NodusTypeConfig>>(payload).map_err(|e| {
+                anyhow::anyhow!("decode persisted Raft log entry at key {:?}: {e}", pair.key)
+            })?;
+            out.insert(entry.log_id.index, entry);
         }
         Ok(out)
     }
@@ -656,25 +661,25 @@ impl RaftMetaStore {
     }
 
     /// Reads the persisted applied-state (applied pointer, membership, purge
-    /// watermark). Absence means a first boot (default state); a storage read
-    /// failure is propagated so recovery cannot silently restart from zero and
-    /// re-apply or lose committed state.
+    /// watermark). Absence means a first boot (default state); storage read and
+    /// decode failures propagate so recovery cannot silently restart from zero
+    /// and re-apply or lose committed state.
     fn load_applied(&self) -> anyhow::Result<AppliedState> {
-        Ok(self
-            .kv
+        self.kv
             .get(RAFT_APPLIED_KEY, u64::MAX)?
-            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
-            .unwrap_or_default())
+            .map(|bytes| decode_raft_json(&bytes, "applied state"))
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 
     /// Reads the persisted snapshot metadata. Absence means no snapshot was
-    /// ever built; a storage read failure is propagated so a restarted node
-    /// does not wrongly conclude it has no snapshot to resume from.
+    /// ever built; storage read and decode failures propagate so a restarted
+    /// node does not wrongly conclude it has no snapshot to resume from.
     fn load_snapshot_meta(&self) -> anyhow::Result<Option<NodusSnapshotMeta>> {
-        Ok(self
-            .kv
+        self.kv
             .get(RAFT_SNAPSHOT_META_KEY, u64::MAX)?
-            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok())))
+            .map(|bytes| decode_raft_json(&bytes, "snapshot metadata"))
+            .transpose()
     }
 }
 
@@ -689,8 +694,7 @@ fn encode_raft(payload: Vec<u8>) -> Vec<u8> {
 
 /// Returns the payload of a persisted Raft record for a supported version, or
 /// legacy (pre-envelope) bytes. Returns `None` for an unrecognized future
-/// version, so a load path treats that state as absent — the node re-syncs it
-/// from the leader — rather than misparsing a format it does not understand.
+/// version so each caller can apply its own fail-closed recovery policy.
 fn decode_raft(bytes: &[u8]) -> Option<&[u8]> {
     use nodus_common::versioned::{Envelope, decode};
     match decode(bytes) {
@@ -698,6 +702,16 @@ fn decode_raft(bytes: &[u8]) -> Option<&[u8]> {
         Envelope::Versioned { .. } => None,
         Envelope::Legacy(legacy) => Some(legacy),
     }
+}
+
+fn decode_raft_json<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    record: &str,
+) -> anyhow::Result<T> {
+    let payload = decode_raft(bytes)
+        .ok_or_else(|| anyhow::anyhow!("unsupported persisted Raft {record} envelope"))?;
+    serde_json::from_slice(payload)
+        .map_err(|e| anyhow::anyhow!("decode persisted Raft {record}: {e}"))
 }
 
 pub struct StateMachine {
@@ -1684,6 +1698,75 @@ mod tests {
         assert_eq!(decode_raft(&future), None);
     }
 
+    fn reopen_with_raw_record(key: &[u8], record: Vec<u8>) -> anyhow::Error {
+        let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let txn = TxnId::new();
+        kv.write_intent(txn, Bytes::copy_from_slice(key), Bytes::from(record))
+            .unwrap();
+        kv.commit(txn, 1).unwrap();
+        match NodusRaftStore::with_kv(kv) {
+            Ok(_) => panic!("construction must reject an unreadable Raft record"),
+            Err(e) => e,
+        }
+    }
+
+    fn reopen_with_raw_log_record(record: Vec<u8>) -> anyhow::Error {
+        reopen_with_raw_record(&log_key(1), record)
+    }
+
+    fn pointer_records() -> [(&'static [u8], &'static str); 3] {
+        [
+            (RAFT_VOTE_KEY, "vote"),
+            (RAFT_APPLIED_KEY, "applied state"),
+            (RAFT_SNAPSHOT_META_KEY, "snapshot metadata"),
+        ]
+    }
+
+    #[test]
+    fn store_construction_fails_closed_on_unknown_log_envelope() {
+        let future = nodus_common::versioned::encode(RAFT_RECORD_VERSION + 1, b"{}");
+        let err = reopen_with_raw_log_record(future);
+        assert!(
+            err.to_string()
+                .contains("unsupported persisted Raft log envelope"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn store_construction_fails_closed_on_malformed_log_entry_json() {
+        let err = reopen_with_raw_log_record(encode_raft(b"{not-json".to_vec()));
+        assert!(
+            err.to_string().contains("decode persisted Raft log entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn store_construction_fails_closed_on_unknown_pointer_envelopes() {
+        for (key, record) in pointer_records() {
+            let future = nodus_common::versioned::encode(RAFT_RECORD_VERSION + 1, b"{}");
+            let err = reopen_with_raw_record(key, future);
+            assert!(
+                err.to_string()
+                    .contains(&format!("unsupported persisted Raft {record} envelope")),
+                "unexpected {record} error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_construction_fails_closed_on_malformed_pointer_payloads() {
+        for (key, record) in pointer_records() {
+            let err = reopen_with_raw_record(key, encode_raft(b"{not-json".to_vec()));
+            assert!(
+                err.to_string()
+                    .contains(&format!("decode persisted Raft {record}")),
+                "unexpected {record} error: {err}"
+            );
+        }
+    }
+
     fn blank_entry(term: u64, index: u64) -> Entry<NodusTypeConfig> {
         Entry {
             log_id: LogId::new(openraft::CommittedLeaderId::new(term, 1), index),
@@ -1885,6 +1968,11 @@ mod tests {
         let store = NodusRaftStore::with_kv(engine).unwrap();
         assert!(store.log.blocking_read().is_empty());
         assert!(store.vote.blocking_read().is_none());
+        let state_machine = store.state_machine.blocking_read();
+        assert!(state_machine.last_applied_log.is_none());
+        assert!(state_machine.last_purged.is_none());
+        drop(state_machine);
+        assert!(store.current_snapshot_meta.blocking_read().is_none());
     }
 
     /// A failed durable append is returned to openraft and the entry never
