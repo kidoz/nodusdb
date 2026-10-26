@@ -372,6 +372,24 @@ pub(crate) fn apply(
             error: None,
         });
     }
+    if matches!(cmd.operation, OperationV1::Start | OperationV1::Rollback) {
+        let ledger = admission::read(kv)?;
+        let rejection = match &cmd.operation {
+            OperationV1::Start if ledger.as_ref().is_some_and(|r| r.pending.is_some()) => {
+                Some("cannot start upgrade while member admission is pending")
+            }
+            OperationV1::Rollback if ledger.is_some() => {
+                Some("cannot rollback upgrade while an admission ledger exists")
+            }
+            _ => None,
+        };
+        if let Some(error) = rejection {
+            return Ok(ShardResponse {
+                success: false,
+                error: Some(error.into()),
+            });
+        }
+    }
     let next = match transition(&old, cmd, &sm.last_membership, index) {
         Ok(next) => next,
         Err(error) => {

@@ -114,15 +114,22 @@ pub fn approved(
     let mut result = members(&authority.membership)?;
     if let Some(record) = record {
         ensure!(
-            authority.phase == Phase::Finalized && record.authority_revision == authority.revision,
-            "admission authority anchor mismatch"
+            authority.phase != Phase::Idle && record.authority_revision <= authority.revision,
+            "admission authority phase or anchor mismatch"
         );
         for (id, member) in &record.admitted {
-            ensure!(
-                !result.contains_key(id) && !result.values().any(|a| a == &member.address),
-                "admission reuses a node ID or address"
-            );
-            result.insert(*id, member.address.clone());
+            if let Some(existing) = result.get(id) {
+                ensure!(
+                    existing == &member.address,
+                    "admission replaces a member address"
+                );
+            } else {
+                ensure!(
+                    !result.values().any(|a| a == &member.address),
+                    "admission reuses a node address"
+                );
+                result.insert(*id, member.address.clone());
+            }
         }
         ensure!(
             result.len() <= MAX_MEMBERS,
@@ -419,7 +426,7 @@ pub(crate) fn validate_snapshot(kv: &dyn KvEngine, bytes: &[u8]) -> Result<Recor
     let next = decode(bytes)?;
     if let Some(old) = read(kv)? {
         ensure!(
-            next.authority_revision == old.authority_revision && next.revision >= old.revision,
+            next.authority_revision >= old.authority_revision && next.revision >= old.revision,
             "snapshot rolls back admission authority"
         );
         ensure!(

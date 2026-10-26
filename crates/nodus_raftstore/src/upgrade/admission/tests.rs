@@ -54,6 +54,64 @@ fn approval(a: &super::super::RecordV1) -> CommandV1 {
         a.membership.clone(),
     )
 }
+fn completed_admission(a: &super::super::RecordV1) -> (RecordV1, StoredMembership<u64, BasicNode>) {
+    let approved = transition(a, None, &approval(a), &a.membership, 11).unwrap();
+    let learner = membership(vec![[1].into()], true);
+    let promote = command(Some(&approved), OperationV1::Promote, learner.clone());
+    let promoting = transition(a, Some(approved), &promote, &learner, 12).unwrap();
+    let stable = membership(vec![[1, 2].into()], true);
+    let complete = command(Some(&promoting), OperationV1::Complete, stable.clone());
+    let completed = transition(a, Some(promoting), &complete, &stable, 13).unwrap();
+    (completed, stable)
+}
+fn authority_command(
+    old: &super::super::RecordV1,
+    membership: &StoredMembership<u64, BasicNode>,
+    operation: super::super::OperationV1,
+) -> super::super::CommandV1 {
+    let session = Uuid::new_v4();
+    super::super::CommandV1 {
+        expected_revision: old.revision,
+        membership: membership.clone(),
+        session,
+        operation,
+        reports: membership
+            .membership()
+            .nodes()
+            .map(|(id, _)| {
+                let mut report = CapabilityV1::local(*id, session);
+                report.ready_for_finalize = true;
+                report
+            })
+            .collect(),
+    }
+}
+fn authority_state(membership: StoredMembership<u64, BasicNode>) -> crate::StateMachine {
+    crate::StateMachine {
+        last_applied_log: None,
+        last_membership: membership,
+        last_purged: None,
+        kv: None,
+        catalog_writer: None,
+        catalog_reader: None,
+        meta_store: Some(Arc::new(nodus_meta::MemMetaStore::new())),
+    }
+}
+fn persist_records(kv: &dyn KvEngine, a: &super::super::RecordV1, ledger: &RecordV1) {
+    for (key, value, revision) in [
+        (
+            super::super::KEY,
+            serde_json::to_vec(a).unwrap(),
+            a.revision,
+        ),
+        (KEY, serde_json::to_vec(ledger).unwrap(), ledger.revision),
+    ] {
+        let txn = TxnId::new();
+        kv.write_intent(txn, Bytes::from_static(key), Bytes::from(value))
+            .unwrap();
+        kv.commit(txn, revision).unwrap();
+    }
+}
 #[test]
 fn learner_promotion_and_joint_consensus_are_ordered_and_retryable() {
     let a = authority();
@@ -136,6 +194,11 @@ fn snapshots_cannot_erase_or_replace_admitted_identity() {
     .unwrap();
     kv.commit(txn, 11).unwrap();
     validate_snapshot(&kv, &serde_json::to_vec(&record).unwrap()).unwrap();
+    let (completed, _) = completed_admission(&a);
+    let mut later_admission = completed;
+    later_admission.authority_revision = 14;
+    later_admission.revision = 15;
+    validate_snapshot(&kv, &serde_json::to_vec(&later_admission).unwrap()).unwrap();
     for defect in 0..3 {
         let mut next = record.clone();
         next.revision += 1;
@@ -176,7 +239,8 @@ async fn snapshot_admission_requires_anchor_applied_index_and_no_omission() {
         let original = receiver.build_snapshot().await.unwrap();
         let mut next = ledger.clone();
         if defect == 1 {
-            next.authority_revision = 9;
+            next.authority_revision = 11;
+            next.revision = 12;
         }
         let mut bytes = Vec::new();
         crate::write_snapshot_header(&mut bytes, None)
@@ -301,4 +365,149 @@ fn level4_admission_requires_write_batch_capable_reports() {
     let mut legacy = approval(&a3);
     legacy.reports[1].write_batch_version = None;
     assert!(transition(&a3, None, &legacy, &a3.membership, 11).is_ok());
+}
+
+#[test]
+fn pending_admission_blocks_start_without_modifying_authority() {
+    let kv = nodus_storage_mem::MemKvEngine::new();
+    let a = authority();
+    let ledger = transition(&a, None, &approval(&a), &a.membership, 11).unwrap();
+    assert!(ledger.pending.is_some());
+    persist_records(&kv, &a, &ledger);
+    let sm = authority_state(a.membership.clone());
+    let start = authority_command(&a, &a.membership, super::super::OperationV1::Start);
+
+    let result = super::super::apply(&kv, &sm, &start, 15).unwrap();
+    assert!(!result.success);
+    assert!(result.error.unwrap().contains("admission is pending"));
+    assert_eq!(super::super::read(&kv).unwrap(), a);
+    assert_eq!(read(&kv).unwrap(), Some(ledger));
+}
+
+#[test]
+fn admission_ledger_blocks_rollback_without_modifying_authority() {
+    let kv = nodus_storage_mem::MemKvEngine::new();
+    let a = authority();
+    let (ledger, current) = completed_admission(&a);
+    persist_records(&kv, &a, &ledger);
+    let sm = authority_state(current.clone());
+    let start = authority_command(&a, &current, super::super::OperationV1::Start);
+    assert!(super::super::apply(&kv, &sm, &start, 15).unwrap().success);
+    let rolling = super::super::read(&kv).unwrap();
+    let rollback = authority_command(&rolling, &current, super::super::OperationV1::Rollback);
+
+    let result = super::super::apply(&kv, &sm, &rollback, 16).unwrap();
+    assert!(!result.success);
+    assert!(result.error.unwrap().contains("admission ledger exists"));
+    assert_eq!(super::super::read(&kv).unwrap(), rolling);
+    assert_eq!(read(&kv).unwrap(), Some(ledger));
+}
+
+#[test]
+fn active_upgrades_accept_ancestor_admission_for_startup_validation() {
+    let kv = nodus_storage_mem::MemKvEngine::new();
+    let a = authority();
+    let (ledger, current) = completed_admission(&a);
+    persist_records(&kv, &a, &ledger);
+    let sm = authority_state(current.clone());
+    let start = authority_command(&a, &current, super::super::OperationV1::Start);
+    assert!(super::super::apply(&kv, &sm, &start, 15).unwrap().success);
+
+    let rolling = super::super::read(&kv).unwrap();
+    assert_eq!(rolling.phase, Phase::RollingNodes);
+    assert_eq!(super::approved(&rolling, Some(&ledger)).unwrap().len(), 2);
+    validate_stable(&rolling, Some(&ledger), &current).unwrap();
+
+    let refresh = authority_command(&rolling, &current, super::super::OperationV1::Refresh);
+    assert!(super::super::apply(&kv, &sm, &refresh, 16).unwrap().success);
+    let ready = super::super::read(&kv).unwrap();
+    assert_eq!(ready.phase, Phase::ReadyToFinalize);
+    assert_eq!(super::approved(&ready, Some(&ledger)).unwrap().len(), 2);
+    validate_stable(&ready, Some(&ledger), &current).unwrap();
+
+    let mut idle = ready.clone();
+    idle.phase = Phase::Idle;
+    assert!(super::approved(&idle, Some(&ledger)).is_err());
+    let mut future = ledger.clone();
+    future.authority_revision = ready.revision + 1;
+    future.revision = ready.revision + 2;
+    assert!(super::approved(&ready, Some(&future)).is_err());
+    assert!(validate_stable(&ready, Some(&future), &current).is_err());
+}
+
+#[test]
+fn sequential_finalization_preserves_admission_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv =
+        Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(dir.path().join("kv"), None).unwrap());
+    let a = authority();
+    let (ledger, current) = completed_admission(&a);
+    let ledger_bytes = serde_json::to_vec(&ledger).unwrap();
+    persist_records(kv.as_ref(), &a, &ledger);
+    let sm = authority_state(current.clone());
+
+    for (level, first_index) in [(3, 15), (4, 18)] {
+        for (index, operation) in [
+            (first_index, super::super::OperationV1::Start),
+            (first_index + 1, super::super::OperationV1::Refresh),
+        ] {
+            let old = super::super::read(kv.as_ref()).unwrap();
+            let cmd = authority_command(&old, &current, operation);
+            assert!(
+                super::super::apply(kv.as_ref(), &sm, &cmd, index)
+                    .unwrap()
+                    .success
+            );
+        }
+        let ready = super::super::read(kv.as_ref()).unwrap();
+        let finalize = authority_command(&ready, &current, super::super::OperationV1::Finalize);
+        let index = first_index + 2;
+        assert_eq!(
+            kv.get(KEY, index - 1).unwrap().unwrap().as_ref(),
+            ledger_bytes
+        );
+        let result = super::super::apply(kv.as_ref(), &sm, &finalize, index).unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let authority = super::super::read(kv.as_ref()).unwrap();
+        let unchanged = read(kv.as_ref()).unwrap().unwrap();
+        assert_eq!(authority.cluster_version, level);
+        assert_eq!(authority.revision, index);
+        assert!(authority.revision > unchanged.authority_revision);
+        assert_eq!(unchanged, ledger);
+        assert_eq!(unchanged.authority_revision, a.revision);
+        assert_eq!(
+            super::approved(&authority, Some(&unchanged)).unwrap().len(),
+            2
+        );
+        assert_eq!(kv.get(KEY, index).unwrap().unwrap().as_ref(), ledger_bytes);
+        validate_snapshot(kv.as_ref(), &ledger_bytes).unwrap();
+
+        assert!(
+            super::super::apply(kv.as_ref(), &sm, &finalize, index)
+                .unwrap()
+                .success
+        );
+        assert_eq!(super::super::read(kv.as_ref()).unwrap(), authority);
+        assert_eq!(read(kv.as_ref()).unwrap(), Some(unchanged));
+    }
+    drop(kv);
+
+    let reopened = nodus_storage_lsm::LsmKvEngine::with_wal(dir.path().join("kv"), None).unwrap();
+    let authority = super::super::read(&reopened).unwrap();
+    let reopened_ledger = read(&reopened).unwrap().unwrap();
+    assert_eq!(authority.cluster_version, WRITE_BATCH_LEVEL);
+    assert!(authority.revision > reopened_ledger.authority_revision);
+    assert_eq!(reopened_ledger, ledger);
+    assert_eq!(reopened_ledger.authority_revision, a.revision);
+    assert_eq!(
+        super::approved(&authority, Some(&reopened_ledger))
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        reopened.get(KEY, u64::MAX).unwrap().unwrap().as_ref(),
+        ledger_bytes
+    );
 }
