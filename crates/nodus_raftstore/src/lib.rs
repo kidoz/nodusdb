@@ -286,9 +286,39 @@ pub enum ShardCommand {
         expected: std::collections::HashMap<nodus_catalog::ShardId, String>,
         placements: std::collections::HashMap<nodus_catalog::ShardId, String>,
     },
+    EpochWriteBatchV1 {
+        epoch: u64,
+        txn_id: uuid::Uuid,
+        operations: Vec<migration::EpochIntentOperationV1>,
+    },
+    EpochCommitBatchV1 {
+        epoch: u64,
+        commits: Vec<migration::EpochCommitV1>,
+    },
 }
 
 impl ShardCommand {
+    /// Fixed, low-cardinality command kinds for metrics and tracing.
+    pub fn metrics_kind(&self) -> &'static str {
+        match self {
+            Self::EpochWriteBatchV1 { .. } => "intent_batch",
+            Self::EpochCommitBatchV1 { .. } => "commit_batch",
+            Self::EpochWriteV1 { mutation, .. } => match mutation {
+                migration::EpochMutationV1::Put { .. } => "put_intent",
+                migration::EpochMutationV1::Delete { .. } => "delete_intent",
+                migration::EpochMutationV1::Prepare { .. } => "prepare",
+                migration::EpochMutationV1::Commit { .. } => "commit",
+            },
+            Self::PutIntent { .. } | Self::IndexPutIntent { .. } => "put_intent",
+            Self::DeleteIntent { .. } | Self::IndexDeleteIntent { .. } => "delete_intent",
+            Self::CommitTxn { .. } => "commit",
+            Self::AbortTxn { .. } => "abort",
+            Self::PrepareTxn { .. } | Self::EpochPrepareV2 { .. } => "prepare",
+            Self::EpochRepairV2 { .. } => "repair",
+            _ => "other",
+        }
+    }
+
     pub fn is_upgrade_command(&self) -> bool {
         matches!(
             self,
@@ -306,6 +336,8 @@ impl ShardCommand {
             self,
             Self::MigrationV1(_)
                 | Self::EpochWriteV1 { .. }
+                | Self::EpochWriteBatchV1 { .. }
+                | Self::EpochCommitBatchV1 { .. }
                 | Self::MigrationV2(_)
                 | Self::EpochRepairV2 { .. }
                 | Self::EpochPrepareV2 { .. }
@@ -313,6 +345,13 @@ impl ShardCommand {
                 | Self::BackupJobV1(_)
                 | Self::UpdateShardMapConditional { .. }
                 | Self::UpdateShardPlacementsConditional { .. }
+        )
+    }
+
+    pub fn requires_write_batch_protocol(&self) -> bool {
+        matches!(
+            self,
+            Self::EpochWriteBatchV1 { .. } | Self::EpochCommitBatchV1 { .. }
         )
     }
 }
@@ -1249,8 +1288,10 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     where
         I: IntoIterator<Item = Entry<NodusTypeConfig>> + OptionalSend,
     {
+        let started = std::time::Instant::now();
         let mut log = self.log.write().await;
         let batch: Vec<Entry<NodusTypeConfig>> = entries.into_iter().collect();
+        let entries = batch.len();
         // Persist the whole append atomically before caching and surface any
         // failure to openraft, so a crash never loses an acked entry and a
         // multi-entry append is never half durable — a leader must not ack a
@@ -1263,6 +1304,12 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         for entry in batch {
             log.insert(entry.log_id.index, entry);
         }
+        tracing::debug!(
+            entries,
+            durable = self.meta.is_some(),
+            elapsed = ?started.elapsed(),
+            "Raft log append persisted and cached"
+        );
         Ok(())
     }
 
@@ -1310,12 +1357,14 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         &mut self,
         entries: &[Entry<NodusTypeConfig>],
     ) -> Result<Vec<ShardResponse>, StorageError<u64>> {
+        let started = std::time::Instant::now();
+        let entry_count = entries.len();
         let mut sm = self.state_machine.write().await;
         let mut res = Vec::with_capacity(entries.len());
         for entry in entries {
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
-                    tracing::info!("Raft applying command: {:?}", cmd);
+                    tracing::debug!(command = cmd.metrics_kind(), "Raft applying command");
                     if cmd.is_upgrade_command() {
                         let response = if let ShardCommand::UpgradeControlV1(command) = cmd {
                             let kv = sm.kv.as_ref().ok_or_else(|| {
@@ -1627,6 +1676,11 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         // durable-write failure aborts the apply: openraft must not treat these
         // entries as applied when a crash would forget them.
         self.persist_applied(&sm)?;
+        tracing::debug!(
+            entries = entry_count,
+            elapsed = ?started.elapsed(),
+            "Raft entries applied and applied-state persisted"
+        );
         Ok(res)
     }
 

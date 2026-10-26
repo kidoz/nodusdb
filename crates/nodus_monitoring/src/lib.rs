@@ -10,6 +10,19 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use std::time::Duration;
+
+pub type MetricLabels = Vec<(String, String)>;
+pub type LabeledCounter = Family<MetricLabels, Counter>;
+pub type LabeledHistogram = Family<MetricLabels, Histogram, fn() -> Histogram>;
+
+fn latency_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.00005, 2.0, 16))
+}
+
+fn batch_size_histogram() -> Histogram {
+    Histogram::new([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0])
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterOverview {
@@ -49,6 +62,20 @@ pub struct Metrics {
     pub janitor_aborts_total: Counter,
     /// Pending intents observed by the janitor's most recent sweep.
     pub pending_intents: Gauge,
+    /// Routed Raft commands by fixed command kind and result.
+    pub raft_commands_total: LabeledCounter,
+    /// Time from router submission until the applied Raft response, by command and result.
+    pub raft_dispatch_seconds: LabeledHistogram,
+    /// Number of intent operations in each accepted write batch.
+    pub intent_batch_operations: Histogram,
+    /// Number of transactions in each dispatched commit batch.
+    pub commit_batch_size: Histogram,
+    /// Time from the first enqueue until each commit batch is dispatched.
+    pub commit_batch_wait_seconds: Histogram,
+    /// Commit batches bypassed for a fixed fallback reason.
+    pub commit_batch_fallbacks_total: LabeledCounter,
+    /// End-to-end transaction commit latency by mode and result.
+    pub commit_latency_seconds: LabeledHistogram,
     /// Raft log entries retained per group (`group` label) — grows without
     /// bound while a group's snapshot build keeps deferring.
     pub raft_log_entries: Family<Vec<(String, String)>, Gauge>,
@@ -78,6 +105,17 @@ impl Default for Metrics {
             shard_groups_unavailable: Gauge::default(),
             janitor_aborts_total: Counter::default(),
             pending_intents: Gauge::default(),
+            raft_commands_total: Family::default(),
+            raft_dispatch_seconds: Family::new_with_constructor(
+                latency_histogram as fn() -> Histogram,
+            ),
+            intent_batch_operations: batch_size_histogram(),
+            commit_batch_size: batch_size_histogram(),
+            commit_batch_wait_seconds: latency_histogram(),
+            commit_batch_fallbacks_total: Family::default(),
+            commit_latency_seconds: Family::new_with_constructor(
+                latency_histogram as fn() -> Histogram,
+            ),
             raft_log_entries: Family::default(),
             snapshot_deferrals_total: Family::default(),
             snapshot_deferred_seconds: Family::default(),
@@ -164,6 +202,41 @@ impl Metrics {
             m.pending_intents.clone(),
         );
         registry.register(
+            "nodus_raft_commands_total",
+            "Routed Raft commands by command kind and result",
+            m.raft_commands_total.clone(),
+        );
+        registry.register(
+            "nodus_raft_dispatch_seconds",
+            "Time from router submission until the applied Raft response",
+            m.raft_dispatch_seconds.clone(),
+        );
+        registry.register(
+            "nodus_intent_batch_operations",
+            "Number of intent operations in each accepted write batch",
+            m.intent_batch_operations.clone(),
+        );
+        registry.register(
+            "nodus_commit_batch_size",
+            "Number of transactions in each dispatched commit batch",
+            m.commit_batch_size.clone(),
+        );
+        registry.register(
+            "nodus_commit_batch_wait_seconds",
+            "Time from the first enqueue until each commit batch is dispatched",
+            m.commit_batch_wait_seconds.clone(),
+        );
+        registry.register(
+            "nodus_commit_batch_fallbacks_total",
+            "Commit batches bypassed for a fixed fallback reason",
+            m.commit_batch_fallbacks_total.clone(),
+        );
+        registry.register(
+            "nodus_commit_latency_seconds",
+            "End-to-end transaction commit latency by mode and result",
+            m.commit_latency_seconds.clone(),
+        );
+        registry.register(
             "nodus_raft_log_entries",
             "Raft log entries retained per group",
             m.raft_log_entries.clone(),
@@ -179,6 +252,43 @@ impl Metrics {
             m.snapshot_deferred_seconds.clone(),
         );
         m
+    }
+
+    pub fn observe_raft_command(&self, command: &str, result: &str, elapsed: Duration) {
+        let labels = || {
+            vec![
+                ("command".to_string(), command.to_string()),
+                ("result".to_string(), result.to_string()),
+            ]
+        };
+        self.raft_commands_total.get_or_create(&labels()).inc();
+        self.raft_dispatch_seconds
+            .get_or_create(&labels())
+            .observe(elapsed.as_secs_f64());
+    }
+
+    pub fn observe_intent_batch(&self, operations: usize) {
+        self.intent_batch_operations.observe(operations as f64);
+    }
+
+    pub fn observe_commit_batch(&self, commits: usize, wait: Duration) {
+        self.commit_batch_size.observe(commits as f64);
+        self.commit_batch_wait_seconds.observe(wait.as_secs_f64());
+    }
+
+    pub fn inc_commit_batch_fallback(&self, reason: &str) {
+        self.commit_batch_fallbacks_total
+            .get_or_create(&vec![("reason".to_string(), reason.to_string())])
+            .inc();
+    }
+
+    pub fn observe_commit(&self, mode: &str, result: &str, elapsed: Duration) {
+        self.commit_latency_seconds
+            .get_or_create(&vec![
+                ("mode".to_string(), mode.to_string()),
+                ("result".to_string(), result.to_string()),
+            ])
+            .observe(elapsed.as_secs_f64());
     }
 }
 
@@ -394,6 +504,11 @@ mod tests {
         let metrics = Metrics::register(&mut registry);
         metrics.queries_total.inc();
         metrics.janitor_aborts_total.inc_by(2);
+        metrics.observe_raft_command("commit_batch", "success", Duration::from_millis(2));
+        metrics.observe_intent_batch(4);
+        metrics.observe_commit_batch(4, Duration::from_millis(1));
+        metrics.inc_commit_batch_fallback("queue_full");
+        metrics.observe_commit("batch", "success", Duration::from_millis(3));
         metrics
             .raft_log_entries
             .get_or_create(&vec![("group".to_string(), "shard-meta".to_string())])
@@ -407,6 +522,19 @@ mod tests {
         // prometheus-client appends its own `_total` to counter samples.
         assert!(buf.contains("nodus_queries_total"));
         assert!(buf.contains("nodus_janitor_aborts_total_total 2"));
+        assert!(buf.contains(
+            "nodus_raft_commands_total_total{command=\"commit_batch\",result=\"success\"} 1"
+        ));
+        assert!(buf.contains(
+            "nodus_raft_dispatch_seconds_count{command=\"commit_batch\",result=\"success\"} 1"
+        ));
+        assert!(buf.contains("nodus_intent_batch_operations_count 1"));
+        assert!(buf.contains("nodus_commit_batch_size_count 1"));
+        assert!(buf.contains("nodus_commit_batch_wait_seconds_count 1"));
+        assert!(buf.contains("nodus_commit_batch_fallbacks_total_total{reason=\"queue_full\"} 1"));
+        assert!(
+            buf.contains("nodus_commit_latency_seconds_count{mode=\"batch\",result=\"success\"} 1")
+        );
         assert!(buf.contains("nodus_raft_log_entries{group=\"shard-meta\"} 42"));
         assert!(buf.contains("nodus_snapshot_deferrals_total_total{group=\"shard-meta\"} 1"));
     }

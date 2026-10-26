@@ -729,10 +729,16 @@ pub async fn run_server_full(
     // has finalized the migration cluster level; the gate fails closed on any
     // read error.
     let gate_kv = local_kv.clone();
+    let write_batch_gate_kv = local_kv.clone();
     let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone())
         .with_migration_gate(move || {
             nodus_raftstore::upgrade::read(gate_kv.as_ref()).is_ok_and(|authority| {
                 authority.cluster_version >= nodus_raftstore::upgrade::MIGRATION_LEVEL
+            })
+        })
+        .with_write_batch_gate(move || {
+            nodus_raftstore::upgrade::read(write_batch_gate_kv.as_ref()).is_ok_and(|authority| {
+                authority.cluster_version >= nodus_raftstore::upgrade::WRITE_BATCH_LEVEL
             })
         });
 

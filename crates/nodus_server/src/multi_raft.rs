@@ -109,6 +109,13 @@ impl KvEngine for ClockAdvancingKvEngine {
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         self.inner.delete_intent(txn_id, key)
     }
+    fn write_intent_batch(
+        &self,
+        txn_id: TxnId,
+        ops: Vec<nodus_storage_api::IntentOperation>,
+    ) -> KvResult<()> {
+        self.inner.write_intent_batch(txn_id, ops)
+    }
     fn replace_intent(
         &self,
         txn_id: TxnId,
@@ -129,6 +136,18 @@ impl KvEngine for ClockAdvancingKvEngine {
                 "clock watermark persist failed for applied commit {commit_ts}: {e}; \
                  commit_ts could regress after a restart until the next reservation"
             );
+        }
+        Ok(())
+    }
+    fn commit_batch(&self, commits: Vec<(TxnId, Timestamp)>) -> KvResult<()> {
+        self.inner.commit_batch(commits.clone())?;
+        for (_, commit_ts) in commits {
+            if let Err(e) = self.clock.observe_durable(commit_ts) {
+                tracing::error!(
+                    "clock watermark persist failed for applied commit {commit_ts}: {e}; \
+                     commit_ts could regress after a restart until the next reservation"
+                );
+            }
         }
         Ok(())
     }

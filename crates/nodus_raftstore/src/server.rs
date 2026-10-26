@@ -296,22 +296,24 @@ async fn write(
             .into_response();
     }
     if cmd.requires_migration_protocol() {
-        // Migration-protocol commands enter only through authenticated leader
-        // forwarding on the mTLS peer listener — never the shared bearer-token
-        // listener — and only once this node's durable upgrade authority has
-        // finalized the migration cluster level.
-        let admitted = matches!(
+        let authenticated = matches!(
             auth_mode,
             Some(axum::Extension(RaftAuthMode::TransportAuthenticated))
-        ) && state
+        );
+        let cluster_version = state
             .capability_kv
             .get()
             .and_then(|kv| crate::upgrade::read(kv.as_ref()).ok())
-            .is_some_and(|authority| authority.cluster_version >= crate::upgrade::MIGRATION_LEVEL);
-        if !admitted {
+            .map_or(0, |authority| authority.cluster_version);
+        let required_level = if cmd.requires_write_batch_protocol() {
+            crate::upgrade::WRITE_BATCH_LEVEL
+        } else {
+            crate::upgrade::MIGRATION_LEVEL
+        };
+        if !authenticated || cluster_version < required_level {
             return (
                 axum::http::StatusCode::NOT_IMPLEMENTED,
-                "migration protocol activation requires verified cluster-wide compatibility",
+                "protocol activation requires verified cluster-wide compatibility",
             )
                 .into_response();
         }

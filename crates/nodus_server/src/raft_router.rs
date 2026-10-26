@@ -19,8 +19,9 @@ use anyhow::{Result, anyhow};
 use nodus_raftstore::{NodusTypeConfig, ShardCommand, ShardResponse};
 use openraft::Raft;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, ForwardToLeader, RaftError};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::multi_raft::MultiRaftManager;
@@ -32,6 +33,23 @@ type WriteResult = Result<ShardResponse>;
 /// How long a follower waits for its state machine to catch up to the leader's
 /// read index before giving the linearizable read up (and retrying).
 const BARRIER_WAIT: Duration = Duration::from_secs(5);
+const COMMIT_BATCH_MAX: usize = 32;
+const COMMIT_BATCH_WAIT: Duration = Duration::from_millis(1);
+const COMMIT_QUEUE_MAX: usize = 1024;
+
+struct CommitRequest {
+    shard_id: String,
+    epoch: u64,
+    txn_id: nodus_storage_api::TxnId,
+    commit_ts: u64,
+    resp: oneshot::Sender<Result<()>>,
+}
+
+struct PendingCommitBatch {
+    requests: Vec<CommitRequest>,
+    created_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+}
 
 /// A request handed to the dispatcher: replicate a command, or run a
 /// linearizable-read barrier on a group. Both are bridged sync→async here so the
@@ -60,6 +78,7 @@ enum RouterRequest {
 #[derive(Clone)]
 pub struct RaftRouter {
     tx: mpsc::UnboundedSender<RouterRequest>,
+    commit_tx: mpsc::Sender<CommitRequest>,
     /// Isolated-fixture override; combined (OR) with the durable gate.
     migration_override: Arc<std::sync::atomic::AtomicBool>,
     /// Production activation: reads the durable upgrade authority and opens
@@ -67,6 +86,8 @@ pub struct RaftRouter {
     /// migration-protocol submission (ordinary writes never call it) and must
     /// fail closed. Defaults to closed.
     migration_gate: Arc<dyn Fn() -> bool + Send + Sync>,
+    write_batch_gate: Arc<dyn Fn() -> bool + Send + Sync>,
+    metrics: Arc<OnceLock<nodus_monitoring::Metrics>>,
 }
 
 impl RaftRouter {
@@ -82,6 +103,14 @@ impl RaftRouter {
         // require the mTLS scheme and a capability re-probe (see
         // `forward_migration`).
         let transport = manager.transport();
+        let metrics = Arc::new(OnceLock::new());
+        let (commit_tx, commit_rx) = mpsc::channel::<CommitRequest>(COMMIT_QUEUE_MAX);
+        tokio::spawn(commit_dispatch(
+            manager.clone(),
+            transport.clone(),
+            commit_rx,
+            metrics.clone(),
+        ));
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let shard_id = match &req {
@@ -137,9 +166,16 @@ impl RaftRouter {
         });
         Self {
             tx,
+            commit_tx,
             migration_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_gate: Arc::new(|| false),
+            write_batch_gate: Arc::new(|| false),
+            metrics,
         }
+    }
+
+    pub(crate) fn attach_metrics(&self, metrics: &nodus_monitoring::Metrics) {
+        self.metrics.get_or_init(|| metrics.clone());
     }
 
     /// Wire the production activation gate: a durable-authority read that
@@ -150,10 +186,22 @@ impl RaftRouter {
         self
     }
 
+    pub fn with_write_batch_gate(
+        mut self,
+        gate: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.write_batch_gate = Arc::new(gate);
+        self
+    }
+
     pub(crate) fn migration_enabled(&self) -> bool {
         self.migration_override
             .load(std::sync::atomic::Ordering::Acquire)
             || (self.migration_gate)()
+    }
+
+    pub(crate) fn write_batch_enabled(&self) -> bool {
+        (self.write_batch_gate)()
     }
 
     /// Isolated fixtures only: no config flag or production activation bypass.
@@ -209,22 +257,91 @@ impl RaftRouter {
         self.submit_inner(shard_id, cmd)
     }
 
-    fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
+    pub fn submit_commit(
+        &self,
+        shard_id: &str,
+        epoch: u64,
+        txn_id: nodus_storage_api::TxnId,
+        commit_ts: u64,
+    ) -> Result<bool> {
         anyhow::ensure!(
-            !cmd.requires_migration_protocol() || self.migration_enabled(),
-            "migration protocol activation requires verified cluster-wide compatibility"
+            self.write_batch_enabled(),
+            "write batching requires verified cluster-wide compatibility"
         );
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(RouterRequest::Write {
-                shard_id: shard_id.to_string(),
-                cmd,
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
-        resp_rx
-            .blocking_recv()
-            .map_err(|_| anyhow!("raft router dropped response"))?
+        let request = CommitRequest {
+            shard_id: shard_id.to_string(),
+            epoch,
+            txn_id,
+            commit_ts,
+            resp: resp_tx,
+        };
+        match self.commit_tx.try_send(request) {
+            Ok(()) => {
+                resp_rx
+                    .blocking_recv()
+                    .map_err(|_| anyhow!("raft router dropped commit response"))??;
+                Ok(true)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.inc_commit_batch_fallback("queue_full");
+                }
+                tracing::debug!("Raft commit queue full; using single-commit fallback");
+                self.submit(
+                    shard_id,
+                    ShardCommand::EpochWriteV1 {
+                        epoch,
+                        mutation: nodus_raftstore::migration::EpochMutationV1::Commit {
+                            txn_id: txn_id.0,
+                            commit_ts,
+                        },
+                    },
+                )?;
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("raft commit dispatcher stopped"))
+            }
+        }
+    }
+
+    fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
+        let started = Instant::now();
+        let command = cmd.metrics_kind();
+        let intent_operations = match &cmd {
+            ShardCommand::EpochWriteBatchV1 { operations, .. } => Some(operations.len()),
+            _ => None,
+        };
+        let result = (|| {
+            anyhow::ensure!(
+                !cmd.requires_migration_protocol() || self.migration_enabled(),
+                "migration protocol activation requires verified cluster-wide compatibility"
+            );
+            anyhow::ensure!(
+                !cmd.requires_write_batch_protocol() || self.write_batch_enabled(),
+                "write batching requires verified cluster-wide compatibility"
+            );
+            let (resp_tx, resp_rx) = oneshot::channel();
+            self.tx
+                .send(RouterRequest::Write {
+                    shard_id: shard_id.to_string(),
+                    cmd,
+                    resp: resp_tx,
+                })
+                .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
+            resp_rx
+                .blocking_recv()
+                .map_err(|_| anyhow!("raft router dropped response"))?
+        })();
+        observe_command(&self.metrics, command, started, &result);
+        if let (Some(operations), Ok(response)) = (intent_operations, &result)
+            && response.success
+            && let Some(metrics) = self.metrics.get()
+        {
+            metrics.observe_intent_batch(operations);
+        }
+        result
     }
 
     /// Blocks until this node's replica of `shard_id` reflects every write
@@ -245,6 +362,157 @@ impl RaftRouter {
             .blocking_recv()
             .map_err(|_| anyhow!("raft router dropped response"))?
     }
+}
+
+fn observe_command(
+    metrics: &OnceLock<nodus_monitoring::Metrics>,
+    command: &str,
+    started: Instant,
+    result: &WriteResult,
+) {
+    if let Some(metrics) = metrics.get() {
+        let result = match result {
+            Ok(response) if response.success => "success",
+            Ok(_) => "rejected",
+            Err(_) => "error",
+        };
+        metrics.observe_raft_command(command, result, started.elapsed());
+    }
+}
+
+async fn commit_dispatch(
+    manager: Arc<MultiRaftManager>,
+    transport: nodus_raftstore::network::RaftTransport,
+    mut rx: mpsc::Receiver<CommitRequest>,
+    metrics: Arc<OnceLock<nodus_monitoring::Metrics>>,
+) {
+    let mut batches: HashMap<(String, u64), PendingCommitBatch> = HashMap::new();
+    loop {
+        let next_deadline = batches.values().map(|batch| batch.deadline).min();
+        let wait = async {
+            if let Some(deadline) = next_deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            request = rx.recv() => {
+                let Some(request) = request else {
+                    for ((shard_id, epoch), batch) in batches.drain() {
+                        spawn_commit_batch(
+                            manager.clone(),
+                            transport.clone(),
+                            shard_id,
+                            epoch,
+                            batch,
+                            metrics.clone(),
+                        );
+                    }
+                    break;
+                };
+                let key = (request.shard_id.clone(), request.epoch);
+                let full = {
+                    let batch = batches.entry(key.clone()).or_insert_with(|| {
+                        let now = tokio::time::Instant::now();
+                        PendingCommitBatch {
+                            requests: Vec::with_capacity(COMMIT_BATCH_MAX),
+                            created_at: now,
+                            deadline: now + COMMIT_BATCH_WAIT,
+                        }
+                    });
+                    batch.requests.push(request);
+                    batch.requests.len() >= COMMIT_BATCH_MAX
+                };
+                if full && let Some(batch) = batches.remove(&key) {
+                    spawn_commit_batch(
+                        manager.clone(),
+                        transport.clone(),
+                        key.0,
+                        key.1,
+                        batch,
+                        metrics.clone(),
+                    );
+                }
+            }
+            _ = wait => {
+                let now = tokio::time::Instant::now();
+                let expired = batches
+                    .iter()
+                    .filter(|(_, batch)| batch.deadline <= now)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                for key in expired {
+                    if let Some(batch) = batches.remove(&key) {
+                        spawn_commit_batch(
+                            manager.clone(),
+                            transport.clone(),
+                            key.0,
+                            key.1,
+                            batch,
+                            metrics.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_commit_batch(
+    manager: Arc<MultiRaftManager>,
+    transport: nodus_raftstore::network::RaftTransport,
+    shard_id: String,
+    epoch: u64,
+    batch: PendingCommitBatch,
+    metrics: Arc<OnceLock<nodus_monitoring::Metrics>>,
+) {
+    let wait = batch.created_at.elapsed();
+    if let Some(metrics) = metrics.get() {
+        metrics.observe_commit_batch(batch.requests.len(), wait);
+    }
+    tracing::debug!(
+        group = %shard_id,
+        commits = batch.requests.len(),
+        wait = ?wait,
+        "Dispatching Raft commit batch"
+    );
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let commits = batch
+            .requests
+            .iter()
+            .map(|request| nodus_raftstore::migration::EpochCommitV1 {
+                txn_id: request.txn_id.0,
+                commit_ts: request.commit_ts,
+            })
+            .collect();
+        let result = match manager.get(&shard_id).await {
+            Some(raft) => {
+                replicate(
+                    raft,
+                    &shard_id,
+                    ShardCommand::EpochCommitBatchV1 { epoch, commits },
+                    &transport,
+                )
+                .await
+            }
+            None => Err(anyhow!("raft group '{shard_id}' not found")),
+        };
+        observe_command(&metrics, "commit_batch", started, &result);
+        let result = match result {
+            Ok(response) if response.success => Ok(()),
+            Ok(response) => Err(response
+                .error
+                .unwrap_or_else(|| "Raft commit batch rejected by participant".into())),
+            Err(error) => Err(error.to_string()),
+        };
+        for request in batch.requests {
+            let _ = request
+                .resp
+                .send(result.clone().map_err(|error| anyhow!(error)));
+        }
+    });
 }
 
 /// Replicates `cmd` to `group_id`, **forwarding to the leader** when this node
@@ -343,6 +611,14 @@ async fn forward_migration(
         report.migration_version,
         nodus_raftstore::upgrade::MIGRATION_VERSION
     );
+    if cmd.requires_write_batch_protocol() {
+        anyhow::ensure!(
+            report.write_batch_version >= Some(nodus_raftstore::upgrade::WRITE_BATCH_VERSION),
+            "write batch forward to {addr}: peer reports write_batch_version {:?}, below {}",
+            report.write_batch_version,
+            nodus_raftstore::upgrade::WRITE_BATCH_VERSION
+        );
+    }
     transport
         .forward_write(addr, group_id, cmd, request_id)
         .await

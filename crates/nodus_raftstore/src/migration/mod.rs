@@ -101,6 +101,18 @@ pub enum EpochMutationV1 {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EpochIntentOperationV1 {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochCommitV1 {
+    pub txn_id: Uuid,
+    pub commit_ts: u64,
+}
+
 fn read<T: DeserializeOwned>(kv: &dyn KvEngine, key: &[u8]) -> Result<Option<T>> {
     let Some(bytes) = kv.get(key, u64::MAX)? else {
         return Ok(None);
@@ -471,6 +483,118 @@ fn apply_control(
     Ok(accepted())
 }
 
+const MAX_BATCH_ITEMS: usize = 256;
+const MAX_BATCH_PAYLOAD_BYTES: usize = 1024 * 1024;
+const COMMIT_PAYLOAD_BYTES: usize = 16 + 8;
+
+fn epoch_is_open(kv: &dyn KvEngine, epoch: u64) -> Result<bool> {
+    let fence = read_fence(kv)?;
+    Ok(fence.as_ref().map_or(0, |f| f.epoch) == epoch && !fence.is_some_and(|f| f.closed))
+}
+
+fn invalid_write_batch(operations: &[EpochIntentOperationV1]) -> Option<&'static str> {
+    if operations.is_empty() {
+        return Some("write batch must not be empty");
+    }
+    if operations.len() > MAX_BATCH_ITEMS {
+        return Some("write batch exceeds 256 operations");
+    }
+    let payload_bytes = operations.iter().try_fold(0usize, |total, operation| {
+        let operation_bytes = match operation {
+            EpochIntentOperationV1::Put { key, value } => key.len().checked_add(value.len())?,
+            EpochIntentOperationV1::Delete { key } => key.len(),
+        };
+        total.checked_add(operation_bytes)
+    });
+    if payload_bytes.is_none_or(|bytes| bytes > MAX_BATCH_PAYLOAD_BYTES) {
+        return Some("write batch exceeds 1 MiB payload");
+    }
+    None
+}
+
+fn invalid_commit_batch(commits: &[EpochCommitV1]) -> Option<&'static str> {
+    if commits.is_empty() {
+        return Some("commit batch must not be empty");
+    }
+    if commits.len() > MAX_BATCH_ITEMS {
+        return Some("commit batch exceeds 256 commits");
+    }
+    if commits
+        .len()
+        .checked_mul(COMMIT_PAYLOAD_BYTES)
+        .is_none_or(|bytes| bytes > MAX_BATCH_PAYLOAD_BYTES)
+    {
+        return Some("commit batch exceeds 1 MiB payload");
+    }
+    None
+}
+
+fn apply_write_batch(
+    kv: &dyn KvEngine,
+    epoch: u64,
+    txn_id: Uuid,
+    operations: &[EpochIntentOperationV1],
+) -> Result<ShardResponse> {
+    if !epoch_is_open(kv, epoch)? {
+        return Ok(reject(
+            "stale epoch or fenced participant; retry transaction",
+        ));
+    }
+    if let Some(reason) = invalid_write_batch(operations) {
+        return Ok(reject(reason));
+    }
+    if operations.iter().any(|operation| {
+        let key = match operation {
+            EpochIntentOperationV1::Put { key, .. } | EpochIntentOperationV1::Delete { key } => key,
+        };
+        is_control_key(key)
+    }) {
+        return Ok(reject("reserved migration key"));
+    }
+    let operations = operations
+        .iter()
+        .map(|operation| match operation {
+            EpochIntentOperationV1::Put { key, value } => nodus_storage_api::IntentOperation::Put {
+                key: Bytes::copy_from_slice(key),
+                value: Bytes::copy_from_slice(value),
+            },
+            EpochIntentOperationV1::Delete { key } => nodus_storage_api::IntentOperation::Delete {
+                key: Bytes::copy_from_slice(key),
+            },
+        })
+        .collect();
+    match kv.write_intent_batch(TxnId(txn_id), operations) {
+        Ok(()) => Ok(accepted()),
+        Err(nodus_storage_api::KvError::WriteConflict(_)) => {
+            Ok(reject("write conflict; retry transaction"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn apply_commit_batch(
+    kv: &dyn KvEngine,
+    epoch: u64,
+    commits: &[EpochCommitV1],
+) -> Result<ShardResponse> {
+    if !epoch_is_open(kv, epoch)? {
+        return Ok(reject(
+            "stale epoch or fenced participant; retry transaction",
+        ));
+    }
+    if let Some(reason) = invalid_commit_batch(commits) {
+        return Ok(reject(reason));
+    }
+    let commits = commits
+        .iter()
+        .map(|commit| (TxnId(commit.txn_id), commit.commit_ts))
+        .collect();
+    match kv.commit_batch(commits) {
+        Ok(()) | Err(nodus_storage_api::KvError::IntentNotFound(_)) => Ok(accepted()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Handles protocol commands and rejects legacy mutations after a fence epoch
 /// exists. Returns None only when the ordinary apply path may handle a command.
 pub(crate) fn apply(
@@ -537,11 +661,18 @@ pub(crate) fn apply(
             key,
             replacement,
         } => return writes::apply_repair(kv, *epoch, *txn_id, key, replacement).map(Some),
+        ShardCommand::EpochWriteBatchV1 {
+            epoch,
+            txn_id,
+            operations,
+        } => {
+            return apply_write_batch(kv, *epoch, *txn_id, operations).map(Some);
+        }
+        ShardCommand::EpochCommitBatchV1 { epoch, commits } => {
+            return apply_commit_batch(kv, *epoch, commits).map(Some);
+        }
         ShardCommand::EpochWriteV1 { epoch, mutation } => {
-            let fence = read_fence(kv)?;
-            if fence.as_ref().map_or(0, |f| f.epoch) != *epoch
-                || fence.as_ref().is_some_and(|f| f.closed)
-            {
+            if !epoch_is_open(kv, *epoch)? {
                 return Ok(Some(reject(
                     "stale epoch or fenced participant; retry transaction",
                 )));
@@ -611,4 +742,188 @@ pub(crate) fn apply(
         _ => return Ok(None), // Abort remains available to drain old transactions.
     }
     Ok(read_fence(kv)?.map(|_| reject("epoch is required on this participant; retry transaction")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodus_storage_mem::MemKvEngine;
+
+    fn fenced_engine(epoch: u64, closed: bool) -> MemKvEngine {
+        let kv = MemKvEngine::new();
+        write(
+            &kv,
+            FENCE_KEY,
+            &ParticipantFence {
+                operation_id: Uuid::new_v4(),
+                epoch,
+                closed,
+            },
+            1,
+        )
+        .unwrap();
+        kv
+    }
+
+    fn apply_command(kv: &dyn KvEngine, command: ShardCommand) -> ShardResponse {
+        apply(kv, &command, 2, None).unwrap().unwrap()
+    }
+
+    fn write_batch(
+        epoch: u64,
+        txn_id: Uuid,
+        operations: Vec<EpochIntentOperationV1>,
+    ) -> ShardCommand {
+        ShardCommand::EpochWriteBatchV1 {
+            epoch,
+            txn_id,
+            operations,
+        }
+    }
+
+    fn put(key: &[u8], value: &[u8]) -> EpochIntentOperationV1 {
+        EpochIntentOperationV1::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    #[test]
+    fn batch_commands_require_migration_and_write_batch_protocols() {
+        let write = write_batch(0, Uuid::new_v4(), vec![put(b"key", b"value")]);
+        let commit = ShardCommand::EpochCommitBatchV1 {
+            epoch: 0,
+            commits: vec![EpochCommitV1 {
+                txn_id: Uuid::new_v4(),
+                commit_ts: 1,
+            }],
+        };
+        for command in [&write, &commit] {
+            assert!(command.requires_migration_protocol());
+            assert!(command.requires_write_batch_protocol());
+        }
+        assert!(!ShardCommand::UpgradeFinalize.requires_write_batch_protocol());
+    }
+
+    #[test]
+    fn write_batch_requires_the_exact_open_epoch() {
+        let kv = fenced_engine(7, false);
+        let txn_id = Uuid::new_v4();
+        let stale = apply_command(&kv, write_batch(6, txn_id, vec![put(b"stale", b"value")]));
+        assert!(!stale.success);
+        assert!(kv.pending_intent_keys(TxnId(txn_id)).is_empty());
+
+        let closed = fenced_engine(7, true);
+        let fenced = apply_command(
+            &closed,
+            write_batch(7, txn_id, vec![put(b"closed", b"value")]),
+        );
+        assert!(!fenced.success);
+        assert!(closed.pending_intent_keys(TxnId(txn_id)).is_empty());
+    }
+
+    #[test]
+    fn write_batch_rejects_any_reserved_key_before_writing() {
+        let kv = fenced_engine(7, false);
+        let txn_id = Uuid::new_v4();
+        let response = apply_command(
+            &kv,
+            write_batch(
+                7,
+                txn_id,
+                vec![put(b"user-key", b"value"), put(FENCE_KEY, b"invalid")],
+            ),
+        );
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("reserved migration key"));
+        assert!(kv.pending_intent_keys(TxnId(txn_id)).is_empty());
+        assert!(kv.get(b"user-key", u64::MAX).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_batch_conflict_is_rejected_without_partial_intents() {
+        let kv = fenced_engine(7, false);
+        let blocker = TxnId::new();
+        kv.write_intent(
+            blocker,
+            Bytes::from_static(b"blocked"),
+            Bytes::from_static(b"old"),
+        )
+        .unwrap();
+        let txn_id = Uuid::new_v4();
+        let response = apply_command(
+            &kv,
+            write_batch(
+                7,
+                txn_id,
+                vec![put(b"fresh", b"value"), put(b"blocked", b"new")],
+            ),
+        );
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("write conflict"));
+        assert!(kv.pending_intent_keys(TxnId(txn_id)).is_empty());
+        assert!(kv.pending_intent_keys(blocker).len() == 1);
+    }
+
+    #[test]
+    fn commit_batch_publishes_all_transactions_and_replays_idempotently() {
+        let kv = fenced_engine(7, false);
+        let first = TxnId::new();
+        let second = TxnId::new();
+        for (txn, key) in [(first, b"first".as_slice()), (second, b"second".as_slice())] {
+            kv.write_intent(
+                txn,
+                Bytes::copy_from_slice(key),
+                Bytes::copy_from_slice(key),
+            )
+            .unwrap();
+        }
+        let command = ShardCommand::EpochCommitBatchV1 {
+            epoch: 7,
+            commits: vec![
+                EpochCommitV1 {
+                    txn_id: first.0,
+                    commit_ts: 10,
+                },
+                EpochCommitV1 {
+                    txn_id: second.0,
+                    commit_ts: 11,
+                },
+            ],
+        };
+        assert!(apply_command(&kv, command.clone()).success);
+        assert_eq!(
+            kv.get(b"first", 10).unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            kv.get(b"second", 11).unwrap().as_deref(),
+            Some(b"second".as_slice())
+        );
+        assert!(apply_command(&kv, command).success);
+    }
+
+    #[test]
+    fn invalid_batch_sizes_are_rejected_at_apply() {
+        let kv = fenced_engine(7, false);
+        let txn_id = Uuid::new_v4();
+        for operations in [
+            vec![],
+            vec![put(b"", b""); MAX_BATCH_ITEMS + 1],
+            vec![put(b"key", &vec![0; MAX_BATCH_PAYLOAD_BYTES + 1])],
+        ] {
+            let response = apply_command(&kv, write_batch(7, txn_id, operations));
+            assert!(!response.success);
+            assert!(kv.pending_intent_keys(TxnId(txn_id)).is_empty());
+        }
+
+        let response = apply_command(
+            &kv,
+            ShardCommand::EpochCommitBatchV1 {
+                epoch: 7,
+                commits: vec![],
+            },
+        );
+        assert!(!response.success);
+    }
 }

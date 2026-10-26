@@ -104,6 +104,7 @@ impl RaftKvEngine {
     /// Capture once, even if a savepoint later clears every intent. A stale
     /// transaction must fail instead of adopting a newly opened epoch.
     fn record_txn_group(&self, txn_id: TxnId, group_id: &str) -> Result<u64> {
+        self.router.attach_metrics(&self.metrics);
         let mut txns = self.txn_groups.lock().unwrap();
         let groups = txns.entry(txn_id).or_default();
         if let Some(participant) = groups.get(group_id) {
@@ -495,6 +496,103 @@ impl KvEngine for RaftKvEngine {
         Ok(())
     }
 
+    fn write_intent_batch(
+        &self,
+        txn_id: TxnId,
+        ops: Vec<nodus_storage_api::IntentOperation>,
+    ) -> KvResult<()> {
+        use nodus_storage_api::IntentOperation;
+
+        if !self.router.write_batch_enabled() {
+            for op in ops {
+                match op {
+                    IntentOperation::Put { key, value } => self.write_intent(txn_id, key, value)?,
+                    IntentOperation::Delete { key } => self.delete_intent(txn_id, key)?,
+                }
+            }
+            return Ok(());
+        }
+
+        const MAX_OPS: usize = 256;
+        const MAX_BYTES: usize = 1024 * 1024;
+        let mut grouped: BTreeMap<String, (u64, Vec<IntentOperation>)> = BTreeMap::new();
+        for op in ops {
+            let group = self.route(op.key())?;
+            let epoch = self.record_txn_group(txn_id, &group)?;
+            grouped
+                .entry(group)
+                .or_insert_with(|| (epoch, Vec::new()))
+                .1
+                .push(op);
+        }
+        for (group, (epoch, ops)) in grouped {
+            let flush = |batch: &mut Vec<IntentOperation>| -> Result<()> {
+                if batch.is_empty() {
+                    return Ok(());
+                }
+                let operations = batch
+                    .iter()
+                    .map(|op| match op {
+                        IntentOperation::Put { key, value } => {
+                            nodus_raftstore::migration::EpochIntentOperationV1::Put {
+                                key: key.to_vec(),
+                                value: value.to_vec(),
+                            }
+                        }
+                        IntentOperation::Delete { key } => {
+                            nodus_raftstore::migration::EpochIntentOperationV1::Delete {
+                                key: key.to_vec(),
+                            }
+                        }
+                    })
+                    .collect();
+                self.router.submit(
+                    &group,
+                    ShardCommand::EpochWriteBatchV1 {
+                        epoch,
+                        txn_id: txn_id.0,
+                        operations,
+                    },
+                )?;
+                for op in batch.iter() {
+                    self.record_intent(txn_id, &group, op.key(), true);
+                }
+                batch.clear();
+                Ok(())
+            };
+            let mut batch = Vec::new();
+            let mut bytes = 0usize;
+            for op in ops {
+                let op_bytes = op.key().len()
+                    + match &op {
+                        IntentOperation::Put { value, .. } => value.len(),
+                        IntentOperation::Delete { .. } => 0,
+                    };
+                if op_bytes > MAX_BYTES {
+                    flush(&mut batch)?;
+                    bytes = 0;
+                    match op {
+                        IntentOperation::Put { key, value } => {
+                            self.write_intent(txn_id, key, value)?
+                        }
+                        IntentOperation::Delete { key } => self.delete_intent(txn_id, key)?,
+                    }
+                    continue;
+                }
+                if !batch.is_empty()
+                    && (batch.len() >= MAX_OPS || bytes.saturating_add(op_bytes) > MAX_BYTES)
+                {
+                    flush(&mut batch)?;
+                    bytes = 0;
+                }
+                bytes += op_bytes;
+                batch.push(op);
+            }
+            flush(&mut batch)?;
+        }
+        Ok(())
+    }
+
     fn replace_intent(
         &self,
         txn_id: TxnId,
@@ -523,23 +621,42 @@ impl KvEngine for RaftKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
+        self.router.attach_metrics(&self.metrics);
+        let started = std::time::Instant::now();
         // Peek, don't remove: the janitor must keep seeing this transaction as
         // live for the whole finalize window (see `finalize_targets_peek`).
         let targets = self.finalize_targets_peek(txn_id);
+        let write_batch = targets.len() == 1 && self.router.write_batch_enabled();
+        let mut mode = if targets.len() > 1 {
+            "cross_shard"
+        } else if write_batch {
+            "batch"
+        } else {
+            "single"
+        };
         let result = (|| {
             if targets.len() <= 1 {
                 for (group, target) in &targets {
-                    self.router.submit(
-                        group,
-                        self.epoch_command(
+                    if write_batch {
+                        if !self
+                            .router
+                            .submit_commit(group, target.epoch, txn_id, commit_ts)?
+                        {
+                            mode = "single";
+                        }
+                    } else {
+                        self.router.submit(
                             group,
-                            target.epoch,
-                            nodus_raftstore::migration::EpochMutationV1::Commit {
-                                txn_id: txn_id.0,
-                                commit_ts,
-                            },
-                        ),
-                    )?;
+                            self.epoch_command(
+                                group,
+                                target.epoch,
+                                nodus_raftstore::migration::EpochMutationV1::Commit {
+                                    txn_id: txn_id.0,
+                                    commit_ts,
+                                },
+                            ),
+                        )?;
+                    }
                 }
             } else {
                 self.commit_cross_shard(txn_id, &targets, commit_ts)?;
@@ -547,10 +664,16 @@ impl KvEngine for RaftKvEngine {
             Ok(())
         })();
         self.finalize_targets(txn_id);
+        self.metrics.observe_commit(
+            mode,
+            if result.is_ok() { "success" } else { "error" },
+            started.elapsed(),
+        );
         result
     }
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
+        self.router.attach_metrics(&self.metrics);
         let targets = self.finalize_targets_peek(txn_id);
         let result = (|| {
             for group_id in targets.keys() {
