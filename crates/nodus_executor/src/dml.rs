@@ -469,6 +469,39 @@ impl MemExecutor {
         on_conflict: Option<crate::plan_types::OnConflictClause>,
         (default_cells, overriding, alias): (Vec<Vec<bool>>, Option<&str>, Option<&str>),
     ) -> Result<QueryOutput> {
+        self.begin_insert_buffering(&ctx.session_id);
+        let result = self.exec_insert_inner(
+            ctx,
+            table_name,
+            columns,
+            values_list,
+            returning,
+            on_conflict,
+            (default_cells, overriding, alias),
+        );
+        let flushed = self.finish_insert_buffering(&ctx.session_id);
+        match result {
+            Ok(output) => {
+                flushed?;
+                Ok(output)
+            }
+            Err(error) => {
+                let _ = flushed;
+                Err(error)
+            }
+        }
+    }
+
+    fn exec_insert_inner(
+        &self,
+        ctx: &ExecutionContext,
+        table_name: String,
+        columns: Vec<String>,
+        values_list: Vec<Vec<Value>>,
+        returning: Returning,
+        on_conflict: Option<crate::plan_types::OnConflictClause>,
+        (default_cells, overriding, alias): (Vec<Vec<bool>>, Option<&str>, Option<&str>),
+    ) -> Result<QueryOutput> {
         use crate::plan_types::OnConflictClause;
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self

@@ -343,6 +343,81 @@ async fn test_savepoints_rollback_release_and_read_your_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_buffered_multirow_insert_preserves_indexes_and_savepoints() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE buffered_rows (id INT PRIMARY KEY, name TEXT, grp INT); \
+             CREATE INDEX buffered_rows_grp ON buffered_rows (grp); \
+             BEGIN",
+        )
+        .await
+        .unwrap();
+    let values = (0..130)
+        .map(|id| format!("({id}, 'name-{id}', {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    client
+        .execute(
+            &format!("INSERT INTO buffered_rows (id, name, grp) VALUES {values}"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM buffered_rows", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 130);
+    let indexed: Vec<i32> = client
+        .query(
+            "SELECT id FROM buffered_rows WHERE grp = 7 ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(indexed, (7..130).step_by(10).collect::<Vec<_>>());
+
+    client.simple_query("SAVEPOINT after_bulk").await.unwrap();
+    client
+        .simple_query(
+            "INSERT INTO buffered_rows (id, name, grp) VALUES \
+             (200, 'rolled back', 7), (201, 'rolled back', 7)",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT after_bulk")
+        .await
+        .unwrap();
+    client
+        .simple_query("RELEASE SAVEPOINT after_bulk")
+        .await
+        .unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM buffered_rows", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 130);
+    let rolled_back: i64 = client
+        .query_one("SELECT count(*) FROM buffered_rows WHERE id >= 200", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rolled_back, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_returning_reports_declared_types_for_generated_key_paths() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;

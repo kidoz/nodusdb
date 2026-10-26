@@ -1507,6 +1507,65 @@ fn executor_with_kv(kv: Arc<dyn KvEngine>) -> (Arc<MemExecutor>, ExecutionContex
 }
 
 #[test]
+fn buffered_multirow_insert_preserves_errors_indexes_and_savepoints() {
+    let (exec, ctx) = executor_with_kv(Arc::new(nodus_storage_mem::MemKvEngine::new()));
+    sql(
+        &exec,
+        &ctx,
+        "CREATE TABLE buffered (id INT PRIMARY KEY, grp INT)",
+    )
+    .unwrap();
+    sql(&exec, &ctx, "CREATE INDEX buffered_grp ON buffered (grp)").unwrap();
+
+    let duplicate_values = (0..130)
+        .map(|id| if id == 129 { 0 } else { id })
+        .map(|id| format!("({id}, {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = sql(
+        &exec,
+        &ctx,
+        &format!("INSERT INTO buffered VALUES {duplicate_values}"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("duplicate key"));
+    let out = sql(&exec, &ctx, "SELECT count(*) FROM buffered").unwrap();
+    assert_eq!(out.rows[0].values[0], Value::Int(0));
+
+    sql(&exec, &ctx, "BEGIN").unwrap();
+    let values = (0..130)
+        .map(|id| format!("({id}, {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    sql(
+        &exec,
+        &ctx,
+        &format!("INSERT INTO buffered VALUES {values}"),
+    )
+    .unwrap();
+    let out = sql(&exec, &ctx, "SELECT count(*) FROM buffered").unwrap();
+    assert_eq!(out.rows[0].values[0], Value::Int(130));
+    let out = sql(&exec, &ctx, "SELECT id FROM buffered WHERE grp = 7").unwrap();
+    assert_eq!(out.rows.len(), 13);
+
+    sql(&exec, &ctx, "SAVEPOINT after_bulk").unwrap();
+    sql(
+        &exec,
+        &ctx,
+        "INSERT INTO buffered VALUES (200, 7), (201, 7)",
+    )
+    .unwrap();
+    sql(&exec, &ctx, "ROLLBACK TO SAVEPOINT after_bulk").unwrap();
+    sql(&exec, &ctx, "RELEASE SAVEPOINT after_bulk").unwrap();
+    sql(&exec, &ctx, "COMMIT").unwrap();
+
+    let out = sql(&exec, &ctx, "SELECT count(*) FROM buffered").unwrap();
+    assert_eq!(out.rows[0].values[0], Value::Int(130));
+    let out = sql(&exec, &ctx, "SELECT count(*) FROM buffered WHERE id >= 200").unwrap();
+    assert_eq!(out.rows[0].values[0], Value::Int(0));
+}
+
+#[test]
 fn failed_kv_commit_releases_intents_explicit_txn() {
     let kv = Arc::new(FailCommitKv::new());
     let (exec, ctx) = executor_with_kv(kv.clone());

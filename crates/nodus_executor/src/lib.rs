@@ -10,7 +10,7 @@ use nodus_catalog::{
     AuditEventId, CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest,
     DescriptorState, IndexId, MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
 };
-use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, Timestamp, TxnId};
+use nodus_storage_api::{IntentOperation, IntentReplacement, KeyRange, KvEngine, Timestamp, TxnId};
 use nodus_txn::TxnManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -203,6 +203,9 @@ pub(crate) struct ActiveTxn {
     /// table's or an index value's range reads without visiting the rest.
     pub(crate) overlay: std::collections::BTreeMap<String, Option<String>>,
     pub(crate) savepoints: Vec<SavepointState>,
+    pub(crate) pending_insert_intents: Vec<IntentOperation>,
+    pub(crate) pending_insert_bytes: usize,
+    pub(crate) insert_buffering_depth: usize,
     /// `true` for a user-issued `BEGIN`, `false` for the single-statement
     /// implicit transaction that wraps each autocommit statement. Only explicit
     /// transactions are surfaced in `pg_locks`, so a bare `SELECT FROM pg_locks`
@@ -254,6 +257,9 @@ impl ActiveTxn {
             write_log: Vec::new(),
             overlay: std::collections::BTreeMap::new(),
             savepoints: Vec::new(),
+            pending_insert_intents: Vec::new(),
+            pending_insert_bytes: 0,
+            insert_buffering_depth: 0,
             explicit,
             batch: false,
             read_only: false,
@@ -1683,15 +1689,86 @@ impl MemExecutor {
         Ok(rows)
     }
 
+    const INSERT_INTENT_BATCH_OPS: usize = 128;
+    const INSERT_INTENT_BATCH_BYTES: usize = 1024 * 1024;
+
+    pub(crate) fn begin_insert_buffering(&self, session: &str) {
+        if let Some(txn) = self.active_txns.write().get_mut(session) {
+            txn.insert_buffering_depth += 1;
+        }
+    }
+
+    pub(crate) fn finish_insert_buffering(&self, session: &str) -> Result<()> {
+        let flush = self
+            .active_txns
+            .write()
+            .get_mut(session)
+            .is_some_and(|txn| {
+                if txn.insert_buffering_depth > 0 {
+                    txn.insert_buffering_depth -= 1;
+                }
+                txn.insert_buffering_depth == 0 && !txn.pending_insert_intents.is_empty()
+            });
+        if flush {
+            self.flush_insert_intents(session)?;
+        }
+        Ok(())
+    }
+
+    fn flush_insert_intents(&self, session: &str) -> Result<()> {
+        let Some((txn_id, operations)) = self.active_txns.write().get_mut(session).map(|txn| {
+            let operations = std::mem::take(&mut txn.pending_insert_intents);
+            txn.pending_insert_bytes = 0;
+            (txn.txn_id, operations)
+        }) else {
+            return Ok(());
+        };
+        if operations.is_empty() {
+            return Ok(());
+        }
+        self.kv.write_intent_batch(txn_id, operations)?;
+        Ok(())
+    }
+
     /// Writes a row value at `key`, using the session's txn.
     pub(crate) fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
         let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
-        self.kv
-            .write_intent(txn_id, Bytes::from(key.clone()), Bytes::from(value.clone()))?;
-        if let Some(txn) = self.active_txns.write().get_mut(session) {
+        let buffering = self
+            .active_txns
+            .read()
+            .get(session)
+            .is_some_and(|txn| txn.insert_buffering_depth > 0);
+        if !buffering {
+            self.kv
+                .write_intent(txn_id, Bytes::from(key.clone()), Bytes::from(value.clone()))?;
+            if let Some(txn) = self.active_txns.write().get_mut(session) {
+                txn.write_log.push(key.clone());
+                txn.overlay.insert(key, Some(value));
+            }
+            return Ok(());
+        }
+
+        let key_bytes = Bytes::from(key.clone());
+        let value_bytes = Bytes::from(value.clone());
+        let flush = if let Some(txn) = self.active_txns.write().get_mut(session) {
             txn.write_log.push(key.clone());
             txn.overlay.insert(key, Some(value));
+            txn.pending_insert_bytes = txn
+                .pending_insert_bytes
+                .saturating_add(key_bytes.len())
+                .saturating_add(value_bytes.len());
+            txn.pending_insert_intents.push(IntentOperation::Put {
+                key: key_bytes,
+                value: value_bytes,
+            });
+            txn.pending_insert_intents.len() >= Self::INSERT_INTENT_BATCH_OPS
+                || txn.pending_insert_bytes >= Self::INSERT_INTENT_BATCH_BYTES
+        } else {
+            false
+        };
+        if flush {
+            self.flush_insert_intents(session)?;
         }
         Ok(())
     }
@@ -1700,10 +1777,34 @@ impl MemExecutor {
     pub(crate) fn delete_row(&self, session: &str, key: String) -> Result<()> {
         let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
-        self.kv.delete_intent(txn_id, Bytes::from(key.clone()))?;
-        if let Some(txn) = self.active_txns.write().get_mut(session) {
+        let buffering = self
+            .active_txns
+            .read()
+            .get(session)
+            .is_some_and(|txn| txn.insert_buffering_depth > 0);
+        if !buffering {
+            self.kv.delete_intent(txn_id, Bytes::from(key.clone()))?;
+            if let Some(txn) = self.active_txns.write().get_mut(session) {
+                txn.write_log.push(key.clone());
+                txn.overlay.insert(key, None);
+            }
+            return Ok(());
+        }
+
+        let key_bytes = Bytes::from(key.clone());
+        let flush = if let Some(txn) = self.active_txns.write().get_mut(session) {
             txn.write_log.push(key.clone());
             txn.overlay.insert(key, None);
+            txn.pending_insert_bytes = txn.pending_insert_bytes.saturating_add(key_bytes.len());
+            txn.pending_insert_intents
+                .push(IntentOperation::Delete { key: key_bytes });
+            txn.pending_insert_intents.len() >= Self::INSERT_INTENT_BATCH_OPS
+                || txn.pending_insert_bytes >= Self::INSERT_INTENT_BATCH_BYTES
+        } else {
+            false
+        };
+        if flush {
+            self.flush_insert_intents(session)?;
         }
         Ok(())
     }
