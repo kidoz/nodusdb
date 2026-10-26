@@ -5,7 +5,7 @@ newer reader. Both contain the bootstrap-authentication and local WAL-retention
 fixes. The older reader still lacks admission commands; patching these defects
 must not erase the protocol boundary being tested.
 
-The October 25 clean candidate run at commit
+The historical October 25 clean candidate run at commit
 `c3f31f942b32afe22143d52e3e796728ba738df3` with an empty source patch **passed
 all thirteen checkpoints**, with `passed: true`, `matrix_completed: true`, no
 blockers, and no diagnostic restarts. Its binary SHA-256 is
@@ -18,8 +18,9 @@ survived; the aborted row remained absent. See the
 The October 19 pinned-pair run also passed all thirteen checkpoints in 277.55
 seconds. The October 24 working-tree candidate at commit `45106f9f` plus patch
 `58ef1210f32520ca6533ef66900cdc8e008cecf92f186b82da6734c3267a4925` passed in
-278.416 seconds. Those earlier runs qualify only their recorded sources; the
-clean October 25 candidate is the current release-qualification evidence.
+278.416 seconds. Every pass qualifies only its recorded sources and binary. In
+particular, the October 25 result is not evidence for the current write-batching
+source or for any new candidate built from it.
 
 The maintenance baseline now includes the bounded atomic purge/recovery fix and a
 torn-recovery repair that drops a snapshot descriptor older than the reconciled
@@ -40,7 +41,7 @@ just test-mixed-binary
 It first runs the source-pin tests, then builds and runs both servers. Cargo/Rust,
 Python 3, Git, tar and OpenSSL are required on a Unix host. The default run uses
 neither a working-tree candidate nor diagnostic restart workarounds. Acceptance
-requires `matrix_completed: true`, `passed: true`, thirteen checks and no blockers.
+requires `matrix_completed: true`, `passed: true`, eighteen checks and no blockers.
 
 ## Pinned sources
 
@@ -164,11 +165,27 @@ reader changes, feature rollback, old/new leader elections, v1 transfer from old
 to new, v2 transfer from new to old, candidate refusal with two and then one old
 voter, refusal of an old candidate, and successful admission once every reader is
 new. It also sends a valid admission-command envelope to both readers: R6a
-rejects its unknown variant (HTTP 422), while the newer reader recognizes it and rejects generic
-ingress (HTTP 403). Finally, it kills the current leader after an acknowledged write, writes on
-the elected replacement, restarts the killed process and checks all rows on all
-four members. It is an ordered regression scenario, not a concurrent-workload
-linearizability proof or a performance benchmark.
+rejects its unknown variant (HTTP 422), while the newer reader recognizes it and
+rejects generic ingress (HTTP 403). Finally, it kills the current leader after an
+acknowledged write, writes on the elected replacement, restarts the killed
+process and checks all rows on all four members. It is an ordered regression
+scenario, not a concurrent-workload linearizability proof or a performance
+benchmark.
+
+While old readers remain, the workload also requires write-batching activation
+and preflight to fail without changing the durable authority, then verifies that
+legacy SQL writes still succeed. Once every voter runs the candidate, it
+finalizes migration-v3 and write-batching-v4, loads rows through indexed COPY and
+multirow INSERT, and runs 32 concurrent independent inserts. It then kills the
+leader, writes through the replacement, restarts the killed candidate, and checks
+all 41 rows and representative index lookups on every member. This exercises the
+batched Raft commands and atomic WAL commit records through real reopen.
+
+The matrix does not exercise late-failure COPY atomicity or prove that
+cross-shard 2PC is not grouped; separate integration and command-path tests cover
+those boundaries. No pass of the extended eighteen-checkpoint workload is claimed
+here yet; the historical thirteen-checkpoint passes do not qualify current
+write-batching candidates.
 
 ## Rollback boundaries for this pair
 
@@ -177,18 +194,24 @@ linearizability proof or a performance benchmark.
 | Before snapshot-v2 finalization | Permitted by the upgrade API | Exercised against the same persistent directory after feature rollback |
 | Finalized v2, before any admission | Rejected; finalization is irreversible | Exercised against the same persistent directory |
 | An admission approval has entered the log | Rejected | Unsupported; R6a cannot interpret admission commands or enforce the ledger |
+| Finalized write-batching-v4 | Rejected; finalization is irreversible | Unsupported; R6a cannot interpret the batched Raft commands or WAL commit records |
 
 Before adding a member, replace every existing voter and learner with an
 admission-capable binary. The join coordinator rejects admission while any probed
-member or candidate lacks the reader. Once approval is recorded, do not roll a
-member back to R6a, including while the admission is still pending. A restarted
-historical executable has no new-ledger startup fence. Outbound reader probes in
-R6b do not turn an arbitrary old executable downgrade into a safe operation.
+member or candidate lacks the reader. At level 4, every existing member and the
+candidate must also report `write_batch_version >= 4`. Once approval is recorded,
+do not roll a member back to R6a, including while the admission is still pending.
+A restarted historical executable has no new-ledger startup fence. Outbound
+reader probes in R6b do not turn an arbitrary old executable downgrade into a
+safe operation. The same restriction applies after write-batching finalization:
+feature rollback is closed and an older executable is not a supported recovery
+path for batched records.
 
 The tests do not certify older revisions, member removal/address replacement,
 original learner promotion, cancellation, power loss, live-reader continuity,
-S3 recovery, or a crash between the two joint-consensus commits. Migration remains
-disabled. The fixture's peers authenticate over the dedicated mTLS listener;
+S3 recovery, or a crash between the two joint-consensus commits. The fixture does
+not enable migration or write batching. Its peers authenticate over the dedicated
+mTLS listener;
 it does not exercise the shared-listener bearer-token path, where old binaries
 send no token and upgraded nodes refuse their Raft RPCs — see the
 rolling-upgrade caveat in

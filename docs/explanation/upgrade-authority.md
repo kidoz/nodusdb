@@ -1,11 +1,12 @@
 # Snapshot upgrade authority
 
-The production server can enable NSNP v2 after explicit, verified finalization.
-It starts at compatibility level 1 and writes v1 snapshots until then. This
-authority protocol supports the target **`snapshot-v2`** and freezes meta
-membership during the upgrade. After finalization, verified additive admission
-can introduce new voters. It does not enable shard
-migration, a new SST/WAL format, or general rolling binary upgrades.
+The production server starts at compatibility level 1 and enables NSNP v2,
+shard migration, and write batching only after their explicit, verified
+finalizations. The sequential targets are **`snapshot-v2`**, **`migration-v3`**,
+and **`write-batching-v4`**. Meta membership is frozen while an upgrade is in
+flight; after finalization, verified additive admission can introduce new
+voters. Feature finalization does not establish general rolling-binary or
+executable-downgrade compatibility.
 
 ## Authority and evidence
 
@@ -33,9 +34,11 @@ Remote probes require the configured peer mTLS transport: only the cluster CA
 is trusted, server hostname verification remains enabled, redirects are disabled,
 and HTTP downgrade is prohibited. Reports must echo the fresh challenge and
 match the requested numeric node ID, supported authority version and snapshot
-version. Missing, duplicate, unknown, stale or incompatible reports cannot enable
-v2. Start also probes every member, because every recipient must already read the
-new authority command before it enters the Raft log.
+version. Activation also requires `migration_version >= 4` for level 3 and
+`write_batch_version >= 4` for level 4. Missing, duplicate, unknown, stale or
+incompatible reports cannot enable the requested target. Start also probes every
+member, because every recipient must already read the new authority command
+before it enters the Raft log.
 
 This assumes trusted, non-Byzantine cluster peers and correct CA/certificate
 issuance. The protocol binds a certificate-validated endpoint to its reported ID;
@@ -57,31 +60,37 @@ continues to require its separate recovery and retention prerequisites.
 Use the existing authenticated `/api/v1/upgrade` API on the meta leader:
 
 1. `GET /api/v1/upgrade` to inspect phase, revision, cluster level, membership,
-   reports and the `mvcc_snapshots` feature gate.
+   reports, the next target, and the `mvcc_snapshots`, `migration_v3`, and
+   `write_batching` feature gates.
 2. `POST /api/v1/upgrade/start?target=snapshot-v2` to verify readers and persist
-   `RollingNodes`. After level 2 is finalized, `target=migration-v3` starts the
-   next sequential upgrade (see below). Other target strings are rejected.
+   `RollingNodes`. After level 2 is finalized, use `target=migration-v3`; after
+   level 3 is finalized, use `target=write-batching-v4`. Skipping a target or
+   supplying any other target string is rejected.
 3. `POST /api/v1/upgrade/node-upgraded?node=<numeric-member-id>` to refresh reports
    from **all** members and persist `ReadyToFinalize`. The name supplied by the
    caller is not evidence that a binary was upgraded.
-4. `POST /api/v1/upgrade/finalize` to run fresh verification and commit level 2.
-   Existing authorized admin middleware continues to enforce permission and audit.
+4. `POST /api/v1/upgrade/finalize` to run fresh verification and commit the next
+   cluster-compatibility level. Existing authorized admin middleware continues
+   to enforce permission and audit.
 
 Rollback before finalization clears the session/reports, keeps a newer revision
-and returns to level 1. Finalization closes rollback. Repeated/stale commands
-cannot reset the phase or reuse an old challenge. A timed-out operation has an
-uncertain outcome; inspect status before retrying. Membership changes during
-probing invalidate the operation at apply. Joint membership cannot start/finalize.
+and returns to level 1. It is rejected once an admission ledger exists, because
+returning to the initial idle state would strand that ledger. Start is likewise
+rejected while member admission is pending. A completed admission ledger remains
+unchanged and valid as an ancestor of later finalized authority revisions.
+Finalization closes rollback. Repeated/stale commands cannot reset the phase or
+reuse an old challenge. A timed-out operation has an uncertain outcome; inspect
+status before retrying. Membership changes during probing invalidate the
+operation at apply. Joint membership cannot start/finalize.
 
-## Level 3 scaffolding (`migration-v3`)
+## Shard migration (`migration-v3`)
 
-The authority also accepts the target **`migration-v3`**, startable only after
-level 2 is finalized, and finalizing it commits cluster-compatibility level 3.
-Every level-2 rule applies unchanged — stale-revision CAS, frozen membership,
-fresh session challenge, drained-intent/2PC/migration preflight, and a report
-from every voter and learner — and, mirroring the snapshot-v2 reader gate, every
-step toward level 3 additionally requires each member to report
-`migration_version >= 3` (this binary reports 3). The field is an optional
+The authority accepts **`migration-v3`** only after level 2 is finalized, and
+finalizing it commits cluster-compatibility level 3. Every level-2 rule applies
+unchanged — stale-revision CAS, frozen membership, fresh session challenge,
+drained-intent/2PC/migration preflight, and a report from every voter and
+learner. Every step toward level 3 additionally requires each member to report
+`migration_version >= 4` (this binary reports 4). The field is an optional
 serde-defaulted capability like `admission_version`: old readers ignore it, and
 base-authority transitions clear it before persisting, so old and new readers
 persist byte-identical records. A `Finalized` authority accepts only a fresh
@@ -96,9 +105,37 @@ meta-leader journal-discovery worker resumes interrupted operations, and shard
 (`POST /api/v1/shards/{table}/split`), **merge**
 (`POST /api/v1/shards/{table}/merge`), and **rebalance**
 (`POST /api/v1/shards/{table}/rebalance`, a guarded atomic placements write —
-groups replicate roster-wide, so no bytes move) are enabled. Status reports a `migration_v3` feature gate
-(`cluster_version >= 3`). See the activation design in the
-[shard migration protocol](shard-migration-protocol.md).
+groups replicate roster-wide, so no bytes move) are enabled. Status reports a
+`migration_v3` feature gate (`cluster_version >= 3`). See the activation design
+in the [shard migration protocol](shard-migration-protocol.md).
+
+## Write batching (`write-batching-v4`)
+
+The authority accepts **`write-batching-v4`** only after level 3 is finalized.
+Start, refresh, and finalize toward level 4 all require a fresh report with
+`write_batch_version >= 4` from every voter and learner; this binary reports 4.
+The optional capability is cleared from persisted base-authority reports in the
+same way as `migration_version`. Finalization sets `cluster_version` to 4 and
+opens the `write_batching` gate. Before that point, the router continues to emit
+legacy single-write and single-commit commands, and LSM continues to emit legacy
+single-transaction WAL commit records. Finalization closes rollback.
+
+`EpochWriteBatchV1` groups one transaction's put and delete intents by Raft group
+and epoch. Apply rejects an empty batch, more than 256 operations, or more than
+1 MiB of key/value payload, and rejects reserved keys and write conflicts without
+publishing a partial intent batch. Batching does not make intents visible before
+commit.
+
+`EpochCommitBatchV1` groups independent single-participant commits for the same
+group and epoch. The router closes a group/epoch batch at 32 commits or after a
+one-millisecond wait, with a 1,024-request commit queue. If that queue is full,
+the request falls back to the legacy single-commit command. Cross-shard 2PC is
+not grouped. Forwarding a batch requires the receiving leader to report both the
+migration and write-batching reader capabilities.
+
+The storage and recovery consequences, including `CommitTxnBatchV1`, PITR replay,
+and COPY atomicity, are specified in the
+[durability contract](../reference/durability-contract.md#batched-writes-and-copy).
 
 ## Adding members after finalization
 
@@ -114,12 +151,17 @@ The finalized base authority stays immutable. A separate version 1 ledger at
 `\x01upgrade/admission/v1/state`, anchored to its revision, records this sequence:
 
 1. **Approved:** probe every current voter, learner and candidate with a fresh
-   challenge; require snapshot v2 and admission v1 support; replicate the reserved
-   ID/address, candidate report, operation UUID and original membership.
+   challenge; require snapshot v2 and admission v1 support, plus every reader
+   required by the finalized cluster level. At level 4 this includes
+   `write_batch_version >= 4` on every existing member and the candidate.
+   Replicate the reserved ID/address, candidate report, operation UUID and
+   original membership.
 2. Add the candidate as a learner and wait for catch-up. Re-probe all members with
-   another challenge and replicate **Promoting** before changing voter membership.
-3. Complete joint consensus, verify the resulting stable voter membership, and
-   replicate completion. The admitted identity remains in the ledger permanently.
+   another challenge, enforce the same level-specific capabilities, and replicate
+   **Promoting** before changing voter membership.
+3. Complete joint consensus, verify the resulting stable voter membership and
+   required capabilities, and replicate completion. The admitted identity remains
+   in the ledger permanently.
 
 Each command compares the exact applied membership and expected ledger revision.
 One pending operation serializes admissions across retries and leader changes.
@@ -160,15 +202,23 @@ learner creation, so catch-up can use v2 snapshots with history and intents.
 | Admission-v1 reader after admission | Reads | Reads and writes anchored ledger | Yes |
 
 A missing capability field decodes as admission version 0; it does not authorize
-admission. Base-authority commands and transitions clear that optional field,
-so old and new authority readers persist identical base records; the immutable
-base does not acquire admission-only evidence. Before the first new admission
-command, the service probes all current members.
+admission. The table describes admission-ledger compatibility only: migration and
+write-batching capabilities remain mandatory when their cluster levels are
+finalized. Base-authority commands and transitions clear optional capability
+fields, so old and new authority readers persist identical base records; the
+immutable base does not acquire admission-only evidence. Before the first new
+admission command, the service probes all current members.
 The sender also probes before transmitting an admission command. Once a ledger
 exists, it requires admission-v1 support before every append RPC and every v2
 snapshot chunk, including cached/resumed transfers. This adds one capability RPC
 to append traffic after admission; failure blocks replication to that peer.
 This is a fail-closed reader guard, not a supported executable downgrade procedure.
+
+After level-4 finalization, do not replace any voter or learner with a binary
+that lacks write-batching support. It cannot safely interpret the new Raft
+commands or `CommitTxnBatchV1` WAL records. Feature rollback is closed, and a
+pre-finalization executable rollback does not qualify a downgrade after new
+records may have been emitted.
 
 ## Snapshot serving and recovery
 
@@ -211,15 +261,19 @@ used as writer or backup authority.
   authentication and local WAL-retention fixes; the older maintenance reader still
   rejects admission commands. The original historical binaries retain those
   defects and are not covered by maintenance-pair acceptance. The September 14
-  maintenance-pair run passed all thirteen checkpoints without diagnostic restarts.
-  The pinned executables retain long synchronous log-purge pauses. Current source
+  maintenance-pair run and the October 25 run at commit
+  `c3f31f942b32afe22143d52e3e796728ba738df3` passed all thirteen checkpoints
+  without diagnostic restarts. A separate batching-candidate run stopped after
+  four checkpoints because the older receiver's restart reported a purge
+  watermark beyond its saved snapshot. These observations qualify only their
+  recorded sources. The pinned executables retain long synchronous log-purge
+  pauses; current source
   [batches and offloads purge](../reference/durability-contract.md#raft-log-purge),
   but passing the matrix is not a latency guarantee.
-  A subsequent batching-candidate run stopped after four checkpoints because the
-  older receiver's restart reported a purge watermark beyond its saved snapshot.
-  Candidate mixed-binary acceptance remains unqualified pending a maintenance
-  purge/recovery backport and another complete run.
-  Feature rollback does **not** establish arbitrary executable compatibility.
+  The thirteen-checkpoint workload does not activate migration-v3 or
+  write-batching-v4. No completed mixed-binary run is claimed for the current
+  write-batching source, and feature rollback does **not** establish arbitrary
+  executable compatibility.
 - Tests cover full voter/learner reports, duplicate/unknown/stale reports, premature
   finalization, rollback, malformed records, actual mTLS/Raft leader loss and reopen,
   an unavailable member blocking finalization, abrupt subprocess exit after an

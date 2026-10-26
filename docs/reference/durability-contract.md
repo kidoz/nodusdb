@@ -11,7 +11,8 @@ These hold when a persistent data directory is configured (`[storage] data_dir`)
 | Guarantee | Statement |
 | --- | --- |
 | Commit durability | A transaction whose `COMMIT` has been acknowledged to the client survives process crash and restart. Its writes reach the write-ahead log, and the log is `fsync`ed, before the acknowledgement is sent. |
-| Abort invisibility | An aborted or never-committed transaction is never visible, before or after a crash. Its intents are invisible to readers and discarded on abort. |
+| Batch commit recovery | A persistent `CommitTxnBatchV1` is one atomic WAL record followed by one sync. Recovery either replays every transaction in that record or none of them; live publication begins only after the sync succeeds. |
+| Abort invisibility | An aborted or never-committed transaction is never visible, before or after a crash. Its intents are invisible to readers and discarded on abort. Batched put/delete intents remain invisible until their transaction commits. |
 | No torn reads after crash | Recovery never mistakes a torn or partial file for a complete one. A crash part-way through a flush, compaction, WAL append, or manifest write leaves the store recoverable to its last consistent state, with no acknowledged write lost. |
 | Version retention | MVCC versions are reclaimed only at or below the garbage-collection watermark — the oldest timestamp any in-flight reader could still observe — so a live read never loses a version it is entitled to see. |
 
@@ -42,6 +43,11 @@ is what the commit-acknowledgement ordering rests on.
 | Torn WAL tail truncates at recovery, and commits acknowledged after that recovery survive the next power cut | `nodus_storage_wal`: `recover_truncates_a_torn_tail_so_later_appends_stay_replayable`; `nodus_storage_lsm`: `powercut_tests::torn_wal_tail_recovers_and_later_commits_survive_the_next_power_cut` |
 | Power cut after acknowledged commits, cut at every byte of the unsynced WAL tail (clean and torn variants) | `nodus_storage_lsm`: `powercut_tests::acknowledged_commits_survive_power_cut_at_every_byte_of_the_unsynced_tail` |
 | Power cut with a commit whose fsync never completed is all-or-nothing, never partially applied | `nodus_storage_lsm`: `powercut_tests::unacknowledged_commit_is_never_partially_applied_after_power_cut` |
+| Power cut with an unsynced commit batch never partially applies the batch | `nodus_storage_lsm`: `powercut_tests::unacknowledged_commit_batch_is_never_partially_applied_after_power_cut` |
+| One commit batch syncs once and recovers every transaction, including after intent flushes | `nodus_storage_lsm`: `powercut_tests::commit_batch_syncs_once_and_recovers_every_transaction`, `commit_batch_recovers_all_transactions_after_intent_flushes` |
+| Reserved keys, write conflicts, and invalid sizes reject a write batch without partial intents | `nodus_raftstore`: `migration::tests::write_batch_rejects_any_reserved_key_before_writing`, `migration::tests::write_batch_conflict_is_rejected_without_partial_intents`, `migration::tests::invalid_batch_sizes_are_rejected_at_apply` |
+| Batched commits publish all transactions and replay idempotently | `nodus_raftstore`: `migration::tests::commit_batch_publishes_all_transactions_and_replays_idempotently` |
+| Unknown valid-frame WAL and Raft log records fail recovery rather than being skipped | `nodus_storage_wal`: `recover_rejects_a_newer_record_version`, `recover_rejects_undecodable_supported_version_payloads`; `nodus_raftstore`: `store_construction_fails_closed_on_unknown_log_envelope`, `store_construction_fails_closed_on_malformed_log_entry_json` |
 | WAL segment power cut keeps exactly the fsynced prefix; garbled or flipped tails are rejected | `nodus_storage_wal`: `power_cut_preserves_exactly_the_synced_prefix`, `power_cut_with_garbled_tail_recovers_the_synced_prefix` |
 | Power cut on either side of the flush's manifest rename (old or new manifest, orphan files present or lost, never a hybrid) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_flush_publishes_old_or_new_manifest` |
 | Power cut on either side of the checkpoint's manifest rename (old or new snapshot in full) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_checkpoint_publishes_old_or_new_snapshot` |
@@ -57,6 +63,9 @@ is what the commit-acknowledgement ordering rests on.
 | Committed row and catalog survive a full restart | `tests/fault`: `committed_data_survives_a_restart` |
 | Rolled-back writes never visible, before or after restart | `tests/fault`: `rolled_back_writes_are_never_visible` |
 | Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` and the persistent filesystem/S3 `restore_drill` scenarios |
+| PITR applies each commit in a batch according to its own target-timestamp boundary | `nodus_backup`: `pitr_commit_batch_applies_each_transaction_at_the_target_boundary` |
+| Late COPY failure rolls back an autocommit import, while explicit transaction ownership is preserved | `tests/integration`: `copy_in_late_constraint_failure_rolls_back_autocommit`, `copy_in_preserves_explicit_transaction_ownership` |
+| Write batching handles indexed COPY and concurrent single-participant commits | `tests/integration`: `write_batching_handles_indexed_copy_and_concurrent_commits` |
 
 A graceful server shutdown runs a final storage flush and closed-segment archive
 pass before its archiver handle completes. This prevents acknowledged writes in
@@ -64,6 +73,32 @@ the active segment from remaining local-only during an orderly recovery drill.
 It is not a distributed write-drain fence. An abrupt exit cannot perform that
 pass; PITR coverage after a crash is bounded by the last successfully archived
 segment.
+
+## Batched writes and COPY
+
+After `write-batching-v4` finalization, `EpochWriteBatchV1` carries one
+transaction's put/delete intents for one Raft group and epoch. Each apply is
+bounded to 256 operations and 1 MiB of key/value payload. These are still
+intents, not committed versions. `EpochCommitBatchV1` instead carries independent
+single-participant commits for one group and epoch. The router uses a maximum of
+32 commits, a one-millisecond batching wait, and a 1,024-request queue; a full
+queue uses the legacy single-commit command. Cross-shard 2PC retains its existing
+protocol and is not grouped.
+
+On persistent LSM, the resulting `CommitTxnBatchV1` is appended as one WAL record
+and synced once before any of its transactions are published. The transactions
+keep their own commit timestamps. PITR compares each timestamp independently
+with the restore target rather than applying or skipping the whole record as a
+unit. Unknown record versions and undecodable supported-version payloads in
+complete, valid WAL frames fail recovery; unknown or malformed persisted Raft
+log entries likewise fail store construction. This is distinct from a torn or
+partial trailing frame, which recovery truncates at the last valid boundary.
+
+`COPY FROM STDIN` accumulates all wire chunks and executes their rows in one
+executor batch. Outside an explicit transaction, that batch is one autocommit
+transaction: a late decoding, planning, or constraint failure rolls back rows
+from every chunk. Inside an existing user transaction, COPY joins that
+transaction and leaves commit or rollback ownership with the user.
 
 ## Local WAL archive cleanup
 
@@ -169,7 +204,7 @@ prove power-loss durability. See the [protocol and compatibility limits](../expl
 | Limitation | Consequence |
 | --- | --- |
 | In-memory by default | Durability requires `[storage] data_dir`. |
-| No general cross-version on-disk compatibility guarantee | Upgrading across hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) requires a clean restart except for explicitly verified maintenance/candidate pairs. The October 18, 2026 mixed-binary runs passed only the pair documented in [the upgrade gate](../how-to/test-mixed-binary-upgrades.md); they do not establish compatibility with arbitrary older binaries or future formats. |
+| No general cross-version on-disk compatibility guarantee | Upgrading across hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) requires a clean restart except for explicitly verified maintenance/candidate pairs. The historical mixed-binary evidence in [the upgrade gate](../how-to/test-mixed-binary-upgrades.md), including the October 25, 2026 run at commit `c3f31f942b32afe22143d52e3e796728ba738df3`, qualifies only its recorded sources. That workload did not activate write batching and is not current-candidate evidence for `CommitTxnBatchV1` recovery or executable downgrade. |
 | Catalog persistence writes a full-state blob per DDL | Catalog writes are not incremental per entry. |
 | WAL retention has two boundaries | Local cleanup waits for both backup retention and the durable local replay floor; retained intents or restore points can delay reclamation. |
 | General runtime error injection is not wired into the storage engines | Power loss is simulated by cutting files back to their fsynced prefixes (`powercut_tests`, above), which proves the fsync discipline under a device that honors fsync. It does not prove real device behavior: volatile write caches, drives or filesystems that lie about fsync, and fsync error handling on subsequent writes are out of scope for in-process tests. The `FaultPoint`/`FaultAction` injector in `nodus_testkit` remains a registry without production call sites. |

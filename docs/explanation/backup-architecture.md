@@ -166,7 +166,7 @@ filtering, and index validation.
 Cluster backup coordination lives in a versioned journal on the meta group at
 `\x01backup/v1/job/{job_id}`, replicated like the migration journal and gated
 by the same finalized migration cluster level (level 3): only binaries that
-report `migration_version >= 3` exist in such a cluster, and they all decode
+report `migration_version >= 4` exist in such a cluster, and they all decode
 the journal. Below level 3, or whenever the journal is unavailable, backup
 keeps the node-local path unchanged.
 

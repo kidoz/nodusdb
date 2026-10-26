@@ -271,11 +271,11 @@ Cluster-compatibility levels and what they unlock:
 
 `CapabilityV1` gains an optional `migration_version` report field (serde
 default, like `admission_version`). Finalization to level 3 requires a fresh
-report from every voter and learner with `migration_version >= 3`, the
+report from every voter and learner with `migration_version >= 4`, the
 membership freeze, and the existing preflight: drained intents, no undecided
 2PC records, and no in-flight migration journals. Post-finalization membership
 changes continue through the admission ledger; an admitted member must report
-`migration_version >= 3` before promotion.
+`migration_version >= 4` before promotion.
 
 ### Per-operation enablement ladder
 
