@@ -175,7 +175,7 @@ fn finalized_two() -> RecordV1 {
 }
 
 #[test]
-fn sequential_lifecycle_restarts_after_finalized_and_reaches_level_three() {
+fn sequential_lifecycle_restarts_after_finalized_and_reaches_level_four() {
     let two = finalized_two();
     // Only a fresh Start reopens a finalized authority; every other operation
     // stays closed, and a replayed session challenge is rejected.
@@ -215,17 +215,29 @@ fn sequential_lifecycle_restarts_after_finalized_and_reaches_level_three() {
     assert_eq!(three.phase, Phase::Finalized);
     assert_eq!(three.cluster_version, 3);
     assert!(decode(&serde_json::to_vec(&three).unwrap()).is_ok());
-    // Level 3 is the highest target; rollback and further starts are closed.
-    assert!(
-        transition(
-            &three,
-            &command(&three, OperationV1::Rollback),
-            &roster(),
-            8
-        )
-        .is_err()
-    );
-    assert!(transition(&three, &command(&three, OperationV1::Start), &roster(), 8).is_err());
+
+    let rolling = transition(&three, &command(&three, OperationV1::Start), &roster(), 8).unwrap();
+    assert_eq!(rolling.cluster_version, 3);
+    let ready = transition(
+        &rolling,
+        &command(&rolling, OperationV1::Refresh),
+        &roster(),
+        9,
+    )
+    .unwrap();
+    let four = transition(
+        &ready,
+        &command(&ready, OperationV1::Finalize),
+        &roster(),
+        10,
+    )
+    .unwrap();
+    assert_eq!(four.phase, Phase::Finalized);
+    assert_eq!(four.cluster_version, WRITE_BATCH_LEVEL);
+    assert!(decode(&serde_json::to_vec(&four).unwrap()).is_ok());
+    // Level 4 is the highest target; rollback and further starts are closed.
+    assert!(transition(&four, &command(&four, OperationV1::Rollback), &roster(), 11).is_err());
+    assert!(transition(&four, &command(&four, OperationV1::Start), &roster(), 11).is_err());
 }
 
 #[test]
@@ -235,7 +247,7 @@ fn level_three_requires_migration_capability_from_every_voter_and_learner() {
         let mut cmd = command(&two, OperationV1::Start);
         match defect {
             0 => cmd.reports[0].migration_version = None,
-            1 => cmd.reports[1].migration_version = Some(MIGRATION_VERSION - 1),
+            1 => cmd.reports[1].migration_version = Some(3),
             // The learner (node 3) must report the capability as well.
             2 => cmd.reports[2].migration_version = None,
             _ => {
@@ -259,7 +271,7 @@ fn level_three_requires_migration_capability_from_every_voter_and_learner() {
     )
     .unwrap();
     let mut finalize = command(&ready, OperationV1::Finalize);
-    finalize.reports[0].migration_version = Some(MIGRATION_VERSION - 1);
+    finalize.reports[0].migration_version = Some(3);
     assert!(transition(&ready, &finalize, &roster(), 7).is_err());
     // Level 2 steps never require the field, so older readers can run 1 -> 2.
     let start = command(&RecordV1::default(), OperationV1::Start);
@@ -269,6 +281,53 @@ fn level_three_requires_migration_capability_from_every_voter_and_learner() {
     }
     let legacy: CommandV1 = serde_json::from_value(legacy).unwrap();
     assert!(transition(&RecordV1::default(), &legacy, &roster(), 2).is_ok());
+}
+
+#[test]
+fn level_four_requires_write_batch_capability_from_every_voter_and_learner() {
+    let mut three = finalized_two();
+    for (index, action) in [
+        (5, OperationV1::Start),
+        (6, OperationV1::Refresh),
+        (7, OperationV1::Finalize),
+    ] {
+        three = transition(&three, &command(&three, action), &roster(), index).unwrap();
+    }
+    for defect in 0..4 {
+        let mut cmd = command(&three, OperationV1::Start);
+        match defect {
+            0 => cmd.reports[0].write_batch_version = None,
+            1 => cmd.reports[1].write_batch_version = Some(WRITE_BATCH_VERSION - 1),
+            2 => cmd.reports[2].write_batch_version = None,
+            _ => {
+                for report in &mut cmd.reports {
+                    report.write_batch_version = None;
+                }
+            }
+        }
+        assert!(transition(&three, &cmd, &roster(), 8).is_err());
+    }
+    let rolling = transition(&three, &command(&three, OperationV1::Start), &roster(), 8).unwrap();
+    let mut refresh = command(&rolling, OperationV1::Refresh);
+    refresh.reports[2].write_batch_version = None;
+    assert!(transition(&rolling, &refresh, &roster(), 9).is_err());
+    let ready = transition(
+        &rolling,
+        &command(&rolling, OperationV1::Refresh),
+        &roster(),
+        9,
+    )
+    .unwrap();
+    let mut finalize = command(&ready, OperationV1::Finalize);
+    finalize.reports[0].write_batch_version = Some(WRITE_BATCH_VERSION - 1);
+    assert!(transition(&ready, &finalize, &roster(), 10).is_err());
+
+    let two = finalized_two();
+    let mut level3 = command(&two, OperationV1::Start);
+    for report in &mut level3.reports {
+        report.write_batch_version = None;
+    }
+    assert!(transition(&two, &level3, &roster(), 5).is_ok());
 }
 
 #[test]
@@ -376,11 +435,19 @@ fn base_authority_bytes_match_reader_that_discards_admission_capability() {
                 .collect::<Vec<_>>(),
             vec![Some(MIGRATION_VERSION); 3]
         );
+        assert_eq!(
+            cmd.reports
+                .iter()
+                .map(|r| r.write_batch_version)
+                .collect::<Vec<_>>(),
+            vec![Some(WRITE_BATCH_VERSION); 3]
+        );
         let mut legacy_json = serde_json::to_value(&cmd).unwrap();
         for report in legacy_json["reports"].as_array_mut().unwrap() {
             let report = report.as_object_mut().unwrap();
             report.remove("admission_version");
             report.remove("migration_version");
+            report.remove("write_batch_version");
         }
         let legacy: CommandV1 = serde_json::from_value(legacy_json).unwrap();
         let new = transition(&old, &cmd, &roster(), index).unwrap();
@@ -390,6 +457,7 @@ fn base_authority_bytes_match_reader_that_discards_admission_capability() {
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("admission_version"));
         assert!(!text.contains("migration_version"));
+        assert!(!text.contains("write_batch_version"));
         // A base record written by a reader that never knew the optional
         // capability fields still decodes and validates.
         assert!(decode(text.as_bytes()).is_ok());

@@ -275,3 +275,30 @@ fn level3_admission_requires_migration_capable_reports() {
     legacy.reports[1].migration_version = None;
     assert!(transition(&a2, None, &legacy, &a2.membership, 11).is_ok());
 }
+
+#[test]
+fn level4_admission_requires_write_batch_capable_reports() {
+    let mut a = authority();
+    a.cluster_version = WRITE_BATCH_LEVEL;
+
+    let mut missing_candidate = approval(&a);
+    missing_candidate.reports[1].write_batch_version = None;
+    assert!(transition(&a, None, &missing_candidate, &a.membership, 11).is_err());
+
+    let mut old_member = approval(&a);
+    old_member.reports[0].write_batch_version = Some(WRITE_BATCH_VERSION - 1);
+    assert!(transition(&a, None, &old_member, &a.membership, 11).is_err());
+
+    let approved = transition(&a, None, &approval(&a), &a.membership, 11).unwrap();
+    let learner = membership(vec![[1].into()], true);
+    let mut promote = command(Some(&approved), OperationV1::Promote, learner.clone());
+    promote.reports[1].write_batch_version = None;
+    assert!(transition(&a, Some(approved.clone()), &promote, &learner, 12).is_err());
+    let promote = command(Some(&approved), OperationV1::Promote, learner.clone());
+    assert!(transition(&a, Some(approved), &promote, &learner, 12).is_ok());
+
+    let a3 = authority();
+    let mut legacy = approval(&a3);
+    legacy.reports[1].write_batch_version = None;
+    assert!(transition(&a3, None, &legacy, &a3.membership, 11).is_ok());
+}

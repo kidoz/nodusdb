@@ -242,12 +242,9 @@ fn validate_reports(
     }
     Ok(reports)
 }
-/// A level-3 cluster may only admit or promote members that enforce the
-/// migration protocol: a stale binary would fail closed on V3 records and
-/// diverge from the group. Level 3 finalized only after every member reported
-/// `migration_version >= MIGRATION_VERSION`, so every fresh report must carry
-/// it too.
-fn require_migration_readers(
+/// Finalized protocol levels remain admission requirements: every current and
+/// candidate member must keep reporting the readers activated by the cluster.
+fn require_protocol_readers(
     authority: &super::RecordV1,
     reports: &BTreeMap<u64, CapabilityV1>,
 ) -> Result<()> {
@@ -256,6 +253,15 @@ fn require_migration_readers(
             ensure!(
                 report.migration_version >= Some(MIGRATION_VERSION),
                 "member {} does not enforce migration protocol v3",
+                report.node_id
+            );
+        }
+    }
+    if authority.cluster_version >= WRITE_BATCH_LEVEL {
+        for report in reports.values() {
+            ensure!(
+                report.write_batch_version >= Some(WRITE_BATCH_VERSION),
+                "member {} does not enforce write batching v4",
                 report.node_id
             );
         }
@@ -307,7 +313,7 @@ fn transition(
             let mut extended = roster;
             extended.insert(*node_id, address.clone());
             let reports = validate_reports(cmd, &extended)?;
-            require_migration_readers(authority, &reports)?;
+            require_protocol_readers(authority, &reports)?;
             next.admitted.insert(
                 *node_id,
                 MemberV1 {
@@ -343,7 +349,7 @@ fn transition(
                         "stale promotion report"
                     );
                     let reports = validate_reports(cmd, &roster)?;
-                    require_migration_readers(authority, &reports)?;
+                    require_protocol_readers(authority, &reports)?;
                     next.admitted
                         .get_mut(&plan.node_id)
                         .ok_or_else(|| anyhow::anyhow!("candidate absent"))?

@@ -15,12 +15,15 @@ pub const KEY: &[u8] = b"\x01upgrade/v1/state";
 pub const MAX_MEMBERS: usize = 256;
 pub const TARGET: &str = "snapshot-v2";
 pub const MIGRATION_TARGET: &str = "migration-v3";
+pub const WRITE_BATCH_TARGET: &str = "write-batching-v4";
 /// Cluster-compatibility level activated by finalizing `MIGRATION_TARGET`.
 /// Level 3 is inert scaffolding: every migration fence stays in effect.
 pub const MIGRATION_LEVEL: u64 = 3;
 /// Migration protocol capability reported by this binary.
-pub const MIGRATION_VERSION: u64 = 3;
-pub const MAX_CLUSTER_VERSION: u64 = MIGRATION_LEVEL;
+pub const MIGRATION_VERSION: u64 = 4;
+pub const WRITE_BATCH_LEVEL: u64 = 4;
+pub const WRITE_BATCH_VERSION: u64 = 4;
+pub const MAX_CLUSTER_VERSION: u64 = WRITE_BATCH_LEVEL;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProbeV1 {
@@ -41,6 +44,8 @@ pub struct CapabilityV1 {
     pub admission_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_batch_version: Option<u64>,
 }
 fn is_zero(value: &u16) -> bool {
     *value == 0
@@ -58,6 +63,7 @@ impl CapabilityV1 {
             ready_for_finalize: false,
             admission_version: 1,
             migration_version: Some(MIGRATION_VERSION),
+            write_batch_version: Some(WRITE_BATCH_VERSION),
         }
     }
     pub fn validate(&self, node: u64, challenge: Uuid) -> Result<()> {
@@ -271,7 +277,13 @@ fn transition(
         if target_level >= MIGRATION_LEVEL {
             ensure!(
                 report.migration_version.unwrap_or(0) >= MIGRATION_VERSION,
-                "migration-v3 requires a migration version 3 report from every voter and learner"
+                "migration-v3 requires a migration version 4 report from every voter and learner"
+            );
+        }
+        if target_level >= WRITE_BATCH_LEVEL {
+            ensure!(
+                report.write_batch_version.unwrap_or(0) >= WRITE_BATCH_VERSION,
+                "write-batching-v4 requires a write batch version 4 report from every voter and learner"
             );
         }
         // R6a readers discard these optional fields. Keep the immutable base
@@ -279,6 +291,7 @@ fn transition(
         let mut report = report.clone();
         report.admission_version = 0;
         report.migration_version = None;
+        report.write_batch_version = None;
         ensure!(
             reports.insert(report.node_id, report).is_none(),
             "duplicate capability report"

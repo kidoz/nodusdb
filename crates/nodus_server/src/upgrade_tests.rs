@@ -243,7 +243,7 @@ async fn upgrade_crash_child() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn migration_v3_scaffolding_lifecycle_and_feature_gates() {
+async fn sequential_upgrade_lifecycle_and_feature_gates() {
     let dir = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -265,7 +265,11 @@ async fn migration_v3_scaffolding_lifecycle_and_feature_gates() {
     );
     assert_eq!(
         service.get_state().await.unwrap()["feature_gates"],
-        serde_json::json!({"mvcc_snapshots": false, "migration_v3": false})
+        serde_json::json!({
+            "mvcc_snapshots": false,
+            "migration_v3": false,
+            "write_batching": false
+        })
     );
     service.start_upgrade(upgrade::TARGET.into()).await.unwrap();
     service.report_node_upgraded("1").await.unwrap();
@@ -274,6 +278,7 @@ async fn migration_v3_scaffolding_lifecycle_and_feature_gates() {
     let gates = service.get_state().await.unwrap()["feature_gates"].clone();
     assert_eq!(gates["mvcc_snapshots"], true);
     assert_eq!(gates["migration_v3"], false);
+    assert_eq!(gates["write_batching"], false);
 
     // The next sequential target is migration-v3; the old target and arbitrary
     // strings are rejected. The gate flips only after finalization.
@@ -296,12 +301,39 @@ async fn migration_v3_scaffolding_lifecycle_and_feature_gates() {
         upgrade::read(nodes[0].kv.as_ref()).unwrap().cluster_version,
         3
     );
-    let gates = service.get_state().await.unwrap()["feature_gates"].clone();
-    assert_eq!(gates["migration_v3"], true);
-    // No higher target exists; rollback stays closed after finalization.
+    let state = service.get_state().await.unwrap();
+    assert_eq!(state["target_version"], upgrade::WRITE_BATCH_TARGET);
+    assert_eq!(state["feature_gates"]["migration_v3"], true);
+    assert_eq!(state["feature_gates"]["write_batching"], false);
+
     assert!(
         service
             .start_upgrade(upgrade::MIGRATION_TARGET.into())
+            .await
+            .is_err()
+    );
+    service
+        .start_upgrade(upgrade::WRITE_BATCH_TARGET.into())
+        .await
+        .unwrap();
+    service.report_node_upgraded("1").await.unwrap();
+    assert_eq!(
+        service.get_state().await.unwrap()["feature_gates"]["write_batching"],
+        false
+    );
+    service.finalize_upgrade().await.unwrap();
+    converge(&nodes, Phase::Finalized).await;
+    assert_eq!(
+        upgrade::read(nodes[0].kv.as_ref()).unwrap().cluster_version,
+        4
+    );
+    let state = service.get_state().await.unwrap();
+    assert_eq!(state["target_version"], serde_json::Value::Null);
+    assert_eq!(state["feature_gates"]["write_batching"], true);
+    // No higher target exists; rollback stays closed after finalization.
+    assert!(
+        service
+            .start_upgrade(upgrade::WRITE_BATCH_TARGET.into())
             .await
             .is_err()
     );

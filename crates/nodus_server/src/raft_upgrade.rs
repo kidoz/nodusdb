@@ -41,6 +41,8 @@ impl RaftUpgradeCoordinator {
             || record.cluster_version >= upgrade::MAX_CLUSTER_VERSION
         {
             serde_json::Value::Null
+        } else if record.cluster_version >= 3 {
+            upgrade::WRITE_BATCH_TARGET.into()
         } else if record.cluster_version >= 2 {
             upgrade::MIGRATION_TARGET.into()
         } else {
@@ -49,6 +51,7 @@ impl RaftUpgradeCoordinator {
         value["feature_gates"] = serde_json::json!({
             "mvcc_snapshots": record.cluster_version >= 2,
             "migration_v3": record.cluster_version >= 3,
+            "write_batching": record.cluster_version >= 4,
         });
         value["member_admission"] =
             serde_json::to_value(upgrade::admission::read(self.kv.as_ref())?)?;
@@ -66,6 +69,7 @@ impl RaftUpgradeCoordinator {
         let expected = match record.cluster_version {
             1 => upgrade::TARGET,
             2 => upgrade::MIGRATION_TARGET,
+            3 => upgrade::WRITE_BATCH_TARGET,
             _ => "",
         };
         ensure!(
