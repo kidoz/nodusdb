@@ -76,14 +76,32 @@ impl NodusCopyHandler {
             }
         };
         let total = rows.len();
-        for chunk in rows.chunks(500) {
-            let sql = nodus_import::synthesize_insert(&spec, chunk);
-            for stmt in nodus_sql::parse_sql(&sql)? {
-                let plan = nodus_executor::plan_statement(&stmt, &[])?;
-                executor.execute_logical(&ctx, plan)?;
+        if total == 0 {
+            return Ok(0);
+        }
+        executor.execute_logical(&ctx, nodus_executor::LogicalPlan::BatchBegin)?;
+        let result = (|| -> anyhow::Result<()> {
+            for chunk in rows.chunks(500) {
+                let sql = nodus_import::synthesize_insert(&spec, chunk);
+                for stmt in nodus_sql::parse_sql(&sql)? {
+                    let plan = nodus_executor::plan_statement(&stmt, &[])?;
+                    executor.execute_logical(&ctx, plan)?;
+                }
+            }
+            executor
+                .execute_logical(&ctx, nodus_executor::LogicalPlan::BatchEnd { commit: true })?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(total),
+            Err(error) => {
+                let _ = executor.execute_logical(
+                    &ctx,
+                    nodus_executor::LogicalPlan::BatchEnd { commit: false },
+                );
+                Err(error)
             }
         }
-        Ok(total)
     }
 
     /// Resolves the declared types of the COPY target columns (or all columns
