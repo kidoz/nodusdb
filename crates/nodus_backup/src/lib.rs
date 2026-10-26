@@ -1356,6 +1356,18 @@ impl BackupOrchestrator {
                         }
                         active_txns.remove(&txn_id);
                     }
+                    WalRecordV1::CommitTxnBatchV1 { commits } => {
+                        for (txn_id, commit_ts) in commits {
+                            if commit_ts <= plan.target_ts {
+                                kv.commit(txn_id, commit_ts)?;
+                                report.commits_applied += 1;
+                            } else {
+                                kv.abort(txn_id)?;
+                                report.commits_skipped += 1;
+                            }
+                            active_txns.remove(&txn_id);
+                        }
+                    }
                     WalRecordV1::AbortTxn { txn_id } => {
                         kv.abort(txn_id)?;
                         active_txns.remove(&txn_id);
@@ -3499,5 +3511,80 @@ mod tests {
         assert_eq!(kv.get(b"x", 20).unwrap(), None);
         assert_eq!(report.deletes_applied, 1);
         assert_eq!(report.aborts_applied, 1);
+    }
+
+    #[test]
+    fn pitr_commit_batch_applies_each_transaction_at_the_target_boundary() {
+        let early = TxnId::new();
+        let exact = TxnId::new();
+        let late = TxnId::new();
+        let pending = TxnId::new();
+        let wal = test_wal_bytes(vec![
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: early,
+                key: b"early".to_vec(),
+                value: b"10".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: exact,
+                key: b"exact".to_vec(),
+                value: b"20".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: late,
+                key: b"late".to_vec(),
+                value: b"30".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: pending,
+                key: b"pending".to_vec(),
+                value: b"pending".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxnBatchV1 {
+                commits: vec![(early, 10), (exact, 20), (late, 30)],
+            }),
+        ]);
+        let plan = PitrRestorePlan {
+            plan_version: CURRENT_PITR_RESTORE_PLAN_VERSION,
+            cluster_id: "cluster-1".into(),
+            timeline_id: "timeline-1".into(),
+            base_backup_id: "base".into(),
+            base_backup_chain: vec!["base".into()],
+            base_snapshot_ts: 0,
+            target_ts: 20,
+            replay_start_ts: 0,
+            replay_end_ts: 20,
+            wal_segments: vec![PitrRestoreWalSegment {
+                segment_id: "1.log".into(),
+                wal_object_key: "wal".into(),
+                index_object_key: "index".into(),
+                first_commit_ts: Some(10),
+                last_commit_ts: Some(30),
+                checksum: checksum(&wal),
+                size: wal.len() as u64,
+            }],
+            generated_at: Utc::now(),
+        };
+        let segments = vec![PitrWalSegmentBytes {
+            segment_id: "1.log".into(),
+            bytes: wal,
+        }];
+        let kv = MemKvEngine::new();
+
+        let report =
+            BackupOrchestrator::replay_pitr_wal_segments(&plan, &segments, &kv, None).unwrap();
+
+        assert_eq!(kv.get(b"early", 20).unwrap(), Some(Bytes::from("10")));
+        assert_eq!(kv.get(b"exact", 20).unwrap(), Some(Bytes::from("20")));
+        assert_eq!(kv.get(b"late", 30).unwrap(), None);
+        assert_eq!(kv.get(b"pending", 30).unwrap(), None);
+        assert_eq!(report.commits_applied, 2);
+        assert_eq!(report.commits_skipped, 1);
+        assert_eq!(report.pending_txns_aborted, 1);
+        assert_eq!(report.records_seen, 5);
     }
 }

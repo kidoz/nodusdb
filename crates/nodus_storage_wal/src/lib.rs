@@ -37,6 +37,9 @@ pub enum WalRecordV1 {
         txn_id: TxnId,
         commit_ts: Timestamp,
     },
+    CommitTxnBatchV1 {
+        commits: Vec<(TxnId, Timestamp)>,
+    },
     AbortTxn {
         txn_id: TxnId,
     },

@@ -2,8 +2,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use nodus_mvcc::{GcMode, VersionChain};
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, PendingIntents, Timestamp,
-    TxnId,
+    IntentOperation, IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion,
+    PendingIntents, Timestamp, TxnId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
@@ -261,6 +261,38 @@ impl KvEngine for MemKvEngine {
         Ok(())
     }
 
+    fn write_intent_batch(&self, txn_id: TxnId, ops: Vec<IntentOperation>) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        let mut store_guard = self.store.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
+
+        for op in &ops {
+            if let Some(intent) = store_guard
+                .get(op.key())
+                .and_then(|chain| chain.active_intent())
+                && intent.txn_id != Some(txn_id)
+            {
+                return Err(nodus_storage_api::KvError::WriteConflict(txn_id));
+            }
+        }
+
+        for op in ops {
+            let key = match &op {
+                IntentOperation::Put { key, .. } | IntentOperation::Delete { key } => key.clone(),
+            };
+            let chain = store_guard.entry(key.clone()).or_default();
+            match op {
+                IntentOperation::Put { value, .. } => chain.write_intent(txn_id, value.to_vec())?,
+                IntentOperation::Delete { .. } => chain.delete_intent(txn_id)?,
+            }
+            intents_guard
+                .entry(txn_id)
+                .or_default()
+                .push((key, nodus_storage_api::wallclock_micros()));
+        }
+        Ok(())
+    }
+
     fn replace_intent(
         &self,
         txn_id: TxnId,
@@ -312,14 +344,20 @@ impl KvEngine for MemKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
+        self.commit_batch(vec![(txn_id, commit_ts)])
+    }
+
+    fn commit_batch(&self, commits: Vec<(TxnId, Timestamp)>) -> KvResult<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
-        if let Some(keys) = intents_guard.remove(&txn_id) {
-            for (key, _) in keys {
-                if let Some(chain) = store_guard.get_mut(&key) {
-                    let _ = chain.commit(txn_id, commit_ts);
+        for (txn_id, commit_ts) in commits {
+            if let Some(keys) = intents_guard.remove(&txn_id) {
+                for (key, _) in keys {
+                    if let Some(chain) = store_guard.get_mut(&key) {
+                        let _ = chain.commit(txn_id, commit_ts);
+                    }
                 }
             }
         }
@@ -541,5 +579,120 @@ mod tests {
 
         // Idempotent: a second pass reclaims nothing.
         assert_eq!(engine.garbage_collect(10).unwrap(), 0);
+    }
+
+    #[test]
+    fn intent_batch_conflict_publishes_none_of_the_batch() {
+        let engine = MemKvEngine::new();
+        let blocker = TxnId::new();
+        let writer = TxnId::new();
+        engine
+            .write_intent(blocker, Bytes::from("blocked"), Bytes::from("old"))
+            .unwrap();
+
+        let result = engine.write_intent_batch(
+            writer,
+            vec![
+                IntentOperation::Put {
+                    key: Bytes::from("fresh"),
+                    value: Bytes::from("new"),
+                },
+                IntentOperation::Put {
+                    key: Bytes::from("blocked"),
+                    value: Bytes::from("new"),
+                },
+            ],
+        );
+
+        assert!(matches!(result, Err(KvError::WriteConflict(id)) if id == writer));
+        assert!(engine.pending_intent_keys(writer).is_empty());
+        assert!(
+            !engine
+                .store
+                .read()
+                .unwrap()
+                .contains_key(b"fresh".as_slice())
+        );
+        assert_eq!(
+            engine.pending_intent_keys(blocker),
+            vec![Bytes::from("blocked")]
+        );
+    }
+
+    #[test]
+    fn intent_batch_same_txn_duplicate_keys_keep_last_operation() {
+        let engine = MemKvEngine::new();
+        let txn = TxnId::new();
+        engine
+            .write_intent_batch(
+                txn,
+                vec![
+                    IntentOperation::Put {
+                        key: Bytes::from("key"),
+                        value: Bytes::from("first"),
+                    },
+                    IntentOperation::Delete {
+                        key: Bytes::from("key"),
+                    },
+                    IntentOperation::Put {
+                        key: Bytes::from("key"),
+                        value: Bytes::from("last"),
+                    },
+                    IntentOperation::Delete {
+                        key: Bytes::from("deleted"),
+                    },
+                ],
+            )
+            .unwrap();
+        engine.commit(txn, 10).unwrap();
+
+        assert_eq!(engine.get(b"key", 10).unwrap(), Some(Bytes::from("last")));
+        assert_eq!(engine.get(b"deleted", 10).unwrap(), None);
+    }
+
+    #[test]
+    fn commit_batch_publishes_every_transaction() {
+        let engine = MemKvEngine::new();
+        let first = TxnId::new();
+        let second = TxnId::new();
+        for (txn, key) in [(first, "a"), (second, "b")] {
+            engine
+                .write_intent(txn, Bytes::from(key), Bytes::from(key))
+                .unwrap();
+        }
+        engine
+            .commit_batch(vec![(first, 10), (second, 20)])
+            .unwrap();
+        engine.commit_batch(Vec::new()).unwrap();
+
+        assert_eq!(engine.get(b"a", 10).unwrap(), Some(Bytes::from("a")));
+        assert_eq!(engine.get(b"b", 20).unwrap(), Some(Bytes::from("b")));
+        assert!(engine.pending_intent_keys(first).is_empty());
+        assert!(engine.pending_intent_keys(second).is_empty());
+    }
+
+    #[test]
+    fn namespaced_batches_isolate_keys_and_transaction_ids() {
+        let inner = std::sync::Arc::new(MemKvEngine::new());
+        let left = nodus_storage_api::NamespacedKvEngine::new(inner.clone(), "left");
+        let right = nodus_storage_api::NamespacedKvEngine::new(inner, "right");
+        let txn = TxnId::new();
+        for engine in [&left, &right] {
+            engine
+                .write_intent_batch(
+                    txn,
+                    vec![IntentOperation::Put {
+                        key: Bytes::from("key"),
+                        value: Bytes::from("value"),
+                    }],
+                )
+                .unwrap();
+        }
+
+        left.commit_batch(vec![(txn, 10)]).unwrap();
+        assert_eq!(left.get(b"key", 10).unwrap(), Some(Bytes::from("value")));
+        assert_eq!(right.get(b"key", 10).unwrap(), None);
+        right.commit_batch(vec![(txn, 20)]).unwrap();
+        assert_eq!(right.get(b"key", 20).unwrap(), Some(Bytes::from("value")));
     }
 }

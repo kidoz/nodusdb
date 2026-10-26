@@ -82,6 +82,20 @@ pub enum IntentReplacement {
     Clear,
 }
 
+#[derive(Debug, Clone)]
+pub enum IntentOperation {
+    Put { key: Bytes, value: Bytes },
+    Delete { key: Bytes },
+}
+
+impl IntentOperation {
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key } => key,
+        }
+    }
+}
+
 /// One transaction's outstanding intents in an engine, as listed by
 /// [`KvEngine::pending_intents`] for the intent janitor. `txn_id` is the id as
 /// recorded in *this* engine: a namespaced group view reports the stored
@@ -167,6 +181,17 @@ pub trait KvEngine: Send + Sync {
     /// Writes a deletion (tombstone) intent for `key`. After commit the key
     /// reads as absent at timestamps at or after the commit.
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()>;
+    /// Writes one transaction's intents as a batch. Engines may override the
+    /// sequential default to make conflict validation and publication atomic.
+    fn write_intent_batch(&self, txn_id: TxnId, ops: Vec<IntentOperation>) -> KvResult<()> {
+        for op in ops {
+            match op {
+                IntentOperation::Put { key, value } => self.write_intent(txn_id, key, value)?,
+                IntentOperation::Delete { key } => self.delete_intent(txn_id, key)?,
+            }
+        }
+        Ok(())
+    }
     /// Replaces or clears this transaction's current intent for one key.
     /// Used by SQL savepoints to restore the uncommitted state that existed
     /// when the savepoint was created.
@@ -177,6 +202,14 @@ pub trait KvEngine: Send + Sync {
         replacement: IntentReplacement,
     ) -> KvResult<()>;
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()>;
+    /// Commits transactions in sequence unless the engine provides an atomic
+    /// batch implementation.
+    fn commit_batch(&self, commits: Vec<(TxnId, Timestamp)>) -> KvResult<()> {
+        for (txn_id, commit_ts) in commits {
+            self.commit(txn_id, commit_ts)?;
+        }
+        Ok(())
+    }
     fn abort(&self, txn_id: TxnId) -> KvResult<()>;
 
     /// Keys on which `txn_id` currently holds uncommitted intents in this engine
@@ -259,9 +292,9 @@ pub trait KvEngine: Send + Sync {
 /// physical key range. As a result, a group's snapshot (a full scan of its
 /// engine) only ever observes its own namespace's keys.
 ///
-/// Transaction-scoped operations (`commit`/`abort`) and `garbage_collect`
-/// delegate to the inner engine unchanged: they act per transaction id or by
-/// watermark, not per key, and a given transaction writes within one namespace.
+/// Transaction-scoped operations use namespace-mapped ids so one group's
+/// commit or abort cannot finalize another group's intents. Garbage collection
+/// delegates by watermark, and a given transaction writes within one namespace.
 pub struct NamespacedKvEngine {
     inner: Arc<dyn KvEngine>,
     prefix: Bytes,
@@ -431,6 +464,23 @@ impl KvEngine for NamespacedKvEngine {
             .delete_intent(self.namespaced_txn(txn_id), self.physical_key(&key))
     }
 
+    fn write_intent_batch(&self, txn_id: TxnId, ops: Vec<IntentOperation>) -> KvResult<()> {
+        let txn_id = self.namespaced_txn(txn_id);
+        let ops = ops
+            .into_iter()
+            .map(|op| match op {
+                IntentOperation::Put { key, value } => IntentOperation::Put {
+                    key: self.physical_key(&key),
+                    value,
+                },
+                IntentOperation::Delete { key } => IntentOperation::Delete {
+                    key: self.physical_key(&key),
+                },
+            })
+            .collect();
+        self.inner.write_intent_batch(txn_id, ops)
+    }
+
     fn replace_intent(
         &self,
         txn_id: TxnId,
@@ -446,6 +496,14 @@ impl KvEngine for NamespacedKvEngine {
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         self.inner.commit(self.namespaced_txn(txn_id), commit_ts)
+    }
+
+    fn commit_batch(&self, commits: Vec<(TxnId, Timestamp)>) -> KvResult<()> {
+        let commits = commits
+            .into_iter()
+            .map(|(txn_id, commit_ts)| (self.namespaced_txn(txn_id), commit_ts))
+            .collect();
+        self.inner.commit_batch(commits)
     }
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {

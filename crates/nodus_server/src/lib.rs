@@ -213,6 +213,14 @@ fn wal_archive_txn_index(
                         commit_ts,
                     });
                 }
+                WalRecordV1::CommitTxnBatchV1 { commits } => {
+                    committed_txns.extend(commits.into_iter().map(|(txn_id, commit_ts)| {
+                        WalCommittedTxn {
+                            txn_id: txn_id.0.to_string(),
+                            commit_ts,
+                        }
+                    }));
+                }
                 WalRecordV1::AbortTxn { .. } | WalRecordV1::Checkpoint { .. } => {}
             }
         }

@@ -31,6 +31,7 @@ use tempfile::TempDir;
 struct WalSyncState {
     synced_len: u64,
     written_len: u64,
+    sync_count: usize,
 }
 
 /// A `WalEngine` wrapper that records the durable frontier on every `sync`.
@@ -54,6 +55,7 @@ impl WalEngine for SyncTrackingWal {
         let mut state = self.state.lock().unwrap();
         state.synced_len = len;
         state.written_len = len;
+        state.sync_count += 1;
         Ok(())
     }
 
@@ -80,6 +82,7 @@ fn track_active_wal(engine: &LsmKvEngine) -> SyncTracker {
     let tracker = Arc::new(Mutex::new(WalSyncState {
         synced_len: len,
         written_len: len,
+        sync_count: 0,
     }));
     *guard = Some(Arc::new(SyncTrackingWal {
         inner,
@@ -248,6 +251,103 @@ fn unacknowledged_commit_is_never_partially_applied_after_power_cut() {
             "transaction partially applied (cut at byte {keep}, garbage {garbage})"
         );
         // The acknowledged setup write is always intact.
+        assert_eq!(
+            recovered.get(b"anchor", 100).unwrap(),
+            Some(Bytes::from("s"))
+        );
+    };
+    for keep in synced_len..=written_len {
+        check(dir.path(), keep, 0);
+    }
+    for keep in (synced_len..written_len).step_by(9) {
+        check(dir.path(), keep, 7);
+    }
+}
+
+#[test]
+fn commit_batch_syncs_once_and_recovers_every_transaction() {
+    let dir = TempDir::new().unwrap();
+    let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+    let tracker = track_active_wal(&engine);
+    let first = TxnId::new();
+    let second = TxnId::new();
+    for (txn, key) in [(first, "a"), (second, "b")] {
+        engine
+            .write_intent_batch(
+                txn,
+                vec![IntentOperation::Put {
+                    key: Bytes::from(key),
+                    value: Bytes::from(key),
+                }],
+            )
+            .unwrap();
+    }
+
+    engine
+        .commit_batch(vec![(first, 10), (second, 20)])
+        .unwrap();
+    assert_eq!(tracker.lock().unwrap().sync_count, 1);
+    engine.commit_batch(Vec::new()).unwrap();
+    assert_eq!(tracker.lock().unwrap().sync_count, 1);
+    drop(engine);
+
+    let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+    assert_eq!(engine.get(b"a", 10).unwrap(), Some(Bytes::from("a")));
+    assert_eq!(engine.get(b"b", 20).unwrap(), Some(Bytes::from("b")));
+}
+
+#[test]
+fn unacknowledged_commit_batch_is_never_partially_applied_after_power_cut() {
+    let dir = TempDir::new().unwrap();
+    let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+    let tracker = track_active_wal(&engine);
+    put(&engine, "anchor", "s", 5);
+    let first = TxnId::new();
+    let second = TxnId::new();
+    for (txn, prefix) in [(first, "a"), (second, "b")] {
+        engine
+            .write_intent_batch(
+                txn,
+                vec![
+                    IntentOperation::Put {
+                        key: Bytes::from(format!("{prefix}1")),
+                        value: Bytes::from("1"),
+                    },
+                    IntentOperation::Put {
+                        key: Bytes::from(format!("{prefix}2")),
+                        value: Bytes::from("2"),
+                    },
+                ],
+            )
+            .unwrap();
+    }
+    {
+        let wal = engine.wal.read().unwrap();
+        wal.as_ref()
+            .unwrap()
+            .append(WalRecord::V1(WalRecordV1::CommitTxnBatchV1 {
+                commits: vec![(first, 20), (second, 30)],
+            }))
+            .unwrap();
+    }
+
+    let wal_id = engine.active_wal_id.load(Ordering::Relaxed);
+    let image = wal_image(dir.path(), wal_id);
+    let (synced_len, written_len) = frontier(&tracker);
+    assert!(synced_len < written_len);
+    drop(engine);
+
+    let check = |dir: &Path, keep: usize, garbage: usize| {
+        apply_power_cut(dir, wal_id, &image, keep, garbage);
+        let recovered = LsmKvEngine::with_wal(dir, None).unwrap();
+        let visibility: Vec<bool> = [b"a1".as_slice(), b"a2", b"b1", b"b2"]
+            .into_iter()
+            .map(|key| recovered.get(key, 100).unwrap().is_some())
+            .collect();
+        assert!(
+            visibility.iter().all(|visible| *visible == visibility[0]),
+            "commit batch partially applied at byte {keep}: {visibility:?}"
+        );
         assert_eq!(
             recovered.get(b"anchor", 100).unwrap(),
             Some(Bytes::from("s"))

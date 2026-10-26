@@ -3,15 +3,15 @@
 //! These give machine-measured numbers for the performance-sensitive paths of
 //! `LsmKvEngine` — MVCC point reads, range scans, write+commit, and garbage
 //! collection — so perf claims about the engine can be reproduced rather than
-//! asserted. The in-memory (WAL-less) engine is benchmarked to isolate engine
-//! cost from fsync latency. Run with `cargo bench -p nodus_storage_lsm` (or
-//! `just bench`).
+//! asserted. WAL-less cases isolate engine cost; durable cases use a fresh
+//! temporary WAL directory per measured input to include commit sync behavior.
+//! Run with `cargo bench -p nodus_storage_lsm` (or `just bench`).
 
 use std::hint::black_box;
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nodus_storage_api::{KeyRange, KvEngine, TxnId};
+use nodus_storage_api::{IntentOperation, KeyRange, KvEngine, TxnId};
 use nodus_storage_lsm::LsmKvEngine;
 
 /// Stable, lexicographically ordered key for index `i`.
@@ -90,6 +90,109 @@ fn bench_write_commit(c: &mut Criterion) {
     group.finish();
 }
 
+fn durable_commit_input(n: usize) -> (tempfile::TempDir, LsmKvEngine, Vec<TxnId>) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+    let txns = (0..n)
+        .map(|i| {
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, key(i), Bytes::from("durable-value"))
+                .unwrap();
+            txn
+        })
+        .collect();
+    (dir, engine, txns)
+}
+
+fn bench_durable_commits(c: &mut Criterion) {
+    const N: usize = 32;
+    let mut group = c.benchmark_group("lsm/durable_commit");
+    group.throughput(Throughput::Elements(N as u64));
+    group.bench_function("single_commits", |b| {
+        b.iter_batched(
+            || durable_commit_input(N),
+            |(_dir, engine, txns)| {
+                for (i, txn) in txns.into_iter().enumerate() {
+                    engine.commit(txn, i as u64 + 1).unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("atomic_commit_batch", |b| {
+        b.iter_batched(
+            || durable_commit_input(N),
+            |(_dir, engine, txns)| {
+                let commits = txns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, txn)| (txn, i as u64 + 1))
+                    .collect();
+                engine.commit_batch(commits).unwrap();
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn durable_intent_input(n: usize) -> (tempfile::TempDir, LsmKvEngine, Vec<IntentOperation>) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+    let operations = (0..n)
+        .map(|i| {
+            if i % 4 == 3 {
+                IntentOperation::Delete { key: key(i) }
+            } else {
+                IntentOperation::Put {
+                    key: key(i),
+                    value: Bytes::from("durable-value"),
+                }
+            }
+        })
+        .collect();
+    (dir, engine, operations)
+}
+
+fn bench_durable_intent_batches(c: &mut Criterion) {
+    const N: usize = 32;
+    let mut group = c.benchmark_group("lsm/durable_intents");
+    group.throughput(Throughput::Elements(N as u64));
+    group.bench_function("sequential_intents", |b| {
+        b.iter_batched(
+            || durable_intent_input(N),
+            |(_dir, engine, operations)| {
+                let txn = TxnId::new();
+                for operation in operations {
+                    match operation {
+                        IntentOperation::Put { key, value } => {
+                            engine.write_intent(txn, key, value).unwrap();
+                        }
+                        IntentOperation::Delete { key } => {
+                            engine.delete_intent(txn, key).unwrap();
+                        }
+                    }
+                }
+                engine.commit(txn, 1).unwrap();
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("atomic_intent_batch", |b| {
+        b.iter_batched(
+            || durable_intent_input(N),
+            |(_dir, engine, operations)| {
+                let txn = TxnId::new();
+                engine.write_intent_batch(txn, operations).unwrap();
+                engine.commit(txn, 1).unwrap();
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 fn bench_gc(c: &mut Criterion) {
     let mut group = c.benchmark_group("lsm/garbage_collect");
     const N: usize = 1_000;
@@ -122,6 +225,8 @@ criterion_group!(
     bench_point_read,
     bench_scan,
     bench_write_commit,
+    bench_durable_commits,
+    bench_durable_intent_batches,
     bench_gc
 );
 criterion_main!(benches);

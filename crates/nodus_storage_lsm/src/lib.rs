@@ -7,8 +7,8 @@ pub mod sstable;
 
 use nodus_mvcc::{GcMode, VersionChain, VisibleVersion};
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, PendingIntents, Timestamp,
-    TxnId, wallclock_micros,
+    IntentOperation, IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion,
+    PendingIntents, Timestamp, TxnId, wallclock_micros,
 };
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,9 @@ pub struct LsmKvEngine {
     gc_watermark: AtomicU64,
     /// Serializes flush and compaction (both rewrite the SSTable set + manifest).
     flush_compact_lock: Mutex<()>,
+    /// Serializes intent validation and publication without holding memtable or
+    /// intent locks across WAL appends or syncs.
+    intent_mutation_lock: Mutex<()>,
     /// Intent WAL appends (write/delete) that have started but not yet
     /// registered their intent in the memtable. Flush must not advance the
     /// replay floor while any are in flight: such an append may already sit in
@@ -248,6 +251,7 @@ impl LsmKvEngine {
             flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
             gc_watermark: AtomicU64::new(0),
             flush_compact_lock: Mutex::new(()),
+            intent_mutation_lock: Mutex::new(()),
             inflight_appends: AtomicUsize::new(0),
             #[cfg(test)]
             append_pause: AppendPause::default(),
@@ -325,6 +329,7 @@ impl LsmKvEngine {
             flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
             gc_watermark: AtomicU64::new(0),
             flush_compact_lock: Mutex::new(()),
+            intent_mutation_lock: Mutex::new(()),
             inflight_appends: AtomicUsize::new(0),
             #[cfg(test)]
             append_pause: AppendPause::default(),
@@ -800,6 +805,17 @@ impl LsmKvEngine {
                                 }
                             }
                         }
+                        WalRecordV1::CommitTxnBatchV1 { commits } => {
+                            for (txn_id, commit_ts) in commits {
+                                if let Some(keys) = int_guard.remove(&txn_id) {
+                                    for (key, _) in keys {
+                                        if let Some(chain) = mem_guard.get_mut(&key) {
+                                            let _ = chain.commit(txn_id, commit_ts);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         WalRecordV1::AbortTxn { txn_id } => {
                             if let Some(keys) = int_guard.remove(&txn_id) {
                                 for (key, _) in keys {
@@ -1028,6 +1044,7 @@ impl KvEngine for LsmKvEngine {
         let added = key.len() + value.len() + 32;
         let started_at = wallclock_micros();
         {
+            let _mutation = self.intent_mutation_lock.lock().unwrap();
             // In flight from the WAL append until the intent is registered:
             // flush consults `inflight_appends` before advancing the replay
             // floor, so this record's segment is never rotated out of the
@@ -1070,6 +1087,7 @@ impl KvEngine for LsmKvEngine {
         let added = key.len() + 32;
         let started_at = wallclock_micros();
         {
+            let _mutation = self.intent_mutation_lock.lock().unwrap();
             // In flight exactly as in `write_intent`.
             let _inflight = self.track_append();
             {
@@ -1099,6 +1117,85 @@ impl KvEngine for LsmKvEngine {
         Ok(())
     }
 
+    fn write_intent_batch(&self, txn_id: TxnId, ops: Vec<IntentOperation>) -> KvResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
+        let added = ops
+            .iter()
+            .map(|op| match op {
+                IntentOperation::Put { key, value } => key.len() + value.len() + 32,
+                IntentOperation::Delete { key } => key.len() + 32,
+            })
+            .sum::<usize>();
+        let started_at = wallclock_micros();
+        {
+            let _mutation = self.intent_mutation_lock.lock().unwrap();
+            {
+                let store_guard = self.memtable.read().unwrap();
+                for op in &ops {
+                    if let Some(intent) = store_guard
+                        .get(op.key())
+                        .and_then(|chain| chain.active_intent())
+                        && intent.txn_id != Some(txn_id)
+                    {
+                        return Err(nodus_storage_api::KvError::WriteConflict(txn_id));
+                    }
+                }
+            }
+
+            let _inflight = self.track_append();
+            {
+                let wal_guard = self.wal.read().unwrap();
+                if let Some(wal) = wal_guard.as_ref() {
+                    for op in &ops {
+                        let record = match op {
+                            IntentOperation::Put { key, value } => WalRecordV1::WriteIntent {
+                                txn_id,
+                                key: key.to_vec(),
+                                value: value.to_vec(),
+                                started_at: Some(started_at),
+                            },
+                            IntentOperation::Delete { key } => WalRecordV1::DeleteIntent {
+                                txn_id,
+                                key: key.to_vec(),
+                                started_at: Some(started_at),
+                            },
+                        };
+                        wal.append(WalRecord::V1(record))?;
+                    }
+                }
+            }
+            self.pause_after_wal_append();
+
+            let mut store_guard = self.memtable.write().unwrap();
+            let mut intents_guard = self.intents.write().unwrap();
+            for op in ops {
+                let key = match &op {
+                    IntentOperation::Put { key, .. } | IntentOperation::Delete { key } => {
+                        key.clone()
+                    }
+                };
+                let chain = store_guard.entry(key.clone()).or_default();
+                match op {
+                    IntentOperation::Put { value, .. } => {
+                        chain.write_intent(txn_id, value.to_vec())?
+                    }
+                    IntentOperation::Delete { .. } => chain.delete_intent(txn_id)?,
+                }
+                intents_guard
+                    .entry(txn_id)
+                    .or_default()
+                    .push((key, started_at));
+            }
+        }
+        self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.maybe_flush_by_size()?;
+        Ok(())
+    }
+
     fn replace_intent(
         &self,
         txn_id: TxnId,
@@ -1107,6 +1204,7 @@ impl KvEngine for LsmKvEngine {
     ) -> KvResult<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
+        let _mutation = self.intent_mutation_lock.lock().unwrap();
         let mut store_guard = self.memtable.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
         let chain = store_guard.entry(key.clone()).or_default();
@@ -1175,6 +1273,7 @@ impl KvEngine for LsmKvEngine {
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
+        let _mutation = self.intent_mutation_lock.lock().unwrap();
         {
             let wal_guard = self.wal.read().unwrap();
             if let Some(wal) = wal_guard.as_ref() {
@@ -1196,9 +1295,41 @@ impl KvEngine for LsmKvEngine {
         Ok(())
     }
 
+    fn commit_batch(&self, commits: Vec<(TxnId, Timestamp)>) -> KvResult<()> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
+        let _mutation = self.intent_mutation_lock.lock().unwrap();
+        {
+            let wal_guard = self.wal.read().unwrap();
+            if let Some(wal) = wal_guard.as_ref() {
+                wal.append(WalRecord::V1(WalRecordV1::CommitTxnBatchV1 {
+                    commits: commits.clone(),
+                }))?;
+                wal.sync()?;
+            }
+        }
+
+        let mut store_guard = self.memtable.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
+        for (txn_id, commit_ts) in commits {
+            if let Some(keys) = intents_guard.remove(&txn_id) {
+                for (key, _) in keys {
+                    if let Some(chain) = store_guard.get_mut(&key) {
+                        let _ = chain.commit(txn_id, commit_ts);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
+        let _mutation = self.intent_mutation_lock.lock().unwrap();
         {
             let wal_guard = self.wal.read().unwrap();
             if let Some(wal) = wal_guard.as_ref() {
@@ -2433,5 +2564,155 @@ mod sst_tests {
             engine.get(b"orphan", stamped + 1).unwrap(),
             Some(Bytes::from("new"))
         );
+    }
+
+    #[test]
+    fn rejected_intent_batch_never_replays_or_overwrites_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let blocker = TxnId::new();
+        let rejected = TxnId::new();
+        let valid = TxnId::new();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            engine
+                .write_intent(blocker, Bytes::from("blocked"), Bytes::from("old"))
+                .unwrap();
+
+            let result = engine.write_intent_batch(
+                rejected,
+                vec![
+                    IntentOperation::Put {
+                        key: Bytes::from("fresh"),
+                        value: Bytes::from("rejected"),
+                    },
+                    IntentOperation::Delete {
+                        key: Bytes::from("blocked"),
+                    },
+                ],
+            );
+
+            assert!(matches!(
+                result,
+                Err(nodus_storage_api::KvError::WriteConflict(id)) if id == rejected
+            ));
+            assert!(engine.pending_intent_keys(rejected).is_empty());
+            assert!(
+                !engine
+                    .memtable
+                    .read()
+                    .unwrap()
+                    .contains_key(b"fresh".as_slice())
+            );
+        }
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert!(engine.pending_intent_keys(rejected).is_empty());
+        assert_eq!(
+            engine.pending_intent_keys(blocker),
+            vec![Bytes::from("blocked")]
+        );
+        assert_eq!(engine.get(b"fresh", 100).unwrap(), None);
+        engine.abort(blocker).unwrap();
+        engine
+            .write_intent_batch(
+                valid,
+                vec![
+                    IntentOperation::Put {
+                        key: Bytes::from("fresh"),
+                        value: Bytes::from("valid"),
+                    },
+                    IntentOperation::Put {
+                        key: Bytes::from("blocked"),
+                        value: Bytes::from("valid"),
+                    },
+                ],
+            )
+            .unwrap();
+        engine.commit(valid, 20).unwrap();
+        engine.commit(rejected, 30).unwrap();
+        drop(engine);
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert!(engine.pending_intent_keys(rejected).is_empty());
+        assert_eq!(
+            engine.get(b"fresh", 100).unwrap(),
+            Some(Bytes::from("valid"))
+        );
+        assert_eq!(
+            engine.get(b"blocked", 100).unwrap(),
+            Some(Bytes::from("valid"))
+        );
+    }
+
+    #[test]
+    fn intent_batch_same_txn_duplicate_keys_keep_last_operation() {
+        let engine = LsmKvEngine::new();
+        let txn = TxnId::new();
+        engine
+            .write_intent_batch(
+                txn,
+                vec![
+                    IntentOperation::Put {
+                        key: Bytes::from("key"),
+                        value: Bytes::from("first"),
+                    },
+                    IntentOperation::Delete {
+                        key: Bytes::from("key"),
+                    },
+                    IntentOperation::Put {
+                        key: Bytes::from("key"),
+                        value: Bytes::from("last"),
+                    },
+                ],
+            )
+            .unwrap();
+        engine.commit(txn, 10).unwrap();
+
+        assert_eq!(engine.get(b"key", 10).unwrap(), Some(Bytes::from("last")));
+        assert_eq!(
+            engine.memtable.read().unwrap()[b"key".as_slice()]
+                .versions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn commit_batch_recovers_all_transactions_after_intent_flushes() {
+        let dir = TempDir::new().unwrap();
+        let first = TxnId::new();
+        let second = TxnId::new();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            engine.set_flush_threshold(1);
+            for (txn, prefix) in [(first, "a"), (second, "b")] {
+                engine
+                    .write_intent_batch(
+                        txn,
+                        vec![
+                            IntentOperation::Put {
+                                key: Bytes::from(format!("{prefix}1")),
+                                value: Bytes::from("1"),
+                            },
+                            IntentOperation::Put {
+                                key: Bytes::from(format!("{prefix}2")),
+                                value: Bytes::from("2"),
+                            },
+                        ],
+                    )
+                    .unwrap();
+            }
+            assert!(engine.active_wal_id.load(Ordering::Relaxed) > 1);
+            engine
+                .commit_batch(vec![(first, 10), (second, 20)])
+                .unwrap();
+            engine.commit_batch(Vec::new()).unwrap();
+        }
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(engine.get(b"a1", 10).unwrap(), Some(Bytes::from("1")));
+        assert_eq!(engine.get(b"a2", 10).unwrap(), Some(Bytes::from("2")));
+        assert_eq!(engine.get(b"b1", 20).unwrap(), Some(Bytes::from("1")));
+        assert_eq!(engine.get(b"b2", 20).unwrap(), Some(Bytes::from("2")));
     }
 }
