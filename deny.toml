@@ -5,9 +5,9 @@
 # The separate fuzz workspace shares this file:
 #     cargo deny --manifest-path tests/fuzz/Cargo.toml check
 #
-# The three accepted unmaintained advisories below are deliberate, tracked
-# holds; anything new fails the gate. See the dependency-maintainer skill for
-# the surrounding policy.
+# The accepted advisories below are deliberate, tracked holds; anything new
+# fails the gate. See the dependency-maintainer skill for the surrounding
+# policy.
 
 [graph]
 # Check every platform's dependency set, not just the host, so that
@@ -34,6 +34,13 @@ ignore = [
     # PemObject trait in rustls-pki-types. Tracked as a follow-up; the
     # tls_handshake compatibility test gates that change.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile has no safe upgrade; migration to rustls-pki-types PemObject is a tracked follow-up" },
+    # iceberg 0.10.1 is the latest stable and a deliberate exact hold; it
+    # requires zstd ^0.13.3. The zstd and zstd-safe fixes below land in
+    # zstd 0.14.3 / zstd-safe 8.2.0, which cannot resolve until iceberg moves.
+    # zstd is reached only through the optional Iceberg CLI chain.
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13.3 is pinned by iceberg 0.10.1; fixed in zstd 0.14.3, revisit when iceberg moves" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.3.0 comes from zstd 0.13.3 under iceberg 0.10.1; fixed in zstd-safe 8.2.0" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7.3.0 comes from zstd 0.13.3 under iceberg 0.10.1; fixed in zstd-safe 8.2.0" },
 ]
 
 [licenses]
