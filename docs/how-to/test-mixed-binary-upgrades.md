@@ -196,6 +196,14 @@ working-tree candidate, not a clean commit or later source. Raw evidence is in
 `target/write-batch-qualification/mixed-binary/results.json` and
 `candidate.json`.
 
+The October 27 clean commit `1f458b41ee130f2c7a8df85cd4ab8ac9119d3d2e`
+with an empty source patch also passed all eighteen checkpoints with no
+blockers. Its binary SHA-256 is
+`fde16f278ca5758ba1a6d42223195483b8ccf2b7e901a33c6353ab2ecb4ed61b`.
+Raw evidence is in `target/write-batch-qualification/mixed-binary-final/`.
+This is local clean-commit compatibility evidence, not hosted-CI or release
+qualification.
+
 ## Rollback boundaries for this pair
 
 | Cluster state | Feature rollback to level 1 | New executable replaced by R6a maintenance |
