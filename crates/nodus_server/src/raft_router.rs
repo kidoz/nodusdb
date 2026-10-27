@@ -51,6 +51,21 @@ struct PendingCommitBatch {
     deadline: tokio::time::Instant,
 }
 
+#[derive(Debug)]
+struct SingleCommitFallbackError;
+
+impl std::fmt::Display for SingleCommitFallbackError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("single-commit fallback failed")
+    }
+}
+
+impl std::error::Error for SingleCommitFallbackError {}
+
+pub(crate) fn is_single_commit_fallback(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SingleCommitFallbackError>().is_some()
+}
+
 /// A request handed to the dispatcher: replicate a command, or run a
 /// linearizable-read barrier on a group. Both are bridged sync→async here so the
 /// synchronous storage traits can drive them via `blocking_recv`.
@@ -297,7 +312,8 @@ impl RaftRouter {
                             commit_ts,
                         },
                     },
-                )?;
+                )
+                .map_err(|error| error.context(SingleCommitFallbackError))?;
                 Ok(false)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -678,4 +694,22 @@ async fn linearizable_barrier(
     Err(anyhow!(
         "linearizable barrier on '{group_id}' did not converge"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_single_commit_fallback_errors_through_context() {
+        let error = anyhow!("raft group unavailable").context(SingleCommitFallbackError);
+        assert!(is_single_commit_fallback(&error));
+        assert_eq!(
+            format!("{error:#}"),
+            "single-commit fallback failed: raft group unavailable"
+        );
+        assert!(!is_single_commit_fallback(&anyhow!(
+            "batched commit failed"
+        )));
+    }
 }

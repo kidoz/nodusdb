@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::multi_raft::{META_SHARD, MultiRaftManager};
-use crate::raft_router::RaftRouter;
+use crate::raft_router::{RaftRouter, is_single_commit_fallback};
 
 /// Reserved key prefix under which the meta group stores 2PC coordinator records.
 /// The leading NUL keeps these out of any `{table_id}:{pk}` row key space.
@@ -634,7 +634,7 @@ impl KvEngine for RaftKvEngine {
         } else {
             "single"
         };
-        let result = (|| {
+        let result = (|| -> KvResult<()> {
             if targets.len() <= 1 {
                 for (group, target) in &targets {
                     if write_batch {
@@ -663,6 +663,14 @@ impl KvEngine for RaftKvEngine {
             }
             Ok(())
         })();
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                nodus_storage_api::KvError::Other(error) if is_single_commit_fallback(error)
+            )
+        }) {
+            mode = "single";
+        }
         self.finalize_targets(txn_id);
         self.metrics.observe_commit(
             mode,
