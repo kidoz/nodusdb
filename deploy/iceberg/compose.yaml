@@ -1,0 +1,57 @@
+# Disposable integration stack. Only the test runner supplies host ports and
+# credentials; it uses a unique Compose project and removes its data afterward.
+x-lakekeeper: &lakekeeper
+  image: quay.io/lakekeeper/catalog:v0.14.2@sha256:9ad8de17a4d291d355215791ee7410409dcaea83cee04ed9279725b6905a4b85
+  environment: &lakekeeper-env
+    LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:${ICEBERG_TEST_PASSWORD:?run the test runner}@db:5432/postgres
+    LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:${ICEBERG_TEST_PASSWORD:?run the test runner}@db:5432/postgres
+    LAKEKEEPER__PG_ENCRYPTION_KEY: ${ICEBERG_TEST_PASSWORD:?run the test runner}
+    LAKEKEEPER__BASE_URI: ${ICEBERG_TEST_CATALOG_URL:?run the test runner}
+    RUST_LOG: warn
+
+services:
+  db:
+    image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
+    environment:
+      POSTGRES_PASSWORD: ${ICEBERG_TEST_PASSWORD:?run the test runner}
+    healthcheck:
+      test: [CMD, pg_isready, -U, postgres]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+    tmpfs:
+      - /var/lib/postgresql
+
+  minio:
+    image: nodus-iceberg-minio:test
+    build:
+      context: ../..
+      dockerfile: deploy/docker/minio.Dockerfile
+    environment:
+      MINIO_ROOT_USER: nodus-iceberg-test
+      MINIO_ROOT_PASSWORD: ${ICEBERG_TEST_PASSWORD:?run the test runner}
+    ports:
+      - 127.0.0.1::9000
+
+  migrate:
+    <<: *lakekeeper
+    command: [migrate]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  lakekeeper:
+    <<: *lakekeeper
+    command: [serve]
+    ports:
+      - 127.0.0.1:${ICEBERG_TEST_CATALOG_PORT:?run the test runner}:8181
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    healthcheck:
+      test: [CMD, /home/nonroot/lakekeeper, healthcheck]
+      interval: 1s
+      timeout: 5s
+      retries: 60
