@@ -34,6 +34,21 @@ and skips the cluster variant. Run one workload by appending a filter, for
 example `-- point_read`. Do not run another build or test suite during a
 baseline capture.
 
+In addition to Criterion output, each run writes per-request latency, RSS, and
+Prometheus evidence to `target/server-bench/<run-id>/measurements.jsonl`. The
+JSONL schema and measurement semantics are documented with the workloads. To
+place the artifact in a specific directory, set it explicitly:
+
+```bash
+NODUS_BENCH_SCALE=smoke \
+NODUS_BENCH_ARTIFACT_DIR=target/server-bench-smoke \
+cargo bench --locked -p nodus_integration_tests --bench server_bench -- --noplot
+```
+
+The output directory must not already contain `measurements.jsonl`; use a fresh
+directory for each run. Generated artifacts stay under `target/` and are not
+committed.
+
 ## Check that they still compile
 
 Compiling the benchmarks is much faster than running them, and it is what CI
