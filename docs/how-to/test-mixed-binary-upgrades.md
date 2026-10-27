@@ -183,9 +183,18 @@ batched Raft commands and atomic WAL commit records through real reopen.
 
 The matrix does not exercise late-failure COPY atomicity or prove that
 cross-shard 2PC is not grouped; separate integration and command-path tests cover
-those boundaries. No pass of the extended eighteen-checkpoint workload is claimed
-here yet; the historical thirteen-checkpoint passes do not qualify current
-write-batching candidates.
+those boundaries.
+
+The October 27 working-tree candidate at base `8918a869` with patch SHA-256
+`64e80fa19ce74a948aa9c61b478038231a579f6a7a2c18d04d6a4975c18ee9e4`
+passed all eighteen checkpoints with `passed: true`, `matrix_completed: true`,
+and no blockers. Its binary SHA-256 is
+`ae17701cd703a521d68adda20adfc8661f34b82578803ec938b289c2dbd591d6`.
+Indexed COPY, multirow INSERT, 32 concurrent inserts, SIGKILL, leader change,
+restart, and index checks on all four members passed. This qualifies that exact
+working-tree candidate, not a clean commit or later source. Raw evidence is in
+`target/write-batch-qualification/mixed-binary/results.json` and
+`candidate.json`.
 
 ## Rollback boundaries for this pair
 
@@ -209,9 +218,8 @@ path for batched records.
 
 The tests do not certify older revisions, member removal/address replacement,
 original learner promotion, cancellation, power loss, live-reader continuity,
-S3 recovery, or a crash between the two joint-consensus commits. The fixture does
-not enable migration or write batching. Its peers authenticate over the dedicated
-mTLS listener;
+S3 recovery, or a crash between the two joint-consensus commits. Its peers
+authenticate over the dedicated mTLS listener;
 it does not exercise the shared-listener bearer-token path, where old binaries
 send no token and upgraded nodes refuse their Raft RPCs — see the
 rolling-upgrade caveat in
