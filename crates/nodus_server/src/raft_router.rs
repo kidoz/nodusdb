@@ -20,6 +20,7 @@ use nodus_raftstore::{NodusTypeConfig, ShardCommand, ShardResponse};
 use openraft::Raft;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, ForwardToLeader, RaftError};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -94,6 +95,8 @@ enum RouterRequest {
 pub struct RaftRouter {
     tx: mpsc::UnboundedSender<RouterRequest>,
     commit_tx: mpsc::Sender<CommitRequest>,
+    router_queue_depth: Arc<AtomicUsize>,
+    commit_queue_depth: Arc<AtomicUsize>,
     /// Isolated-fixture override; combined (OR) with the durable gate.
     migration_override: Arc<std::sync::atomic::AtomicBool>,
     /// Production activation: reads the durable upgrade authority and opens
@@ -119,15 +122,22 @@ impl RaftRouter {
         // `forward_migration`).
         let transport = manager.transport();
         let metrics = Arc::new(OnceLock::new());
+        let router_queue_depth = Arc::new(AtomicUsize::new(0));
+        let commit_queue_depth = Arc::new(AtomicUsize::new(0));
         let (commit_tx, commit_rx) = mpsc::channel::<CommitRequest>(COMMIT_QUEUE_MAX);
         tokio::spawn(commit_dispatch(
             manager.clone(),
             transport.clone(),
             commit_rx,
+            commit_queue_depth.clone(),
             metrics.clone(),
         ));
+        let dispatch_metrics = metrics.clone();
+        let dispatch_depth = router_queue_depth.clone();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
+                let depth = dispatch_depth.fetch_sub(1, Ordering::Relaxed) - 1;
+                observe_router_queue(&dispatch_metrics, depth);
                 let shard_id = match &req {
                     RouterRequest::Write { shard_id, .. } => shard_id.clone(),
                     RouterRequest::Barrier { shard_id, .. }
@@ -182,6 +192,8 @@ impl RaftRouter {
         Self {
             tx,
             commit_tx,
+            router_queue_depth,
+            commit_queue_depth,
             migration_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_gate: Arc::new(|| false),
             write_batch_gate: Arc::new(|| false),
@@ -226,6 +238,31 @@ impl RaftRouter {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    fn send_router_request(&self, request: RouterRequest) -> Result<usize> {
+        let depth = self.router_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        match self.tx.send(request) {
+            Ok(()) => Ok(depth),
+            Err(_) => {
+                self.router_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                Err(anyhow!("raft router dispatcher stopped"))
+            }
+        }
+    }
+
+    fn try_send_commit(
+        &self,
+        request: CommitRequest,
+    ) -> std::result::Result<usize, mpsc::error::TrySendError<CommitRequest>> {
+        let depth = self.commit_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        match self.commit_tx.try_send(request) {
+            Ok(()) => Ok(depth),
+            Err(error) => {
+                self.commit_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn repair_legacy(
         &self,
         shard_id: &str,
@@ -234,15 +271,14 @@ impl RaftRouter {
         replacement: nodus_storage_api::IntentReplacement,
     ) -> Result<()> {
         let (resp, rx) = oneshot::channel();
-        self.tx
-            .send(RouterRequest::RepairLegacy {
-                shard_id: shard_id.to_string(),
-                txn,
-                key,
-                replacement,
-                resp,
-            })
-            .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
+        let depth = self.send_router_request(RouterRequest::RepairLegacy {
+            shard_id: shard_id.to_string(),
+            txn,
+            key,
+            replacement,
+            resp,
+        })?;
+        observe_router_queue(&self.metrics, depth);
         rx.blocking_recv()
             .map_err(|_| anyhow!("raft router dropped repair response"))?
     }
@@ -291,14 +327,19 @@ impl RaftRouter {
             commit_ts,
             resp: resp_tx,
         };
-        match self.commit_tx.try_send(request) {
-            Ok(()) => {
+        match self.try_send_commit(request) {
+            Ok(depth) => {
+                observe_commit_queue(&self.metrics, depth);
                 resp_rx
                     .blocking_recv()
                     .map_err(|_| anyhow!("raft router dropped commit response"))??;
                 Ok(true)
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                observe_commit_queue(
+                    &self.metrics,
+                    self.commit_queue_depth.load(Ordering::Relaxed),
+                );
                 if let Some(metrics) = self.metrics.get() {
                     metrics.inc_commit_batch_fallback("queue_full");
                 }
@@ -317,6 +358,10 @@ impl RaftRouter {
                 Ok(false)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                observe_commit_queue(
+                    &self.metrics,
+                    self.commit_queue_depth.load(Ordering::Relaxed),
+                );
                 Err(anyhow!("raft commit dispatcher stopped"))
             }
         }
@@ -339,13 +384,12 @@ impl RaftRouter {
                 "write batching requires verified cluster-wide compatibility"
             );
             let (resp_tx, resp_rx) = oneshot::channel();
-            self.tx
-                .send(RouterRequest::Write {
-                    shard_id: shard_id.to_string(),
-                    cmd,
-                    resp: resp_tx,
-                })
-                .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
+            let depth = self.send_router_request(RouterRequest::Write {
+                shard_id: shard_id.to_string(),
+                cmd,
+                resp: resp_tx,
+            })?;
+            observe_router_queue(&self.metrics, depth);
             resp_rx
                 .blocking_recv()
                 .map_err(|_| anyhow!("raft router dropped response"))?
@@ -368,15 +412,26 @@ impl RaftRouter {
     /// MUST be called from a blocking context (it waits via `blocking_recv`).
     pub fn read_barrier(&self, shard_id: &str) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(RouterRequest::Barrier {
-                shard_id: shard_id.to_string(),
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
+        let depth = self.send_router_request(RouterRequest::Barrier {
+            shard_id: shard_id.to_string(),
+            resp: resp_tx,
+        })?;
+        observe_router_queue(&self.metrics, depth);
         resp_rx
             .blocking_recv()
             .map_err(|_| anyhow!("raft router dropped response"))?
+    }
+}
+
+fn observe_router_queue(metrics: &OnceLock<nodus_monitoring::Metrics>, depth: usize) {
+    if let Some(metrics) = metrics.get() {
+        metrics.observe_raft_router_queue(depth);
+    }
+}
+
+fn observe_commit_queue(metrics: &OnceLock<nodus_monitoring::Metrics>, depth: usize) {
+    if let Some(metrics) = metrics.get() {
+        metrics.observe_raft_commit_queue(depth);
     }
 }
 
@@ -400,6 +455,7 @@ async fn commit_dispatch(
     manager: Arc<MultiRaftManager>,
     transport: nodus_raftstore::network::RaftTransport,
     mut rx: mpsc::Receiver<CommitRequest>,
+    queue_depth: Arc<AtomicUsize>,
     metrics: Arc<OnceLock<nodus_monitoring::Metrics>>,
 ) {
     let mut batches: HashMap<(String, u64), PendingCommitBatch> = HashMap::new();
@@ -427,6 +483,8 @@ async fn commit_dispatch(
                     }
                     break;
                 };
+                let depth = queue_depth.fetch_sub(1, Ordering::Relaxed) - 1;
+                observe_commit_queue(&metrics, depth);
                 let key = (request.shard_id.clone(), request.epoch);
                 let full = {
                     let batch = batches.entry(key.clone()).or_insert_with(|| {

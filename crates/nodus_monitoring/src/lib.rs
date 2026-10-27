@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -18,6 +18,10 @@ pub type LabeledHistogram = Family<MetricLabels, Histogram, fn() -> Histogram>;
 
 fn latency_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.00005, 2.0, 16))
+}
+
+fn storage_duration_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.0001, 2.0, 20))
 }
 
 fn batch_size_histogram() -> Histogram {
@@ -84,6 +88,24 @@ pub struct Metrics {
     /// Duration (seconds) of each group's current unbroken snapshot-deferral
     /// streak (`group` label); 0 when builds are succeeding.
     pub snapshot_deferred_seconds: Family<Vec<(String, String)>, Gauge>,
+    /// Last-observed depth and monotonic high-water of the general Raft queue.
+    pub raft_router_queue_depth: Gauge,
+    pub raft_router_queue_high_water: Gauge,
+    raft_router_queue_high_water_value: Arc<AtomicU64>,
+    /// Last-observed depth and monotonic high-water of the bounded commit queue.
+    pub raft_commit_queue_depth: Gauge,
+    pub raft_commit_queue_high_water: Gauge,
+    raft_commit_queue_high_water_value: Arc<AtomicU64>,
+    /// Current and monotonic high-water approximate LSM memtable bytes.
+    pub lsm_memtable_bytes: Gauge,
+    pub lsm_memtable_high_water_bytes: Gauge,
+    lsm_memtable_high_water_value: Arc<AtomicU64>,
+    /// Currently published in-memory SSTable count.
+    pub lsm_sstables: Gauge,
+    pub lsm_flushes_total: LabeledCounter,
+    pub lsm_flush_seconds: LabeledHistogram,
+    pub lsm_compactions_total: LabeledCounter,
+    pub lsm_compaction_seconds: LabeledHistogram,
 }
 
 impl Default for Metrics {
@@ -119,6 +141,24 @@ impl Default for Metrics {
             raft_log_entries: Family::default(),
             snapshot_deferrals_total: Family::default(),
             snapshot_deferred_seconds: Family::default(),
+            raft_router_queue_depth: Gauge::default(),
+            raft_router_queue_high_water: Gauge::default(),
+            raft_router_queue_high_water_value: Arc::new(AtomicU64::new(0)),
+            raft_commit_queue_depth: Gauge::default(),
+            raft_commit_queue_high_water: Gauge::default(),
+            raft_commit_queue_high_water_value: Arc::new(AtomicU64::new(0)),
+            lsm_memtable_bytes: Gauge::default(),
+            lsm_memtable_high_water_bytes: Gauge::default(),
+            lsm_memtable_high_water_value: Arc::new(AtomicU64::new(0)),
+            lsm_sstables: Gauge::default(),
+            lsm_flushes_total: Family::default(),
+            lsm_flush_seconds: Family::new_with_constructor(
+                storage_duration_histogram as fn() -> Histogram,
+            ),
+            lsm_compactions_total: Family::default(),
+            lsm_compaction_seconds: Family::new_with_constructor(
+                storage_duration_histogram as fn() -> Histogram,
+            ),
         }
     }
 }
@@ -251,6 +291,61 @@ impl Metrics {
             "Duration of each group's current unbroken snapshot-deferral streak",
             m.snapshot_deferred_seconds.clone(),
         );
+        registry.register(
+            "nodus_raft_router_queue_depth",
+            "Last-observed general Raft router queue depth",
+            m.raft_router_queue_depth.clone(),
+        );
+        registry.register(
+            "nodus_raft_router_queue_high_water",
+            "Monotonic general Raft router queue high-water",
+            m.raft_router_queue_high_water.clone(),
+        );
+        registry.register(
+            "nodus_raft_commit_queue_depth",
+            "Last-observed bounded Raft commit queue depth",
+            m.raft_commit_queue_depth.clone(),
+        );
+        registry.register(
+            "nodus_raft_commit_queue_high_water",
+            "Monotonic bounded Raft commit queue high-water",
+            m.raft_commit_queue_high_water.clone(),
+        );
+        registry.register(
+            "nodus_lsm_memtable_bytes",
+            "Approximate current LSM memtable bytes",
+            m.lsm_memtable_bytes.clone(),
+        );
+        registry.register(
+            "nodus_lsm_memtable_high_water_bytes",
+            "Monotonic approximate LSM memtable high-water bytes",
+            m.lsm_memtable_high_water_bytes.clone(),
+        );
+        registry.register(
+            "nodus_lsm_sstables",
+            "Currently published in-memory LSM SSTable count",
+            m.lsm_sstables.clone(),
+        );
+        registry.register(
+            "nodus_lsm_flushes_total",
+            "Completed non-empty LSM flushes by result",
+            m.lsm_flushes_total.clone(),
+        );
+        registry.register(
+            "nodus_lsm_flush_seconds",
+            "Duration of non-empty LSM flushes by result",
+            m.lsm_flush_seconds.clone(),
+        );
+        registry.register(
+            "nodus_lsm_compactions_total",
+            "Completed real LSM compactions by result",
+            m.lsm_compactions_total.clone(),
+        );
+        registry.register(
+            "nodus_lsm_compaction_seconds",
+            "Duration of real LSM compactions by result",
+            m.lsm_compaction_seconds.clone(),
+        );
         m
     }
 
@@ -288,6 +383,60 @@ impl Metrics {
                 ("mode".to_string(), mode.to_string()),
                 ("result".to_string(), result.to_string()),
             ])
+            .observe(elapsed.as_secs_f64());
+    }
+
+    fn observe_high_water(current: &Gauge, high_water: &Gauge, maximum: &AtomicU64, value: usize) {
+        let value = u64::try_from(value).unwrap_or(u64::MAX);
+        maximum.fetch_max(value, Ordering::Relaxed);
+        current.set(value.min(i64::MAX as u64) as i64);
+        high_water.set(maximum.load(Ordering::Relaxed).min(i64::MAX as u64) as i64);
+    }
+
+    pub fn observe_raft_router_queue(&self, depth: usize) {
+        Self::observe_high_water(
+            &self.raft_router_queue_depth,
+            &self.raft_router_queue_high_water,
+            &self.raft_router_queue_high_water_value,
+            depth,
+        );
+    }
+
+    pub fn observe_raft_commit_queue(&self, depth: usize) {
+        Self::observe_high_water(
+            &self.raft_commit_queue_depth,
+            &self.raft_commit_queue_high_water,
+            &self.raft_commit_queue_high_water_value,
+            depth,
+        );
+    }
+
+    pub fn observe_lsm_memtable(&self, bytes: usize) {
+        Self::observe_high_water(
+            &self.lsm_memtable_bytes,
+            &self.lsm_memtable_high_water_bytes,
+            &self.lsm_memtable_high_water_value,
+            bytes,
+        );
+    }
+
+    pub fn set_lsm_sstables(&self, count: usize) {
+        self.lsm_sstables.set(count.min(i64::MAX as usize) as i64);
+    }
+
+    pub fn observe_lsm_flush(&self, result: &str, elapsed: Duration) {
+        let labels = vec![("result".to_owned(), result.to_owned())];
+        self.lsm_flushes_total.get_or_create(&labels).inc();
+        self.lsm_flush_seconds
+            .get_or_create(&labels)
+            .observe(elapsed.as_secs_f64());
+    }
+
+    pub fn observe_lsm_compaction(&self, result: &str, elapsed: Duration) {
+        let labels = vec![("result".to_owned(), result.to_owned())];
+        self.lsm_compactions_total.get_or_create(&labels).inc();
+        self.lsm_compaction_seconds
+            .get_or_create(&labels)
             .observe(elapsed.as_secs_f64());
     }
 }
@@ -537,5 +686,34 @@ mod tests {
         );
         assert!(buf.contains("nodus_raft_log_entries{group=\"shard-meta\"} 42"));
         assert!(buf.contains("nodus_snapshot_deferrals_total_total{group=\"shard-meta\"} 1"));
+    }
+
+    #[test]
+    fn resource_metrics_preserve_high_water_and_storage_durations() {
+        let mut registry = Registry::default();
+        let metrics = Metrics::register(&mut registry);
+        metrics.observe_raft_router_queue(8);
+        metrics.observe_raft_router_queue(3);
+        metrics.observe_raft_commit_queue(12);
+        metrics.observe_raft_commit_queue(4);
+        metrics.observe_lsm_memtable(1024);
+        metrics.observe_lsm_memtable(512);
+        metrics.set_lsm_sstables(2);
+        metrics.observe_lsm_flush("success", Duration::from_millis(20));
+        metrics.observe_lsm_compaction("success", Duration::from_secs(2));
+
+        let mut buf = String::new();
+        prometheus_client::encoding::text::encode(&mut buf, &registry).unwrap();
+        assert!(buf.contains("nodus_raft_router_queue_depth 3"));
+        assert!(buf.contains("nodus_raft_router_queue_high_water 8"));
+        assert!(buf.contains("nodus_raft_commit_queue_depth 4"));
+        assert!(buf.contains("nodus_raft_commit_queue_high_water 12"));
+        assert!(buf.contains("nodus_lsm_memtable_bytes 512"));
+        assert!(buf.contains("nodus_lsm_memtable_high_water_bytes 1024"));
+        assert!(buf.contains("nodus_lsm_sstables 2"));
+        assert!(buf.contains("nodus_lsm_flushes_total_total{result=\"success\"} 1"));
+        assert!(buf.contains("nodus_lsm_flush_seconds_count{result=\"success\"} 1"));
+        assert!(buf.contains("nodus_lsm_compactions_total_total{result=\"success\"} 1"));
+        assert!(buf.contains("nodus_lsm_compaction_seconds_count{result=\"success\"} 1"));
     }
 }

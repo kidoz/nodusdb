@@ -64,11 +64,20 @@ RSS includes both server and benchmark clients; it is not allocator-only or
 server-only memory. Unsupported platforms and collection failures produce null
 RSS fields rather than zero.
 
+The Prometheus snapshots also include general and bounded-commit Raft queue
+depth/high-water, approximate LSM memtable bytes/high-water, SSTable count,
+and result-labelled flush/compaction counts and duration histograms. Queue
+and memtable high-water values are monotonic within one server process; depth
+and current-byte gauges are last-observed values. Flush and compaction metrics
+exclude empty no-ops, and flush duration includes any compaction triggered by
+that flush. The LSM observer is attached only to durable storage.
+
 ## Budgets
 
 The CI smoke job catches harness breakage and provides coarse output for
 regression review; shared runners do not enforce stable performance budgets.
-Allocator/queue-specific high-water marks, compaction timings, recovery
-budgets, scheduled mixed-activity soaks, and the final 24-hour soak remain PR2
-work. Production budgets require maintainer approval and repeated supported-
-profile evidence, never a number invented from one laptop run.
+Allocator-specific statistics, successful Raft snapshot count/duration metrics,
+recovery budgets, repeated full baselines, scheduled mixed-activity soaks, and
+the final 24-hour soak remain PR2 work. Production budgets require maintainer
+approval and repeated supported-profile evidence, never a number invented from
+one laptop run.

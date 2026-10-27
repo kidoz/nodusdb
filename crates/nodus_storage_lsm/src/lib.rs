@@ -16,7 +16,23 @@ use sstable::Sstable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+/// Observable storage events, emitted without a storage-to-monitoring dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsmTelemetryEvent {
+    /// Approximate live memtable bytes after a write, flush, or observer attachment.
+    MemtableBytes { bytes: usize },
+    /// Number of SSTables in the engine's current in-memory published set.
+    Sstables { count: usize },
+    /// A non-empty flush completed, including any compaction it triggered.
+    Flush { elapsed: Duration, success: bool },
+    /// A compaction with at least two input SSTables completed.
+    Compaction { elapsed: Duration, success: bool },
+}
+
+type LsmTelemetryObserver = Arc<dyn Fn(LsmTelemetryEvent) + Send + Sync>;
 
 /// Flush the memtable once its (approximate) live size reaches this many bytes.
 const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
@@ -87,6 +103,7 @@ pub struct LsmKvEngine {
     #[cfg(test)]
     flush_pause: AppendPause,
     _wal_key: Option<[u8; 32]>,
+    telemetry_observer: OnceLock<LsmTelemetryObserver>,
 }
 
 /// Decrements [`LsmKvEngine::inflight_appends`] on drop, so every exit from an
@@ -258,12 +275,51 @@ impl LsmKvEngine {
             #[cfg(test)]
             flush_pause: AppendPause::default(),
             _wal_key: None,
+            telemetry_observer: OnceLock::new(),
         }
     }
 
     /// Overrides the memtable flush threshold (bytes). Mainly for tests.
     pub fn set_flush_threshold(&self, bytes: usize) {
         self.flush_threshold.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Installs the single telemetry observer and emits the current resource snapshot.
+    pub fn set_telemetry_observer(
+        &self,
+        observer: impl Fn(LsmTelemetryEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        let observer: LsmTelemetryObserver = Arc::new(observer);
+        self.telemetry_observer
+            .set(observer.clone())
+            .map_err(|_| anyhow::anyhow!("LSM telemetry observer is already installed"))?;
+        observer(LsmTelemetryEvent::MemtableBytes {
+            bytes: self.memtable_bytes.load(Ordering::Relaxed),
+        });
+        observer(LsmTelemetryEvent::Sstables {
+            count: self.sstables.read().unwrap().len(),
+        });
+        Ok(())
+    }
+
+    fn emit_telemetry(&self, event: LsmTelemetryEvent) {
+        if let Some(observer) = self.telemetry_observer.get() {
+            observer(event);
+        }
+    }
+
+    fn set_memtable_bytes(&self, bytes: usize) {
+        self.memtable_bytes.store(bytes, Ordering::Relaxed);
+        self.emit_telemetry(LsmTelemetryEvent::MemtableBytes { bytes });
+    }
+
+    fn add_memtable_bytes(&self, added: usize) {
+        let previous = self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.set_memtable_bytes(previous.wrapping_add(added));
+    }
+
+    fn emit_sstable_count(&self, count: usize) {
+        self.emit_telemetry(LsmTelemetryEvent::Sstables { count });
     }
 
     pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
@@ -336,6 +392,7 @@ impl LsmKvEngine {
             #[cfg(test)]
             flush_pause: AppendPause::default(),
             _wal_key: key,
+            telemetry_observer: OnceLock::new(),
         };
 
         engine.recover()?;
@@ -348,7 +405,7 @@ impl LsmKvEngine {
             .iter()
             .map(|(k, c)| chain_bytes(k, c))
             .sum();
-        engine.memtable_bytes.store(restored, Ordering::Relaxed);
+        engine.set_memtable_bytes(restored);
         engine.save_manifest()?;
         Ok(engine)
     }
@@ -397,6 +454,19 @@ impl LsmKvEngine {
     }
 
     fn flush_inner(&self) -> Result<()> {
+        if self.data_dir.is_none() || self.memtable.read().unwrap().is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let result = self.flush_inner_impl();
+        self.emit_telemetry(LsmTelemetryEvent::Flush {
+            elapsed: started.elapsed(),
+            success: result.is_ok(),
+        });
+        result
+    }
+
+    fn flush_inner_impl(&self) -> Result<()> {
         let dir = match &self.data_dir {
             Some(d) => d.clone(),
             None => return Ok(()), // no-op for in-memory only
@@ -431,13 +501,18 @@ impl LsmKvEngine {
                 }
             });
             let retained: usize = mem_guard.iter().map(|(k, c)| chain_bytes(k, c)).sum();
-            self.memtable_bytes.store(retained, Ordering::Relaxed);
+            self.set_memtable_bytes(retained);
 
             if !to_flush.is_empty() {
                 // Durably + atomically publish committed data as an SSTable.
                 let sst_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
                 let sst = Sstable::build(dir.join(format!("{sst_id}.sst")), &to_flush)?;
-                self.sstables.write().unwrap().push(sst);
+                let count = {
+                    let mut sstables = self.sstables.write().unwrap();
+                    sstables.push(sst);
+                    sstables.len()
+                };
+                self.emit_sstable_count(count);
             }
 
             // Rotate to a fresh WAL segment; older segments stay on disk for the
@@ -523,6 +598,19 @@ impl LsmKvEngine {
     }
 
     fn compact_inner(&self) -> Result<()> {
+        if self.data_dir.is_none() || self.sstables.read().unwrap().len() < 2 {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let result = self.compact_inner_impl();
+        self.emit_telemetry(LsmTelemetryEvent::Compaction {
+            elapsed: started.elapsed(),
+            success: result.is_ok(),
+        });
+        result
+    }
+
+    fn compact_inner_impl(&self) -> Result<()> {
         let dir = match &self.data_dir {
             Some(d) => d.clone(),
             None => return Ok(()),
@@ -583,6 +671,7 @@ impl LsmKvEngine {
         // Atomic swap: install the single compacted SSTable, persist the manifest
         // (commit point), then delete the now-orphaned old files.
         *self.sstables.write().unwrap() = vec![new_sst];
+        self.emit_sstable_count(1);
         self.save_manifest()?;
         for path in old_paths {
             let _ = std::fs::remove_file(path);
@@ -1076,7 +1165,7 @@ impl KvEngine for LsmKvEngine {
                 .or_default()
                 .push((key, started_at));
         }
-        self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.add_memtable_bytes(added);
         self.maybe_flush_by_size()?;
         Ok(())
     }
@@ -1112,7 +1201,7 @@ impl KvEngine for LsmKvEngine {
                 .or_default()
                 .push((key, started_at));
         }
-        self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.add_memtable_bytes(added);
         self.maybe_flush_by_size()?;
         Ok(())
     }
@@ -1191,7 +1280,7 @@ impl KvEngine for LsmKvEngine {
                     .push((key, started_at));
             }
         }
-        self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.add_memtable_bytes(added);
         self.maybe_flush_by_size()?;
         Ok(())
     }
@@ -2714,5 +2803,61 @@ mod sst_tests {
         assert_eq!(engine.get(b"a2", 10).unwrap(), Some(Bytes::from("2")));
         assert_eq!(engine.get(b"b1", 20).unwrap(), Some(Bytes::from("1")));
         assert_eq!(engine.get(b"b2", 20).unwrap(), Some(Bytes::from("2")));
+    }
+
+    #[test]
+    fn telemetry_reports_real_storage_operations_and_skips_noops() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observer = events.clone();
+        engine
+            .set_telemetry_observer(move |event| observer.lock().unwrap().push(event))
+            .unwrap();
+
+        for (key, timestamp) in [("first", 10), ("second", 20)] {
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, Bytes::from(key), Bytes::from("value"))
+                .unwrap();
+            engine.commit(txn, timestamp).unwrap();
+            engine.flush().unwrap();
+        }
+        engine.compact().unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+
+        let events = events.lock().unwrap();
+        let flushes = events
+            .iter()
+            .filter(|event| matches!(event, LsmTelemetryEvent::Flush { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(flushes.len(), 2);
+        assert!(
+            flushes
+                .iter()
+                .all(|event| matches!(event, LsmTelemetryEvent::Flush { success: true, .. }))
+        );
+        let compactions = events
+            .iter()
+            .filter(|event| matches!(event, LsmTelemetryEvent::Compaction { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(compactions.len(), 1);
+        assert!(matches!(
+            compactions[0],
+            LsmTelemetryEvent::Compaction { success: true, .. }
+        ));
+        let sstable_counts = events
+            .iter()
+            .filter_map(|event| match event {
+                LsmTelemetryEvent::Sstables { count } => Some(*count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sstable_counts, vec![0, 1, 2, 1]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LsmTelemetryEvent::MemtableBytes { bytes } if *bytes > 0
+        )));
     }
 }

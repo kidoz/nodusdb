@@ -603,6 +603,18 @@ pub async fn run_server_full(
                 .map_err(|e| anyhow::anyhow!("creating storage.data_dir '{dir}': {e}"))?;
             let engine = nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key)
                 .map_err(|e| anyhow::anyhow!("opening durable storage at '{dir}': {e}"))?;
+            let telemetry = state.metrics.clone();
+            engine.set_telemetry_observer(move |event| {
+                use nodus_storage_lsm::LsmTelemetryEvent as Event;
+                match event {
+                    Event::MemtableBytes { bytes } => telemetry.observe_lsm_memtable(bytes),
+                    Event::Sstables { count } => telemetry.set_lsm_sstables(count),
+                    Event::Flush { elapsed, success } => telemetry
+                        .observe_lsm_flush(if success { "success" } else { "error" }, elapsed),
+                    Event::Compaction { elapsed, success } => telemetry
+                        .observe_lsm_compaction(if success { "success" } else { "error" }, elapsed),
+                }
+            })?;
             tracing::info!("Durable storage at {dir}");
             Arc::new(engine)
         }
