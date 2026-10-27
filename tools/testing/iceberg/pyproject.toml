@@ -1,0 +1,12 @@
+[project]
+name = "nodus-iceberg-live-tests"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "pyiceberg[pyarrow]==0.12.0",
+  "pyarrow==26.0.0",
+  "boto3==1.43.119",
+]
+
+[tool.uv]
+package = false
