@@ -111,6 +111,18 @@ establish long-running fuzzing assurance.
 
 ## Live infrastructure and restore drills
 
+Run the independent-writer Iceberg gate against a disposable Lakekeeper and
+MinIO stack with:
+
+```sh
+just test-iceberg-live
+```
+
+It requires Docker Compose and `uv`, runs without external credentials, and
+writes `target/iceberg-live/report.json`. See
+[test Lakekeeper interoperability](test-lakekeeper-interoperability.md) for
+the pinned versions, checks, and cleanup behavior.
+
 The persistent filesystem restore drill needs no external service:
 
 ```bash

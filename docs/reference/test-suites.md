@@ -51,6 +51,13 @@ backend gates.
 **Loom tests.** Only run under `RUSTFLAGS="--cfg loom"`; they are compiled out of
 ordinary builds.
 
+**Live Iceberg interoperability.** `just test-iceberg-live` drives the pinned
+Lakekeeper/PostgreSQL/MinIO stack through `tools/testing/iceberg/`. PyIceberg
+creates real tables and checks the CLI's Arrow results, schema/partition
+evolution, temporary storage credentials, and failure behavior. This is a
+separate CI job; ordinary `cargo test` runs only the fast protocol fixtures.
+See [the gate guide](../how-to/test-lakekeeper-interoperability.md) for scope.
+
 **Fault injection.** `nodus_testkit::FaultInjector` covers component-level fault
 injection. The storage engines do not consume it — the low-level crates cannot
 depend on the testkit — so storage crash residue is reproduced directly on disk

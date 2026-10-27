@@ -28,6 +28,7 @@ Recipes for people who already know what they want.
 
 - [Import a PostgreSQL dump](how-to/import-a-postgresql-dump.md)
 - [Read external Iceberg tables](how-to/read-iceberg-tables.md)
+- [Test Lakekeeper interoperability](how-to/test-lakekeeper-interoperability.md)
 - [Back up and restore](how-to/back-up-and-restore.md)
 - [Run the test suites](how-to/run-the-test-suites.md)
 - [Run the benchmarks](how-to/run-benchmarks.md)

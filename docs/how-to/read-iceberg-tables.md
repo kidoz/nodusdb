@@ -29,7 +29,7 @@ namespace and table, and set `NODUS_ICEBERG_TOKEN` in your shell first.
 ```sh
 ./target/debug/nodus_cli iceberg inspect \
   --catalog-uri http://localhost:8181/catalog \
-  --warehouse YOUR_WAREHOUSE_ID \
+  --warehouse YOUR_WAREHOUSE_NAME \
   --namespace analytics --table events
 ```
 
@@ -37,13 +37,15 @@ Inspection prints a versioned JSON object with the table UUID, format version,
 selected snapshot ID, its Iceberg schema, and output column names. Credentials,
 storage locations, and catalog properties are omitted. Repeat `--namespace` for
 a multi-level namespace; a dot inside a component is a literal dot.
+Lakekeeper 0.14.2 expects the warehouse name for catalog discovery; use the
+identifier required by your catalog release.
 
 ## Read a snapshot
 
 ```sh
 ./target/debug/nodus_cli iceberg scan \
   --catalog-uri http://localhost:8181/catalog \
-  --warehouse YOUR_WAREHOUSE_ID \
+  --warehouse YOUR_WAREHOUSE_NAME \
   --namespace analytics --table events \
   --column id --column name \
   --limit 1000 --batch-size 1024 --timeout-seconds 120 \
@@ -142,9 +144,13 @@ Automated fixtures use REST configuration/table responses, generated Avro
 manifests and Parquet files, and a local S3 HTTP range-read endpoint. They cover
 snapshot selection, projections, nulls, empty tables, row limits, missing files,
 errors, and output publication. The S3 fixture checks credential selection and
-request shape, not AWS signature cryptography. A deployed Lakekeeper/Polaris
-instance, real AWS credentials, partition evolution, and large-table performance
-have not been certified by these fixtures.
+request shape, not AWS signature cryptography.
+
+The separate [live Lakekeeper gate](test-lakekeeper-interoperability.md), run with
+`just test-iceberg-live`, uses pinned Lakekeeper and MinIO services plus an
+independent PyIceberg writer. It verifies schema/partition evolution, temporary
+storage credentials, and read/failure behavior against real services. Catalog
+OIDC/RBAC, Polaris, real AWS, and large-table performance remain unverified.
 
 See the [official Rust implementation](https://github.com/apache/iceberg-rust)
 and [Iceberg REST specification](https://iceberg.apache.org/rest-catalog-spec/)
