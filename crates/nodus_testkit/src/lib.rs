@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 
+pub mod benchmark;
 pub mod cluster;
 pub mod fault;
 

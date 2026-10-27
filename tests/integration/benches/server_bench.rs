@@ -9,10 +9,29 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nodus_testkit::TestServer;
+use nodus_testkit::benchmark::{IterationMeasurement, LatencyRecorder};
 use std::time::{Duration, Instant};
 use tokio_postgres::NoTls;
 
 const FULL_ROWS: usize = 10_000;
+
+fn scale() -> &'static str {
+    if smoke() { "smoke" } else { "full" }
+}
+
+fn single_node(server: &TestServer) -> Vec<(String, std::net::SocketAddr)> {
+    vec![("1".to_owned(), server.http_addr)]
+}
+
+async fn observed<T>(
+    recorder: &LatencyRecorder,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    let start = Instant::now();
+    let result = operation.await;
+    recorder.record(start.elapsed());
+    result
+}
 
 fn rows() -> usize {
     match std::env::var("NODUS_BENCH_SCALE").as_deref() {
@@ -133,7 +152,7 @@ async fn server_with_rows(
         eprintln!("server ready");
     }
     if n > 0 {
-        preload(&client, n, 1).await;
+        preload(&client, n, 1, None).await;
         if std::env::var("BENCH_DEBUG").is_ok() {
             eprintln!("preload done");
         }
@@ -143,7 +162,12 @@ async fn server_with_rows(
 
 /// Bulk load via `COPY ... FROM STDIN` (one transaction per batch, the
 /// intended bulk path; per-row INSERTs fsync per transaction).
-async fn preload(client: &tokio_postgres::Client, n: usize, from: usize) {
+async fn preload(
+    client: &tokio_postgres::Client,
+    n: usize,
+    from: usize,
+    recorder: Option<LatencyRecorder>,
+) {
     let mut i = from;
     while i < from + n {
         let end = (i + 100).min(from + n);
@@ -152,6 +176,7 @@ async fn preload(client: &tokio_postgres::Client, n: usize, from: usize) {
             rows.push_str(&format!("{j}\tnote-{j}\n"));
         }
         use futures_util::SinkExt as _;
+        let start = Instant::now();
         let mut sink = Box::pin(
             client
                 .copy_in::<_, bytes::Bytes>("COPY bench (id, note) FROM STDIN")
@@ -160,6 +185,9 @@ async fn preload(client: &tokio_postgres::Client, n: usize, from: usize) {
         );
         sink.as_mut().send(bytes::Bytes::from(rows)).await.unwrap();
         sink.as_mut().finish().await.unwrap();
+        if let Some(recorder) = &recorder {
+            recorder.record(start.elapsed());
+        }
         i = end;
     }
 }
@@ -198,6 +226,17 @@ fn bench_concurrent_point_inserts(
                     let total = iters as usize * n;
                     base += total as i32;
                     rt.block_on(async {
+                        let measurement = IterationMeasurement::begin(
+                            name.trim_start_matches("server/"),
+                            scale(),
+                            write_batch_requested(),
+                            client_count,
+                            iters,
+                            "insert",
+                            single_node(&_server),
+                        )
+                        .await
+                        .unwrap();
                         let start = Instant::now();
                         let mut tasks = Vec::new();
                         for (worker, client) in
@@ -205,22 +244,30 @@ fn bench_concurrent_point_inserts(
                         {
                             let first = total * worker / client_count;
                             let end = total * (worker + 1) / client_count;
+                            let recorder = measurement.recorder();
                             tasks.push(tokio::spawn(async move {
                                 for i in first..end {
-                                    client
-                                        .execute(
+                                    observed(
+                                        &recorder,
+                                        client.execute(
                                             "INSERT INTO bench VALUES ($1, 'x')",
                                             &[&(start_at + i as i32)],
-                                        )
-                                        .await
-                                        .unwrap();
+                                        ),
+                                    )
+                                    .await
+                                    .unwrap();
                                 }
                             }));
                         }
                         for task in tasks {
                             task.await.unwrap();
                         }
-                        start.elapsed()
+                        let elapsed = start.elapsed();
+                        measurement
+                            .finish(elapsed, total as u64, Some(total as u64))
+                            .await
+                            .unwrap();
+                        elapsed
                     })
                 })
             },
@@ -271,15 +318,34 @@ fn bench_point_read(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let client = client.clone();
             rt.block_on(async {
+                let total = iters as usize * n;
+                let measurement = IterationMeasurement::begin(
+                    "point_read",
+                    scale(),
+                    write_batch_requested(),
+                    1,
+                    iters,
+                    "select",
+                    single_node(&_server),
+                )
+                .await
+                .unwrap();
                 let start = Instant::now();
-                for i in 0..iters as usize * n {
+                for i in 0..total {
                     let id = (i % rows()) as i32 + 1;
-                    client
-                        .query_one("SELECT note FROM bench WHERE id = $1", &[&id])
-                        .await
-                        .unwrap();
+                    observed(
+                        &measurement.recorder(),
+                        client.query_one("SELECT note FROM bench WHERE id = $1", &[&id]),
+                    )
+                    .await
+                    .unwrap();
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                measurement
+                    .finish(elapsed, total as u64, Some(total as u64))
+                    .await
+                    .unwrap();
+                elapsed
             })
         })
     });
@@ -323,11 +389,23 @@ fn bench_mixed_oltp(c: &mut Criterion) {
             let clients = clients.clone();
             let next_id = next_id.clone();
             rt.block_on(async {
+                let total = iters as usize * n;
+                let measurement = IterationMeasurement::begin(
+                    "mixed_oltp",
+                    scale(),
+                    write_batch_requested(),
+                    8,
+                    iters,
+                    "mixed_sql",
+                    single_node(&_server),
+                )
+                .await
+                .unwrap();
                 let start = Instant::now();
                 let mut tasks = Vec::new();
-                let total = iters as usize * n;
                 for (worker, client) in clients.iter().cloned().enumerate() {
                     let next_id = next_id.clone();
+                    let recorder = measurement.recorder();
                     let first = total * worker / 8;
                     let end = total * (worker + 1) / 8;
                     tasks.push(tokio::spawn(async move {
@@ -342,15 +420,23 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                                 let write_id = next_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                     as i32;
-                                client
-                                    .execute("INSERT INTO bench VALUES ($1, 'w')", &[&write_id])
-                                    .await
-                                    .unwrap();
+                                observed(
+                                    &recorder,
+                                    client.execute(
+                                        "INSERT INTO bench VALUES ($1, 'w')",
+                                        &[&write_id],
+                                    ),
+                                )
+                                .await
+                                .unwrap();
                             } else {
-                                client
-                                    .query_one("SELECT note FROM bench WHERE id = $1", &[&id])
-                                    .await
-                                    .unwrap();
+                                observed(
+                                    &recorder,
+                                    client
+                                        .query_one("SELECT note FROM bench WHERE id = $1", &[&id]),
+                                )
+                                .await
+                                .unwrap();
                             }
                             if debug {
                                 eprintln!(
@@ -364,7 +450,12 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                 for task in tasks {
                     task.await.unwrap();
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                measurement
+                    .finish(elapsed, total as u64, None)
+                    .await
+                    .unwrap();
+                elapsed
             })
         })
     });
@@ -387,10 +478,27 @@ fn bench_bulk_insert(c: &mut Criterion) {
             if std::env::var("BENCH_DEBUG").is_ok() {
                 eprintln!("iter_custom: iters={iters} base={base}");
             }
-            rt.block_on(async move {
+            rt.block_on(async {
+                let total = iters as usize * n;
+                let measurement = IterationMeasurement::begin(
+                    "bulk_insert",
+                    scale(),
+                    write_batch_requested(),
+                    1,
+                    iters,
+                    "copy_batch_100_rows",
+                    single_node(&_server),
+                )
+                .await
+                .unwrap();
                 let start = Instant::now();
-                preload(&client, iters as usize * n, base).await;
-                start.elapsed()
+                preload(&client, total, base, Some(measurement.recorder())).await;
+                let elapsed = start.elapsed();
+                measurement
+                    .finish(elapsed, (total as u64).div_ceil(100), Some(total as u64))
+                    .await
+                    .unwrap();
+                elapsed
             })
         })
     });
@@ -408,15 +516,33 @@ fn bench_range_scan(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let client = client.clone();
             rt.block_on(async {
+                let measurement = IterationMeasurement::begin(
+                    "range_scan",
+                    scale(),
+                    write_batch_requested(),
+                    1,
+                    iters,
+                    "ordered_select",
+                    single_node(&_server),
+                )
+                .await
+                .unwrap();
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let rows = client
-                        .query("SELECT id FROM bench ORDER BY id", &[])
-                        .await
-                        .unwrap();
+                    let rows = observed(
+                        &measurement.recorder(),
+                        client.query("SELECT id FROM bench ORDER BY id", &[]),
+                    )
+                    .await
+                    .unwrap();
                     std::hint::black_box(rows);
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                measurement
+                    .finish(elapsed, iters, Some(iters * n as u64))
+                    .await
+                    .unwrap();
+                elapsed
             })
         })
     });
@@ -442,7 +568,7 @@ fn bench_replicated_oltp(c: &mut Criterion) {
         seed.batch_execute("CREATE TABLE bench (id INT PRIMARY KEY, note TEXT)")
             .await
             .unwrap();
-        preload(&seed, rows(), 1).await;
+        preload(&seed, rows(), 1, None).await;
         let mut clients = Vec::new();
         for idx in 0..8 {
             clients.push(connect_node(&cluster, idx % 3).await);
@@ -459,11 +585,28 @@ fn bench_replicated_oltp(c: &mut Criterion) {
             let clients = clients.clone();
             let next_id = next_id.clone();
             rt.block_on(async {
+                let total = iters as usize * n;
+                let metric_nodes = cluster
+                    .nodes
+                    .iter()
+                    .map(|node| (node.node_id.to_string(), node.http_addr().parse().unwrap()))
+                    .collect();
+                let measurement = IterationMeasurement::begin(
+                    "replicated_oltp",
+                    scale(),
+                    write_batch_requested(),
+                    8,
+                    iters,
+                    "mixed_sql",
+                    metric_nodes,
+                )
+                .await
+                .unwrap();
                 let start = Instant::now();
                 let mut tasks = Vec::new();
-                let total = iters as usize * n;
                 for (worker, client) in clients.iter().cloned().enumerate() {
                     let next_id = next_id.clone();
+                    let recorder = measurement.recorder();
                     let first = total * worker / 8;
                     let end = total * (worker + 1) / 8;
                     tasks.push(tokio::spawn(async move {
@@ -478,15 +621,23 @@ fn bench_replicated_oltp(c: &mut Criterion) {
                                 let write_id = next_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                     as i32;
-                                client
-                                    .execute("INSERT INTO bench VALUES ($1, 'w')", &[&write_id])
-                                    .await
-                                    .unwrap();
+                                observed(
+                                    &recorder,
+                                    client.execute(
+                                        "INSERT INTO bench VALUES ($1, 'w')",
+                                        &[&write_id],
+                                    ),
+                                )
+                                .await
+                                .unwrap();
                             } else {
-                                client
-                                    .query_one("SELECT note FROM bench WHERE id = $1", &[&id])
-                                    .await
-                                    .unwrap();
+                                observed(
+                                    &recorder,
+                                    client
+                                        .query_one("SELECT note FROM bench WHERE id = $1", &[&id]),
+                                )
+                                .await
+                                .unwrap();
                             }
                             if debug {
                                 eprintln!(
@@ -500,7 +651,12 @@ fn bench_replicated_oltp(c: &mut Criterion) {
                 for task in tasks {
                     task.await.unwrap();
                 }
-                start.elapsed()
+                let elapsed = start.elapsed();
+                measurement
+                    .finish(elapsed, total as u64, None)
+                    .await
+                    .unwrap();
+                elapsed
             })
         })
     });

@@ -21,6 +21,8 @@ nodus_security = { path = "../nodus_security" }
 nodus_config = { path = "../nodus_config" }
 rcgen = "0.14.10"
 madsim = "0.2.34"
+libc = "0.2.190"
+serde.workspace = true
 serde_json.workspace = true
 tempfile = "3.27.0"
 
