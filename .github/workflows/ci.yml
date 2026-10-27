@@ -46,6 +46,38 @@ jobs:
       - name: Server benchmark smoke (1/100 scale sanity floor)
         run: NODUS_BENCH_SCALE=smoke cargo bench --locked -p nodus_integration_tests --bench server_bench
 
+  iceberg:
+    name: Live Lakekeeper interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/target/iceberg-venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Python environment manager
+        run: python -m pip install uv==0.13.6
+      - name: Build Iceberg CLI
+        run: cargo build -p nodus_cli --features iceberg --locked
+      - name: Check live-test harness assertions
+        run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
+      - name: Read PyIceberg tables through Lakekeeper and MinIO
+        run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py
+      - name: Upload interoperability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iceberg-live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/iceberg-live/report.json
+          if-no-files-found: warn
+          retention-days: 14
+
   frontend:
     name: Frontend build, lint, test, and audit
     runs-on: ubuntu-latest

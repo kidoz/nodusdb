@@ -38,6 +38,12 @@ test-compat-rust:
 test-sql:
     cargo test -p nodus_sqllogictest
 
+# Read independently written Iceberg tables through a disposable Lakekeeper stack
+test-iceberg-live:
+    cargo build -p nodus_cli --features iceberg --locked
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py
+
 # Run crash and fault-injection tests
 test-fault:
     cargo test -p nodus_fault_tests
