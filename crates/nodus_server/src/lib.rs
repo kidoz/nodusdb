@@ -693,21 +693,32 @@ pub async fn run_server_full(
 
     // Owns this node's Raft groups. The meta group is created now; data-shard
     // groups are created on demand (routing lands in Phase 2).
-    let multi_raft = Arc::new(crate::multi_raft::MultiRaftManager::new(
-        config.cluster.node_id,
-        config.cluster.raft_advertise_addr.clone(),
-        raft_config,
-        raft_state.clone(),
-        local_kv.clone(),
-        config.admin.token.clone(),
-        txn.clone(),
-        config
-            .storage
-            .data_dir
-            .clone()
-            .map(std::path::PathBuf::from),
-        raft_transport.clone(),
-    ));
+    let raft_telemetry = state.metrics.clone();
+    let multi_raft = Arc::new(
+        crate::multi_raft::MultiRaftManager::new(
+            config.cluster.node_id,
+            config.cluster.raft_advertise_addr.clone(),
+            raft_config,
+            raft_state.clone(),
+            local_kv.clone(),
+            config.admin.token.clone(),
+            txn.clone(),
+            config
+                .storage
+                .data_dir
+                .clone()
+                .map(std::path::PathBuf::from),
+            raft_transport.clone(),
+        )
+        .with_telemetry_observer(Arc::new(move |event| {
+            use nodus_raftstore::RaftTelemetryEvent as Event;
+            match event {
+                Event::SnapshotBuilt { group, elapsed } => {
+                    raft_telemetry.observe_raft_snapshot_build(&group, elapsed);
+                }
+            }
+        })),
+    );
     // Peer-driven replica formation works over the raft listener (including
     // mTLS-only deployments that do not serve the admin API there).
     multi_raft.install_instantiate_hook();

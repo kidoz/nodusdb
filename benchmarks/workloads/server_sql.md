@@ -72,12 +72,19 @@ and current-byte gauges are last-observed values. Flush and compaction metrics
 exclude empty no-ops, and flush duration includes any compaction triggered by
 that flush. The LSM observer is attached only to durable storage.
 
+Per-group `nodus_raft_snapshot_builds_total` and
+`nodus_raft_snapshot_build_seconds` measure successful local snapshot builds.
+A build counts only after its new snapshot is published and reopened for reading;
+deferred, retry-throttled unchanged, and failed attempts do not count. Duration
+covers the real build through that reopen, not snapshot network transfer or
+installation. Each successful retry counts once. Short or smoke workloads may
+legitimately contain no snapshot observations.
+
 ## Budgets
 
 The CI smoke job catches harness breakage and provides coarse output for
 regression review; shared runners do not enforce stable performance budgets.
-Allocator-specific statistics, successful Raft snapshot count/duration metrics,
-recovery budgets, repeated full baselines, scheduled mixed-activity soaks, and
-the final 24-hour soak remain PR2 work. Production budgets require maintainer
-approval and repeated supported-profile evidence, never a number invented from
-one laptop run.
+Allocator-specific statistics, recovery budgets, repeated full baselines,
+scheduled mixed-activity soaks, and the final 24-hour soak remain PR2 work.
+Production budgets require maintainer approval and repeated supported-profile
+evidence, never a number invented from one laptop run.

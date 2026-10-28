@@ -12,7 +12,7 @@ use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::RwLock;
 
@@ -34,6 +34,15 @@ mod purge;
 pub mod server;
 mod snapshots;
 pub use snapshots::v2::SnapshotCompatibility;
+
+/// Observable Raft storage events, emitted without a Raft-to-monitoring dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftTelemetryEvent {
+    /// A newly published snapshot was returned successfully and reopened for reading.
+    SnapshotBuilt { group: String, elapsed: Duration },
+}
+
+pub type RaftTelemetryObserver = Arc<dyn Fn(RaftTelemetryEvent) + Send + Sync>;
 
 /// Shared, cheap-to-clone tracker for a group's snapshot-build deferrals.
 /// `build_snapshot` records every deferral here; the owning
@@ -775,6 +784,7 @@ pub struct NodusRaftStore {
     /// [`SNAPSHOT_RETRY_INTERVAL`] reports no progress without rescanning, and
     /// the node's metrics loop can watch per-group deferrals.
     deferral: SnapshotDeferral,
+    telemetry_observer: RaftTelemetryObserver,
     pub log: Arc<RwLock<BTreeMap<u64, Entry<NodusTypeConfig>>>>,
     pub vote: Arc<RwLock<Option<Vote<u64>>>>,
     pub state_machine: Arc<RwLock<StateMachine>>,
@@ -832,6 +842,7 @@ impl NodusRaftStore {
             snapshot_group: "unscoped".into(),
             snapshot_compatibility: None,
             deferral: SnapshotDeferral::default(),
+            telemetry_observer: Arc::new(|_| {}),
             snapshot_dir: temp_snapshot_dir(),
             current_snapshot_meta: Arc::new(RwLock::new(None)),
         }
@@ -914,6 +925,7 @@ impl NodusRaftStore {
             snapshot_group: "unscoped".into(),
             snapshot_compatibility: None,
             deferral: SnapshotDeferral::default(),
+            telemetry_observer: Arc::new(|_| {}),
             snapshot_dir,
             current_snapshot_meta: Arc::new(RwLock::new(snapshot_meta)),
         })
@@ -974,6 +986,12 @@ impl NodusRaftStore {
     /// Bind snapshots to the physical Raft group. Configure before starting Raft.
     pub fn with_snapshot_group(mut self, group: impl Into<String>) -> Self {
         self.snapshot_group = group.into();
+        self
+    }
+
+    /// Configure telemetry before starting Raft; cloned storage handles share it.
+    pub fn with_telemetry_observer(mut self, observer: RaftTelemetryObserver) -> Self {
+        self.telemetry_observer = observer;
         self
     }
 
@@ -1203,9 +1221,14 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
         if self.deferral.recently_deferred(SNAPSHOT_RETRY_INTERVAL) {
             return self.unchanged_snapshot().await;
         }
+        let started = Instant::now();
         match self.build_atomic_snapshot().await {
             Ok(snapshot) => {
                 self.deferral.clear();
+                (self.telemetry_observer)(RaftTelemetryEvent::SnapshotBuilt {
+                    group: self.snapshot_group.clone(),
+                    elapsed: started.elapsed(),
+                });
                 Ok(snapshot)
             }
             Err(e) if e.downcast_ref::<snapshots::SnapshotDeferred>().is_some() => {

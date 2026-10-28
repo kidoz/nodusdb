@@ -187,6 +187,7 @@ pub struct MultiRaftManager {
     /// so the metrics loop can report deferral streaks without reaching into
     /// openraft's storage adaptor.
     deferrals: Arc<RwLock<HashMap<String, nodus_raftstore::SnapshotDeferral>>>,
+    telemetry_observer: nodus_raftstore::RaftTelemetryObserver,
     machines: tokio::sync::RwLock<
         std::collections::HashMap<String, Arc<tokio::sync::RwLock<nodus_raftstore::StateMachine>>>,
     >,
@@ -225,11 +226,20 @@ impl MultiRaftManager {
             base_kv,
             hosted: Arc::new(RwLock::new(HashSet::new())),
             deferrals: Arc::new(RwLock::new(HashMap::new())),
+            telemetry_observer: Arc::new(|_| {}),
             machines: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             clock,
             data_dir,
             transport,
         }
+    }
+
+    pub fn with_telemetry_observer(
+        mut self,
+        observer: nodus_raftstore::RaftTelemetryObserver,
+    ) -> Self {
+        self.telemetry_observer = observer;
+        self
     }
 
     pub(crate) async fn machine(
@@ -436,6 +446,7 @@ impl MultiRaftManager {
             .insert(shard_id.to_string(), store.deferral());
         let store = store
             .with_snapshot_group(shard_id)
+            .with_telemetry_observer(self.telemetry_observer.clone())
             .with_snapshot_compatibility(Arc::new(
                 nodus_raftstore::upgrade::DurableSnapshotCompatibility(self.base_kv.clone()),
             ));

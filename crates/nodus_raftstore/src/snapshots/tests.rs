@@ -114,6 +114,50 @@ async fn a_deferred_build_waits_out_the_retry_interval() {
 }
 
 #[tokio::test]
+async fn snapshot_telemetry_counts_only_new_successful_builds() {
+    let kv = Arc::new(MemKvEngine::new());
+    put(kv.as_ref(), b"row", b"first", 10);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observer = events.clone();
+    let mut store = NodusRaftStore::with_kv(kv.clone())
+        .unwrap()
+        .with_snapshot_group("shard-test")
+        .with_telemetry_observer(Arc::new(move |event| {
+            observer.lock().unwrap().push(event);
+        }));
+
+    let original = store.build_snapshot().await.unwrap();
+    assert_eq!(events.lock().unwrap().len(), 1);
+
+    let txn = TxnId::new();
+    kv.write_intent(txn, Bytes::from_static(b"other"), Bytes::from_static(b"x"))
+        .unwrap();
+    let deferred = store.build_snapshot().await.unwrap();
+    assert_eq!(deferred.meta.snapshot_id, original.meta.snapshot_id);
+    kv.commit(txn, 20).unwrap();
+    let throttled = store.build_snapshot().await.unwrap();
+    assert_eq!(throttled.meta.snapshot_id, original.meta.snapshot_id);
+    assert_eq!(events.lock().unwrap().len(), 1);
+
+    store.deferral().clear();
+    std::fs::remove_dir_all(&store.snapshot_dir).unwrap();
+    std::fs::write(&store.snapshot_dir, b"not a directory").unwrap();
+    assert!(store.build_snapshot().await.is_err());
+    assert_eq!(events.lock().unwrap().len(), 1);
+
+    std::fs::remove_file(&store.snapshot_dir).unwrap();
+    std::fs::create_dir(&store.snapshot_dir).unwrap();
+    let retried = store.build_snapshot().await.unwrap();
+    assert_ne!(retried.meta.snapshot_id, original.meta.snapshot_id);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    for event in events.iter() {
+        let RaftTelemetryEvent::SnapshotBuilt { group, .. } = event;
+        assert_eq!(group, "shard-test");
+    }
+}
+
+#[tokio::test]
 async fn legacy_build_refuses_intents_history_and_tombstones_without_replacing_snapshot() {
     for state in ["intent", "history", "tombstone"] {
         let kv = Arc::new(MemKvEngine::new());

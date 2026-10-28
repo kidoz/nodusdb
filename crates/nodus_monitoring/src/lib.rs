@@ -88,6 +88,9 @@ pub struct Metrics {
     /// Duration (seconds) of each group's current unbroken snapshot-deferral
     /// streak (`group` label); 0 when builds are succeeding.
     pub snapshot_deferred_seconds: Family<Vec<(String, String)>, Gauge>,
+    /// Successful newly published snapshot builds and their duration per group.
+    pub raft_snapshot_builds_total: LabeledCounter,
+    pub raft_snapshot_build_seconds: LabeledHistogram,
     /// Last-observed depth and monotonic high-water of the general Raft queue.
     pub raft_router_queue_depth: Gauge,
     pub raft_router_queue_high_water: Gauge,
@@ -141,6 +144,10 @@ impl Default for Metrics {
             raft_log_entries: Family::default(),
             snapshot_deferrals_total: Family::default(),
             snapshot_deferred_seconds: Family::default(),
+            raft_snapshot_builds_total: Family::default(),
+            raft_snapshot_build_seconds: Family::new_with_constructor(
+                storage_duration_histogram as fn() -> Histogram,
+            ),
             raft_router_queue_depth: Gauge::default(),
             raft_router_queue_high_water: Gauge::default(),
             raft_router_queue_high_water_value: Arc::new(AtomicU64::new(0)),
@@ -292,6 +299,16 @@ impl Metrics {
             m.snapshot_deferred_seconds.clone(),
         );
         registry.register(
+            "nodus_raft_snapshot_builds_total",
+            "Successful newly published Raft snapshot builds per group",
+            m.raft_snapshot_builds_total.clone(),
+        );
+        registry.register(
+            "nodus_raft_snapshot_build_seconds",
+            "Duration of successful newly published Raft snapshot builds per group",
+            m.raft_snapshot_build_seconds.clone(),
+        );
+        registry.register(
             "nodus_raft_router_queue_depth",
             "Last-observed general Raft router queue depth",
             m.raft_router_queue_depth.clone(),
@@ -359,6 +376,14 @@ impl Metrics {
         self.raft_commands_total.get_or_create(&labels()).inc();
         self.raft_dispatch_seconds
             .get_or_create(&labels())
+            .observe(elapsed.as_secs_f64());
+    }
+
+    pub fn observe_raft_snapshot_build(&self, group: &str, elapsed: Duration) {
+        let labels = vec![("group".to_owned(), group.to_owned())];
+        self.raft_snapshot_builds_total.get_or_create(&labels).inc();
+        self.raft_snapshot_build_seconds
+            .get_or_create(&labels)
             .observe(elapsed.as_secs_f64());
     }
 
@@ -654,6 +679,7 @@ mod tests {
         metrics.queries_total.inc();
         metrics.janitor_aborts_total.inc_by(2);
         metrics.observe_raft_command("commit_batch", "success", Duration::from_millis(2));
+        metrics.observe_raft_snapshot_build("shard-meta", Duration::from_millis(25));
         metrics.observe_intent_batch(4);
         metrics.observe_commit_batch(4, Duration::from_millis(1));
         metrics.inc_commit_batch_fallback("queue_full");
@@ -686,6 +712,9 @@ mod tests {
         );
         assert!(buf.contains("nodus_raft_log_entries{group=\"shard-meta\"} 42"));
         assert!(buf.contains("nodus_snapshot_deferrals_total_total{group=\"shard-meta\"} 1"));
+        assert!(buf.contains("nodus_raft_snapshot_builds_total_total{group=\"shard-meta\"} 1"));
+        assert!(buf.contains("nodus_raft_snapshot_build_seconds_count{group=\"shard-meta\"} 1"));
+        assert!(buf.contains("nodus_raft_snapshot_build_seconds_sum{group=\"shard-meta\"} 0.025"));
     }
 
     #[test]
