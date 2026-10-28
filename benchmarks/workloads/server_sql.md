@@ -43,13 +43,15 @@ the data directory, run count, and confidence intervals go into the report
 header. Reports live in `benchmarks/reports/`; generated Criterion output stays
 under `target/criterion`.
 
-Each `iter_custom` invocation also appends a schema-version-1 JSON object to
+Each `iter_custom` invocation also appends a schema-version-2 JSON object to
 `target/server-bench/<run-id>/measurements.jsonl`. Set
 `NODUS_BENCH_ARTIFACT_DIR` to choose a different output directory. The record
 contains the workload and configuration, Criterion iteration count, request and
 optional row counts, elapsed time and throughput, request-latency summary,
-process RSS, and before/after/delta Prometheus samples for every server node.
-The benchmark fails if it cannot collect required metrics or write the artifact.
+process RSS and allocator summaries, and before/after/delta Prometheus samples
+for every server node. The benchmark fails if it cannot collect required metrics
+or write the artifact. Schema-version-1 records remain readable; their missing
+allocator summary deserializes as unavailable.
 
 Latency is measured around each awaited pgwire request and pooled across the
 workload's clients. p50, p95, and p99 use nearest-rank samples after sorting;
@@ -58,11 +60,15 @@ up to 100 rows, not one row. One range-scan sample is one complete ordered
 SELECT. These request percentiles are distinct from Criterion's
 whole-iteration estimates.
 
-RSS is sampled every 100 ms on Linux and macOS and reported as start, end, and
-observed high-water bytes. Because the server runs in the benchmark process,
-RSS includes both server and benchmark clients; it is not allocator-only or
-server-only memory. Unsupported platforms and collection failures produce null
-RSS fields rather than zero.
+RSS and allocator statistics are sampled every 100 ms and reported as start,
+end, and observed high-water bytes. Because the server runs in the benchmark
+process, both include server and benchmark client activity; neither is
+server-only memory. RSS is supported on Linux and macOS. Allocated bytes come
+from the macOS default malloc zone's `size_in_use` or GNU/Linux
+`mallinfo2().uordblks`; they do not describe a custom global allocator. The
+allocator high-water is the highest 100 ms observation, including the start and
+end samples, not a native lifetime peak. Unsupported platforms and collection
+failures produce null fields rather than zero.
 
 The Prometheus snapshots also include general and bounded-commit Raft queue
 depth/high-water, approximate LSM memtable bytes/high-water, SSTable count,
@@ -84,7 +90,7 @@ legitimately contain no snapshot observations.
 
 The CI smoke job catches harness breakage and provides coarse output for
 regression review; shared runners do not enforce stable performance budgets.
-Allocator-specific statistics, recovery budgets, repeated full baselines,
-scheduled mixed-activity soaks, and the final 24-hour soak remain PR2 work.
+Recovery budgets, repeated full baselines, scheduled mixed-activity soaks, and
+the final 24-hour soak remain PR2 work.
 Production budgets require maintainer approval and repeated supported-profile
 evidence, never a number invented from one laptop run.

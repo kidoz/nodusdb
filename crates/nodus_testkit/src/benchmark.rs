@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const BENCHMARK_RECORD_SCHEMA_VERSION: u32 = 1;
-const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+pub const BENCHMARK_RECORD_SCHEMA_VERSION: u32 = 2;
+const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub type MetricSamples = BTreeMap<String, f64>;
 
@@ -67,64 +67,103 @@ fn nearest_rank(sorted: &[f64], percentile: f64) -> f64 {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct RssSummary {
+pub struct ByteSummary {
     pub start_bytes: Option<u64>,
     pub end_bytes: Option<u64>,
     pub high_water_bytes: Option<u64>,
 }
 
-pub struct RssMonitor {
-    stop: Arc<AtomicBool>,
-    observed: Arc<AtomicBool>,
-    high_water: Arc<AtomicU64>,
-    worker: Option<JoinHandle<()>>,
-    start: Option<u64>,
+pub type RssSummary = ByteSummary;
+pub type AllocatorSummary = ByteSummary;
+
+#[derive(Default)]
+struct HighWater {
+    observed: AtomicBool,
+    bytes: AtomicU64,
 }
 
-impl RssMonitor {
+impl HighWater {
+    fn new(start: Option<u64>) -> Self {
+        let tracker = Self::default();
+        if let Some(start) = start {
+            tracker.observe(start);
+        }
+        tracker
+    }
+
+    fn observe(&self, bytes: u64) {
+        self.observed.store(true, Ordering::Relaxed);
+        self.bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    fn summary(&self, start: Option<u64>, end: Option<u64>) -> ByteSummary {
+        ByteSummary {
+            start_bytes: start,
+            end_bytes: end,
+            high_water_bytes: self
+                .observed
+                .load(Ordering::Relaxed)
+                .then(|| self.bytes.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+pub struct ProcessResourceMonitor {
+    stop: Arc<AtomicBool>,
+    rss: Arc<HighWater>,
+    allocator: Arc<HighWater>,
+    worker: Option<JoinHandle<()>>,
+    rss_start: Option<u64>,
+    allocator_start: Option<u64>,
+}
+
+impl ProcessResourceMonitor {
     pub fn start() -> Self {
-        let start = process_rss_bytes().ok();
+        let rss_start = process_rss_bytes().ok();
+        let allocator_start = process_allocator_bytes().ok();
         let stop = Arc::new(AtomicBool::new(false));
-        let observed = Arc::new(AtomicBool::new(start.is_some()));
-        let high_water = Arc::new(AtomicU64::new(start.unwrap_or(0)));
+        let rss = Arc::new(HighWater::new(rss_start));
+        let allocator = Arc::new(HighWater::new(allocator_start));
         let worker = {
             let stop = stop.clone();
-            let observed = observed.clone();
-            let high_water = high_water.clone();
+            let rss = rss.clone();
+            let allocator = allocator.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    if let Ok(rss) = process_rss_bytes() {
-                        observed.store(true, Ordering::Relaxed);
-                        high_water.fetch_max(rss, Ordering::Relaxed);
+                    if let Ok(bytes) = process_rss_bytes() {
+                        rss.observe(bytes);
                     }
-                    std::thread::sleep(RSS_SAMPLE_INTERVAL);
+                    if let Ok(bytes) = process_allocator_bytes() {
+                        allocator.observe(bytes);
+                    }
+                    std::thread::sleep(RESOURCE_SAMPLE_INTERVAL);
                 }
             })
         };
         Self {
             stop,
-            observed,
-            high_water,
+            rss,
+            allocator,
             worker: Some(worker),
-            start,
+            rss_start,
+            allocator_start,
         }
     }
 
-    pub fn finish(mut self) -> RssSummary {
-        let end = process_rss_bytes().ok();
-        if let Some(end) = end {
-            self.observed.store(true, Ordering::Relaxed);
-            self.high_water.fetch_max(end, Ordering::Relaxed);
+    pub fn finish(mut self) -> (RssSummary, AllocatorSummary) {
+        let rss_end = process_rss_bytes().ok();
+        let allocator_end = process_allocator_bytes().ok();
+        if let Some(end) = rss_end {
+            self.rss.observe(end);
+        }
+        if let Some(end) = allocator_end {
+            self.allocator.observe(end);
         }
         self.stop_worker();
-        RssSummary {
-            start_bytes: self.start,
-            end_bytes: end,
-            high_water_bytes: self
-                .observed
-                .load(Ordering::Relaxed)
-                .then(|| self.high_water.load(Ordering::Relaxed)),
-        }
+        (
+            self.rss.summary(self.rss_start, rss_end),
+            self.allocator.summary(self.allocator_start, allocator_end),
+        )
     }
 
     fn stop_worker(&mut self) {
@@ -135,7 +174,7 @@ impl RssMonitor {
     }
 }
 
-impl Drop for RssMonitor {
+impl Drop for ProcessResourceMonitor {
     fn drop(&mut self) {
         self.stop_worker();
     }
@@ -184,6 +223,34 @@ fn process_rss_bytes() -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "RSS collection is supported on Linux and macOS",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn process_allocator_bytes() -> io::Result<u64> {
+    // SAFETY: the default zone is process-global and remains valid for the process lifetime.
+    let zone = unsafe { libc::malloc_default_zone() };
+    if zone.is_null() {
+        return Err(io::Error::other("default malloc zone is unavailable"));
+    }
+    let mut stats = std::mem::MaybeUninit::<libc::malloc_statistics_t>::uninit();
+    // SAFETY: `zone` is valid and `stats` points to writable storage of the required type.
+    unsafe { libc::malloc_zone_statistics(zone, stats.as_mut_ptr()) };
+    // SAFETY: malloc_zone_statistics initializes the structure for a valid zone.
+    Ok(unsafe { stats.assume_init() }.size_in_use as u64)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn process_allocator_bytes() -> io::Result<u64> {
+    // SAFETY: mallinfo2 takes no pointers and returns process-global allocator statistics.
+    Ok(unsafe { libc::mallinfo2() }.uordblks as u64)
+}
+
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+fn process_allocator_bytes() -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "allocator collection is supported on macOS and GNU/Linux",
     ))
 }
 
@@ -253,6 +320,8 @@ pub struct BenchmarkRecord {
     pub rows_per_second: Option<f64>,
     pub latency: LatencySummary,
     pub rss: RssSummary,
+    #[serde(default)]
+    pub allocator: AllocatorSummary,
     pub node_metrics: Vec<NodeMetricRecord>,
 }
 
@@ -329,7 +398,7 @@ pub struct IterationMeasurement {
     criterion_iterations: u64,
     request_kind: String,
     recorder: LatencyRecorder,
-    rss: RssMonitor,
+    resources: ProcessResourceMonitor,
     http: reqwest::Client,
     nodes: Vec<(String, SocketAddr)>,
     before: Vec<MetricSamples>,
@@ -362,7 +431,7 @@ impl IterationMeasurement {
             criterion_iterations,
             request_kind: request_kind.to_owned(),
             recorder: LatencyRecorder::default(),
-            rss: RssMonitor::start(),
+            resources: ProcessResourceMonitor::start(),
             http,
             nodes,
             before,
@@ -387,7 +456,7 @@ impl IterationMeasurement {
                     .map_err(io::Error::other)?,
             );
         }
-        let rss = self.rss.finish();
+        let (rss, allocator) = self.resources.finish();
         let latency = self.recorder.summary();
         if latency.count != expected_requests {
             return Err(io::Error::new(
@@ -438,6 +507,7 @@ impl IterationMeasurement {
             rows_per_second,
             latency,
             rss,
+            allocator,
             node_metrics,
         })
     }
@@ -536,7 +606,38 @@ mod tests {
     }
 
     #[test]
-    fn artifact_round_trip_preserves_schema_and_unavailable_rss() {
+    fn high_water_tracks_start_and_largest_observation() {
+        let tracker = HighWater::new(Some(10));
+        tracker.observe(20);
+        tracker.observe(15);
+        assert_eq!(
+            tracker.summary(Some(10), Some(12)),
+            ByteSummary {
+                start_bytes: Some(10),
+                end_bytes: Some(12),
+                high_water_bytes: Some(20),
+            }
+        );
+    }
+
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[test]
+    fn process_resource_monitor_reports_supported_allocations() {
+        let monitor = ProcessResourceMonitor::start();
+        let allocation = vec![1_u8; 64 * 1024];
+        std::hint::black_box(&allocation);
+        let (rss, allocator) = monitor.finish();
+        for summary in [rss, allocator] {
+            let start = summary.start_bytes.unwrap();
+            let end = summary.end_bytes.unwrap();
+            let high_water = summary.high_water_bytes.unwrap();
+            assert!(start > 0 && end > 0);
+            assert!(high_water >= start && high_water >= end);
+        }
+    }
+
+    #[test]
+    fn artifact_round_trip_preserves_schema_and_reads_legacy_records() {
         let directory = tempfile::tempdir().unwrap();
         let artifact = BenchmarkArtifact::new(directory.path(), "test-run".into()).unwrap();
         artifact
@@ -563,13 +664,27 @@ mod tests {
                     max_seconds: 0.5,
                 },
                 rss: RssSummary::default(),
+                allocator: AllocatorSummary {
+                    start_bytes: Some(10),
+                    end_bytes: Some(12),
+                    high_water_bytes: Some(20),
+                },
                 node_metrics: Vec::new(),
             })
             .unwrap();
         let output = std::fs::read_to_string(artifact.path()).unwrap();
         let record: BenchmarkRecord = serde_json::from_str(output.trim_end()).unwrap();
-        assert_eq!(record.schema_version, 1);
+        assert_eq!(record.schema_version, 2);
         assert_eq!(record.run_id, "test-run");
         assert_eq!(record.rss.high_water_bytes, None);
+        assert_eq!(record.allocator.high_water_bytes, Some(20));
+
+        let mut legacy: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.insert("schema_version".into(), 1.into());
+        object.remove("allocator");
+        let legacy: BenchmarkRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.schema_version, 1);
+        assert_eq!(legacy.allocator, AllocatorSummary::default());
     }
 }
