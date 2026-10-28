@@ -259,6 +259,7 @@ async fn run_scenario(
     let restore = restore_backup(&http, server.http_addr, backup_id, target_ts).await?;
     let restore_api_ms = restore_started.elapsed().as_millis() as u64;
     let restored = validate_state(server.pgwire_addr, expected).await?;
+    let restore_to_ready_ms = restore_started.elapsed().as_millis() as u64;
     server.shutdown().await;
 
     let restarted = TestServer::start_with_config(config).await?;
@@ -280,12 +281,25 @@ async fn run_scenario(
         "target_ts": target_ts,
         "passed": passed,
         "restore_api_ms": restore_api_ms,
+        "restore_to_ready_ms": restore_to_ready_ms,
         "total_recovery_ms": total_recovery_ms,
         "restart_verified": true,
         "index_verified": restored.index_ok && persisted.index_ok,
         "permission_verified": restored.permission_ok && persisted.permission_ok,
         "observed_data_loss_rows": missing_rows,
         "unexpected_rows": unexpected_rows,
+        "recovery_objectives": {
+            "rpo": {
+                "observed_data_loss_rows": missing_rows,
+                "zero_acknowledged_write_loss_observed": missing_rows == 0,
+            },
+            "rto": {
+                "restore_to_ready_ms": restore_to_ready_ms,
+                "restart_inclusive_recovery_ms": total_recovery_ms,
+                "budget_ms": null,
+                "within_budget": null,
+            },
+        },
         "expected_rows": expected.iter().map(|(id, value)| format!("{id}:{value}")).collect::<Vec<_>>(),
         "actual_rows": persisted.rows.iter().map(|(id, value)| format!("{id}:{value}")).collect::<Vec<_>>(),
         "restore_response": restore,
@@ -488,7 +502,44 @@ fn persist_report(path: &Path, report: &mut Value) -> Result<()> {
             "nodus_restore_drill_recovery_time_seconds{{drill=\"{drill}\",scenario=\"{name}\"}} {seconds}\n"
         ));
     }
+    metrics.push_str(
+        "# HELP nodus_restore_drill_restore_to_ready_seconds Restore request through semantic readiness by scenario.\n\
+         # TYPE nodus_restore_drill_restore_to_ready_seconds gauge\n",
+    );
+    for scenario in report["scenarios"].as_array().into_iter().flatten() {
+        let name = scenario["scenario"].as_str().unwrap_or("unknown");
+        let seconds = scenario["restore_to_ready_ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
+        metrics.push_str(&format!(
+            "nodus_restore_drill_restore_to_ready_seconds{{drill=\"{drill}\",scenario=\"{name}\"}} {seconds}\n"
+        ));
+    }
     atomic_write(&path.with_extension("prom"), metrics.as_bytes())
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|stdout| stdout.trim().to_owned())
+}
+
+fn source_metadata() -> Value {
+    let commit = git_output(&["rev-parse", "HEAD"]);
+    let dirty = git_output(&["status", "--porcelain"]).map(|status| !status.is_empty());
+    json!({
+        "commit": commit,
+        "dirty": dirty,
+        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "target_os": std::env::consts::OS,
+        "target_arch": std::env::consts::ARCH,
+    })
 }
 
 async fn run_and_report(drill: &str, repository_uri: &str) -> Result<()> {
@@ -497,10 +548,22 @@ async fn run_and_report(drill: &str, repository_uri: &str) -> Result<()> {
     let mut scenarios = Vec::new();
     let result = execute_drill(repository_uri, &mut scenarios).await;
     let mut report = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "drill": drill,
         "repository": if drill == "s3" { "s3" } else { "filesystem" },
         "repository_uri": repository_uri,
+        "source": source_metadata(),
+        "deployment": {
+            "topology": "single-node",
+            "storage": "persistent-lsm",
+            "snapshot_v2_finalized": true,
+            "destination": "fresh-empty-directory-per-scenario",
+        },
+        "failure_model": {
+            "source_shutdown": "clean",
+            "wal_archive": "caught-up-through-final-acknowledged-write",
+            "injected_failures": "none",
+        },
         "started_at_unix_micros": started_at,
         "finished_at_unix_micros": now_micros(),
         "status": if result.is_ok() { "passed" } else { "failed" },
@@ -510,6 +573,58 @@ async fn run_and_report(drill: &str, repository_uri: &str) -> Result<()> {
     persist_report(&path, &mut report)?;
     println!("restore drill report: {}", path.display());
     result
+}
+
+fn validate_successful_report(path: &Path) -> Result<()> {
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read restore report {}", path.display()))?;
+    let report: Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse restore report {}", path.display()))?;
+    if report["schema_version"] != 2 || report["status"] != "passed" {
+        bail!("restore report is not a successful schema-2 report");
+    }
+    if report["deployment"]["topology"] != "single-node"
+        || report["failure_model"]["source_shutdown"] != "clean"
+    {
+        bail!("restore report omitted its deployment or failure model");
+    }
+    let scenarios = report["scenarios"]
+        .as_array()
+        .context("restore report scenarios are not an array")?;
+    if scenarios.len() != 3 {
+        bail!("restore report contains {} scenarios", scenarios.len());
+    }
+    for name in ["full", "incremental", "pitr"] {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario["scenario"] == name)
+            .with_context(|| format!("restore report omitted {name} scenario"))?;
+        if scenario["passed"] != true
+            || scenario["observed_data_loss_rows"] != 0
+            || scenario["unexpected_rows"] != 0
+            || scenario["recovery_objectives"]["rpo"]["zero_acknowledged_write_loss_observed"]
+                != true
+        {
+            bail!("{name} restore report did not prove exact zero-loss recovery");
+        }
+        let restore_api_ms = scenario["restore_api_ms"]
+            .as_u64()
+            .with_context(|| format!("{name} report omitted restore API time"))?;
+        let ready_ms = scenario["recovery_objectives"]["rto"]["restore_to_ready_ms"]
+            .as_u64()
+            .with_context(|| format!("{name} report omitted request-to-ready time"))?;
+        let total_ms = scenario["recovery_objectives"]["rto"]["restart_inclusive_recovery_ms"]
+            .as_u64()
+            .with_context(|| format!("{name} report omitted total recovery time"))?;
+        if ready_ms < restore_api_ms || total_ms < ready_ms {
+            bail!("{name} restore report has incoherent recovery timings");
+        }
+        let rto = &scenario["recovery_objectives"]["rto"];
+        if !rto["budget_ms"].is_null() || !rto["within_budget"].is_null() {
+            bail!("{name} restore report invented an unapproved RTO budget result");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -527,6 +642,7 @@ async fn persistent_full_incremental_pitr_restore_drill() {
         eprintln!("preserve failed drill repository: {}", root.display());
     }
     result.unwrap();
+    validate_successful_report(&report_path("filesystem")).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -552,4 +668,5 @@ async fn s3_full_incremental_pitr_restore_drill() {
     let prefix = format!("restore-drill-{}-{}", std::process::id(), now_micros());
     let uri = format!("s3://{bucket}/{prefix}");
     run_and_report("s3", &uri).await.unwrap();
+    validate_successful_report(&report_path("s3")).unwrap();
 }

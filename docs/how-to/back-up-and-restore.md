@@ -197,11 +197,12 @@ cargo test -p nodus_integration_tests --test restore_drill \
 
 It writes:
 
-- `target/restore-drill/filesystem.json` — status, expected and actual rows,
-  permission/index/restart results, restore API time, total recovery time, and
-  observed data loss;
+- `target/restore-drill/filesystem.json` — schema-2 status, source and deployment
+  metadata, expected and actual rows, permission/index/restart results, and
+  per-scenario RPO/RTO measurements;
 - `target/restore-drill/filesystem.prom` — Prometheus textfile metrics for the
-  latest run and the last successful/failed run.
+  latest run and the last successful/failed run, including
+  `nodus_restore_drill_restore_to_ready_seconds` by scenario.
 
 The S3 drill runs when the live S3 environment is configured. It additionally
 requires the AWS variables used by the server:
@@ -223,8 +224,22 @@ AWS_ALLOW_HTTP=true \
 Use an isolated bucket for each run. The report is
 `target/restore-drill/s3.json` with `target/restore-drill/s3.prom` beside it.
 Set `NODUS_RESTORE_DRILL_REPORT` or `NODUS_S3_RESTORE_DRILL_REPORT` to choose
-other paths. `total_recovery_ms` covers the restore request, semantic checks,
-restart, and repeated checks; `restore_api_ms` is reported separately.
+other paths.
+
+Each scenario's `recovery_objectives.rpo` records missing expected rows and
+whether zero acknowledged-write loss was observed. Its
+`recovery_objectives.rto.restore_to_ready_ms` starts immediately before the
+restore request and ends after SQL rows, index metadata, and permissions pass
+validation. It excludes destination startup and pre-restore object verification.
+`restore_api_ms` measures only the request; `total_recovery_ms` additionally
+covers shutdown, restart, and repeated validation. The RTO `budget_ms` and
+`within_budget` fields remain null until maintainers approve a numeric budget.
+
+The schema-2 report records the source commit and dirty state when Git metadata
+is available, build profile, host OS/architecture, and deployment/failure model.
+The zero-loss evidence covers this drill's exact fixture after a clean source
+shutdown with WAL archiving caught up through the final acknowledged write. It
+does not by itself prove crash, distributed, or arbitrary-workload recovery.
 
 The drill has no built-in production scheduler. Run it from your scheduler or CI,
 publish the `.prom` file through a Prometheus textfile collector, and retain the
