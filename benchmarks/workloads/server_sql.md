@@ -90,7 +90,8 @@ legitimately contain no snapshot observations.
 
 The CI smoke job catches harness breakage and provides coarse output for
 regression review; shared runners do not enforce stable performance budgets.
-Recovery budgets, repeated full baselines, scheduled mixed-activity soaks, and
-the final 24-hour soak remain PR2 work.
-Production budgets require maintainer approval and repeated supported-profile
-evidence, never a number invented from one laptop run.
+The [2026-10-29 repeated schema-2 baseline](../reports/server-baseline-2026-10-29.md)
+records three full legacy-write-path runs on one host. Recovery and performance
+budget approval, scheduled mixed-activity soaks, and the final 24-hour soak
+remain PR2 work. Production budgets require maintainer approval and repeated
+supported-profile evidence, never a number invented from one laptop run.
