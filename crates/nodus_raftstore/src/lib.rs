@@ -1240,7 +1240,10 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
                 self.deferral.record(reason);
                 self.unchanged_snapshot().await
             }
-            Err(e) => Err(snapshot_io_err("build snapshot", e)),
+            Err(e) => {
+                tracing::error!(group = %self.snapshot_group, error = %e, "snapshot build failed");
+                Err(snapshot_io_err("build snapshot", e))
+            }
         }
     }
 }
@@ -1735,9 +1738,17 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Box<tokio::fs::File>,
     ) -> Result<(), StorageError<u64>> {
-        self.install_atomic_snapshot(meta, *snapshot)
-            .await
-            .map_err(|e| snapshot_io_err("install snapshot", e))
+        match self.install_atomic_snapshot(meta, *snapshot).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(
+                    group = %self.snapshot_group,
+                    error = %error,
+                    "snapshot installation failed"
+                );
+                Err(snapshot_io_err("install snapshot", error))
+            }
+        }
     }
 
     async fn get_current_snapshot(
