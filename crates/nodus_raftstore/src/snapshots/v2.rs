@@ -45,6 +45,12 @@ pub(super) fn canonicalize(rows: &mut [SnapshotRow]) -> anyhow::Result<()> {
     for row in rows {
         row.versions.sort_by_key(|v| std::cmp::Reverse(v.version));
         row.versions.dedup();
+        row.versions.dedup_by(|next, previous| {
+            !next.is_intent
+                && !previous.is_intent
+                && next.version == previous.version
+                && next.value == previous.value
+        });
         validate_chain(row)?;
     }
     Ok(())
@@ -57,7 +63,11 @@ fn validate_chain(row: &SnapshotRow) -> anyhow::Result<()> {
     for value in &row.versions {
         anyhow::ensure!(
             previous.is_none_or(|p| p > value.version),
-            "duplicate or unordered MVCC timestamp"
+            "duplicate or unordered MVCC timestamp on key {:?}: previous={previous:?}, current={}, txn={:?}, intent={}",
+            row.key,
+            value.version,
+            value.txn_id,
+            value.is_intent,
         );
         previous = Some(value.version);
         if value.is_intent {

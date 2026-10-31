@@ -50,9 +50,10 @@ Integers are unsigned big-endian. The layout is:
 
 Rows have strictly increasing keys. Chains have strictly decreasing unique
 timestamps, at most one intent, and no empty chains. An intent requires a UUID
-and timestamp `u64::MAX`; committed versions cannot use that timestamp. Identical
-duplicate storage versions are collapsed during export; conflicting timestamps
-are rejected. Aborted empty chains are omitted. Unknown flags, excessive lengths,
+and timestamp `u64::MAX`; committed versions cannot use that timestamp. Exact
+duplicates and committed duplicates with the same timestamp and value are
+collapsed during export, even if their historical transaction IDs differ;
+conflicting values or intents at one timestamp are rejected. Aborted empty chains are omitted. Unknown flags, excessive lengths,
 trailing records, checksum errors, group/metadata mismatches, scope violations,
 and invalid control records fail before the atomic storage replacement.
 

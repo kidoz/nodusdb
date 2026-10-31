@@ -413,6 +413,19 @@ async fn mvcc_payload_checksum_group_and_metadata_mismatch_leave_old_state() {
 }
 
 #[test]
+fn mvcc_codec_deduplicates_equivalent_committed_versions() {
+    let mut row =
+        SnapshotRow::committed(Bytes::from_static(b"row"), Bytes::from_static(b"same"), 10);
+    row.versions[0].txn_id = Some(TxnId::new());
+    row.versions.push(row.versions[0].clone());
+    row.versions[1].txn_id = Some(TxnId::new());
+    v2::canonicalize(std::slice::from_mut(&mut row)).unwrap();
+    assert_eq!(row.versions.len(), 1);
+    assert_eq!(row.versions[0].value.as_deref(), Some(b"same".as_slice()));
+    assert!(!row.versions[0].is_intent);
+}
+
+#[test]
 fn mvcc_codec_rejects_conflicting_intents_and_duplicate_timestamps() {
     use nodus_storage_api::SnapshotValue;
     let mut row =
