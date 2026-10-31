@@ -14,7 +14,7 @@ use crate::{
     multi_raft::{META_SHARD, MultiRaftManager},
     raft_router::RaftRouter,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use nodus_catalog::TableId;
 use nodus_raftstore::{
@@ -36,8 +36,10 @@ use uuid::Uuid;
 const COPY_BATCH_ROWS: usize = 256;
 
 /// Journal/discovery step deadline, shared by the discovery worker.
-pub(crate) const STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+const COPY_CONCURRENCY: usize = 16;
 
+#[derive(Clone)]
 pub struct ProductionBackendV3 {
     manager: Arc<MultiRaftManager>,
     router: RaftRouter,
@@ -333,7 +335,15 @@ impl BackendV3 for ProductionBackendV3 {
             .destination_map
             .as_ref()
             .ok_or_else(|| anyhow!("copy requires a destination map"))?;
-        for row in &batch {
+        let checkpoint_cursor = batch.last().map(|row| row.key.to_vec()).unwrap_or(cursor);
+        let mut copies = tokio::task::JoinSet::<Result<()>>::new();
+        for row in batch {
+            while copies.len() >= COPY_CONCURRENCY {
+                let _ = copies
+                    .join_next()
+                    .await
+                    .context("migration copy task failed")??;
+            }
             let shard = destination_map
                 .shards
                 .iter()
@@ -348,33 +358,38 @@ impl BackendV3 for ProductionBackendV3 {
                 // replica; formation itself is prepare_destination's job.
                 self.manager.get_or_create_data(&group).await?;
             }
-            // Epoch discipline on the destination: fresh groups sit at epoch 0.
-            // The deterministic txn id makes a re-driven batch idempotent.
-            let txn_id = Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                &[
-                    record.plan.migration.operation_id.as_bytes(),
-                    row.key.as_ref(),
-                ]
-                .concat(),
-            );
-            for mutation in [
-                migration::EpochMutationV1::Put {
-                    txn_id,
-                    key: row.key.to_vec(),
-                    value: row.value.to_vec(),
-                },
-                migration::EpochMutationV1::Commit {
-                    txn_id,
-                    commit_ts: row.version,
-                },
-            ] {
-                self.submit(&group, ShardCommand::EpochWriteV1 { epoch: 0, mutation })
-                    .await?;
-            }
+            let backend = self.clone();
+            let operation = record.plan.migration.operation_id;
+            copies.spawn(async move {
+                // Epoch discipline on the destination: fresh groups sit at epoch 0.
+                // The deterministic txn id makes a re-driven batch idempotent.
+                let txn_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_OID,
+                    &[operation.as_bytes(), row.key.as_ref()].concat(),
+                );
+                for mutation in [
+                    migration::EpochMutationV1::Put {
+                        txn_id,
+                        key: row.key.to_vec(),
+                        value: row.value.to_vec(),
+                    },
+                    migration::EpochMutationV1::Commit {
+                        txn_id,
+                        commit_ts: row.version,
+                    },
+                ] {
+                    backend
+                        .submit(&group, ShardCommand::EpochWriteV1 { epoch: 0, mutation })
+                        .await?;
+                }
+                Ok(())
+            });
+        }
+        while let Some(result) = copies.join_next().await {
+            result??;
         }
         Ok(CheckpointV3 {
-            cursor: batch.last().map(|r| r.key.to_vec()).unwrap_or(cursor),
+            cursor: checkpoint_cursor,
             complete: !more,
         })
     }
