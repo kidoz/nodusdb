@@ -223,6 +223,40 @@ async fn a_restarted_node_rejoins_and_recovers_its_data() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn an_mtls_restarted_node_rebinds_its_peer_listener_and_recovers_data() {
+    let certs_dir = tempfile::tempdir().unwrap();
+    let certs = nodus_testkit::write_test_certs(certs_dir.path());
+    let mut cluster = ClusterFixture::start_cluster_mtls(3, &certs, |_| {})
+        .await
+        .expect("3-node mTLS cluster forms");
+    let leader = cluster.pg_client(0).await.unwrap();
+    leader
+        .simple_query("CREATE TABLE mtls_restart (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    leader
+        .simple_query("INSERT INTO mtls_restart (id, v) VALUES (1, 'durable')")
+        .await
+        .unwrap();
+
+    cluster.stop(2).await.unwrap();
+    cluster.restart(2).await.unwrap();
+    assert!(cluster.wait_ready(2, Duration::from_secs(60)).await);
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(60)).await);
+    let rejoined = cluster.pg_client(2).await.unwrap();
+    rejoined
+        .simple_query("SET nodus.linearizable_reads = on")
+        .await
+        .unwrap();
+    let row = rejoined
+        .query_one("SELECT v FROM mtls_restart WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "durable");
+}
+
 /// Killing the leader does not lose committed data: the surviving majority
 /// re-elects a new leader that keeps serving, and the pre-failure write is still
 /// readable. This is the consensus payoff of the harness + durable log.

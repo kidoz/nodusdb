@@ -28,12 +28,14 @@ use tokio::sync::watch;
 /// and it authenticates the internal `/raft/...` ingress on the public listener.
 pub const ADMIN_TOKEN: &str = "cluster-test-token";
 
-/// Binds a listener on a specific loopback port with `SO_REUSEADDR`. Port zero
-/// asks the OS for a free port, which can be read from `local_addr` while the
-/// listener remains bound.
+/// Binds a listener on a specific loopback port with address/port reuse enabled
+/// for persistent fixtures. Port zero asks the OS for a free port, which can be
+/// read from `local_addr` while the listener remains bound.
 fn bind_reuse(port: u16) -> Result<TcpListener> {
     let sock = TcpSocket::new_v4()?;
     sock.set_reuseaddr(true)?;
+    #[cfg(unix)]
+    sock.set_reuseport(true)?;
     sock.bind(format!("127.0.0.1:{port}").parse().unwrap())?;
     Ok(sock.listen(1024)?)
 }
@@ -64,6 +66,8 @@ pub struct ClusterNode {
     /// Prebound dedicated raft peer listener (mTLS clusters), or None to share
     /// the HTTP listener.
     raft_listener: Option<TcpListener>,
+    /// Permanent dedicated peer port, retained after the listener is consumed.
+    raft_port: Option<u16>,
     /// Peer mTLS config (set for `start_cluster_mtls`).
     tls_config: Option<nodus_config::ClusterTlsConfig>,
 }
@@ -86,14 +90,10 @@ impl ClusterNode {
         config.admin.password = Some("nodus".into());
         config.admin.token = Some(ADMIN_TOKEN.into());
         config.cluster.node_id = self.node_id;
-        config.cluster.raft_advertise_addr = match &self.raft_listener {
-            Some(listener) => listener.local_addr().unwrap().to_string(),
-            None => self.http_addr(),
-        };
-        config.cluster.raft_listen_addr = self
-            .raft_listener
-            .as_ref()
-            .map(|listener| listener.local_addr().unwrap().to_string());
+        config.cluster.raft_advertise_addr = self
+            .raft_port
+            .map_or_else(|| self.http_addr(), |port| format!("127.0.0.1:{port}"));
+        config.cluster.raft_listen_addr = self.raft_port.map(|port| format!("127.0.0.1:{port}"));
         config.cluster.join_peers = self.seed_http.clone().into_iter().collect();
         config.storage.data_dir = Some(self.data_path.to_string_lossy().into_owned());
         if let Some(tls) = &self.tls_config {
@@ -107,8 +107,35 @@ impl ClusterNode {
     }
 
     async fn launch(&mut self) -> Result<()> {
-        let pgwire_listener = bind_reuse(self.pgwire_port)?;
-        let http_listener = bind_reuse(self.http_port)?;
+        let pgwire_listener = bind_reuse(self.pgwire_port)
+            .with_context(|| format!("binding pgwire port {}", self.pgwire_port))?;
+        let http_listener = bind_reuse(self.http_port)
+            .with_context(|| format!("binding HTTP port {}", self.http_port))?;
+        if self.tls_config.is_some() && self.raft_listener.is_none() {
+            let raft_addr = self.config().cluster.raft_advertise_addr;
+            let raft_port = raft_addr.parse::<SocketAddr>()?.port();
+            let mut retries = 0;
+            let listener = loop {
+                match bind_reuse(raft_port) {
+                    Ok(listener) => break listener,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                            && retries < 100 =>
+                    {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("binding Raft peer port {raft_port} after {retries} retries")
+                        });
+                    }
+                }
+            };
+            self.raft_listener = Some(listener);
+        }
         self.launch_with_listeners(pgwire_listener, http_listener)
             .await
     }
@@ -219,6 +246,14 @@ impl ClusterFixture {
             }
             let dir = tempfile::tempdir()?;
             let data_path = dir.path().to_path_buf();
+            let raft_listener = match &tls_config {
+                Some(_) => Some(bind_reuse(0)?),
+                None => None,
+            };
+            let raft_port = raft_listener
+                .as_ref()
+                .map(|listener| listener.local_addr().map(|addr| addr.port()))
+                .transpose()?;
             nodes.push(ClusterNode {
                 node_id: (i + 1) as u64,
                 http_port,
@@ -228,10 +263,8 @@ impl ClusterFixture {
                 data_path,
                 running: None,
                 configure: configure.clone(),
-                raft_listener: match &tls_config {
-                    Some(_) => Some(bind_reuse(0)?),
-                    None => None,
-                },
+                raft_listener,
+                raft_port,
                 tls_config: tls_config.clone(),
             });
             listeners.push((pgwire_listener, http_listener));
