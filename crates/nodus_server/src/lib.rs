@@ -644,7 +644,8 @@ pub async fn run_server_full(
     // undocumented openraft defaults. `snapshot_max_chunk_size` bounds the
     // per-RPC payload so a large snapshot transfers as a series of chunks (each
     // `install_snapshot` request carries at most this many bytes) instead of one
-    // oversized body.
+    // oversized body. The 256 KiB chunk keeps JSON encoding below axum's default
+    // 2 MiB body limit; the separate 30-second timeout covers real mTLS/disk I/O.
     //
     // Heartbeat/election timers come from cluster config (see [`ClusterConfig`]),
     // defaulting well past openraft's own 50ms/150-300ms — which assume a cheap
@@ -660,7 +661,8 @@ pub async fn run_server_full(
     let raft_config = Arc::new(
         openraft::Config {
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5000),
-            snapshot_max_chunk_size: 4 * 1024 * 1024,
+            snapshot_max_chunk_size: 256 * 1024,
+            install_snapshot_timeout: 30_000,
             max_in_snapshot_log_to_keep: 1000,
             heartbeat_interval: config.cluster.raft_heartbeat_ms,
             election_timeout_min: config.cluster.raft_election_timeout_min_ms,
