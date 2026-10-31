@@ -67,11 +67,11 @@ Maintenance proceeds in this order while the workload continues:
    Backup and migration use their existing mutual-exclusion barrier and are not
    forced to run simultaneously.
 8. Drain writers and readers, require Raft queue depths to return to zero, and
-   compare the complete acknowledged `(id, value)` multiset on every node. After
-   the split, combine two per-shard linearizable range reads over the quiescent
-   dataset; this is not a shared cross-shard snapshot. Check for missing,
-   duplicate, unexpected, and value-mismatched rows and verify a secondary-index
-   lookup.
+   require every post-split data group to converge to the same applied index on
+   every node. Compare the complete acknowledged `(id, value)` multiset on every
+   node using quiescent MVCC reads; this is not a shared cross-shard linearizable
+   snapshot. Check for missing, duplicate, unexpected, and value-mismatched rows
+   and verify a secondary-index lookup.
 9. Continue sampling during a 10-second post-activity observation window.
 
 A `passed` summary covers only these executed activity and correctness checks.

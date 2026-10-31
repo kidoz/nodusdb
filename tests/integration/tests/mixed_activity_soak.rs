@@ -397,9 +397,7 @@ async fn wait_for_data_group_catchup(cluster: &ClusterFixture, group: &str) -> R
             return Ok(leader);
         }
         if Instant::now() >= deadline {
-            bail!(
-                "data group did not converge after follower restart: leader={leader}, applied={applied:?}"
-            );
+            bail!("data group {group} did not converge: leader={leader}, applied={applied:?}");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -551,30 +549,38 @@ async fn record_activity(
 async fn validate_on_every_node(
     cluster: &ClusterFixture,
     expected: &BTreeSet<i32>,
+    split_map: &Value,
 ) -> Result<Value> {
     cluster
         .pg_client(0)
         .await?
         .batch_execute("CREATE INDEX mixed_activity_value_idx ON mixed_activity_soak (value)")
         .await?;
+    let groups = split_map["shards"]
+        .as_array()
+        .context("split map omitted shards")?
+        .iter()
+        .map(|shard| {
+            shard["id"]
+                .as_str()
+                .map(|id| format!("shard-{id}"))
+                .context("split map omitted shard id")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut applied = Vec::with_capacity(groups.len());
+    for group in groups {
+        applied.push(json!({
+            "group": group,
+            "applied_on_every_node": wait_for_data_group_catchup(cluster, &group).await?,
+        }));
+    }
     let mut nodes = Vec::new();
     for index in 0..cluster.nodes.len() {
         let client = cluster.pg_client(index).await?;
-        client
-            .batch_execute("SET nodus.linearizable_reads = on")
-            .await?;
-        let mut rows = Vec::new();
-        for query in [
-            "SELECT id, value FROM mixed_activity_soak WHERE id < 3000 ORDER BY id",
-            "SELECT id, value FROM mixed_activity_soak WHERE id >= 3000 ORDER BY id",
-        ] {
-            rows.extend(
-                client
-                    .query(query, &[])
-                    .await
-                    .map_err(|error| anyhow::anyhow!(pg_error(error)))?,
-            );
-        }
+        let rows = client
+            .query("SELECT id, value FROM mixed_activity_soak ORDER BY id", &[])
+            .await
+            .map_err(|error| anyhow::anyhow!(pg_error(error)))?;
         let mut seen = BTreeSet::new();
         let mut duplicates = 0_u64;
         let mut unexpected = 0_u64;
@@ -627,14 +633,15 @@ async fn validate_on_every_node(
             "duplicates": duplicates,
             "mismatched_values": mismatched_values,
             "indexed_lookup_verified": indexed_ok,
-            "linearizable_reads": true,
+            "linearizable_reads": false,
         }));
     }
     Ok(json!({
         "exact_acknowledged_multiset_on_every_node": true,
         "expected_rows": expected.len(),
         "nodes": nodes,
-        "validation_method": "per-shard linearizable range reads after write and queue quiescence",
+        "applied_index_convergence": applied,
+        "validation_method": "quiescent MVCC reads after per-group applied-index convergence",
         "shared_cross_shard_snapshot": false,
         "restart_kind": "graceful-in-process",
         "crash_or_power_loss_verified": false,
@@ -932,7 +939,7 @@ async fn execute(
     parts.workload = workload.summary();
     set_phase(&phase, "quiescent");
     wait_for_quiescent_queues(&cluster).await?;
-    parts.validation = validate_on_every_node(&cluster, &workload.expected()).await?;
+    parts.validation = validate_on_every_node(&cluster, &workload.expected(), &split_map).await?;
     record_activity(
         &artifact,
         activities,
