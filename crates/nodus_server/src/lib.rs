@@ -738,6 +738,14 @@ pub async fn run_server_full(
         .await
         .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
     tracing::debug!("Raft created");
+    let has_persistent_raft_state = {
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow();
+        metrics.last_log_index.is_some()
+            || metrics.last_applied.is_some()
+            || metrics.snapshot.is_some()
+            || metrics.purged.is_some()
+    };
 
     let raft_clone = raft.clone();
     let join_peers = config.cluster.join_peers.clone();
@@ -868,12 +876,16 @@ pub async fn run_server_full(
     let reconcile_meta = meta.clone();
     let reconcile_manager = multi_raft.clone();
     tokio::spawn(async move {
-        if join_peers.is_empty() {
-            tracing::debug!("Background initializing raft cluster as singleton");
-            let mut nodes = std::collections::BTreeMap::new();
-            nodes.insert(node_id, openraft::BasicNode::new(&advertise_addr));
-            let _ = raft_clone.initialize(nodes).await;
-            tracing::debug!("Background raft initialization complete");
+        if join_peers.is_empty() || has_persistent_raft_state {
+            if has_persistent_raft_state {
+                tracing::debug!("Restoring existing raft member from durable state");
+            } else {
+                tracing::debug!("Background initializing raft cluster as singleton");
+                let mut nodes = std::collections::BTreeMap::new();
+                nodes.insert(node_id, openraft::BasicNode::new(&advertise_addr));
+                let _ = raft_clone.initialize(nodes).await;
+                tracing::debug!("Background raft initialization complete");
+            }
 
             // Wait for this node to establish leadership before bootstrapping.
             // Poll at a fine granularity (capped at ~5s) so readiness is detected
