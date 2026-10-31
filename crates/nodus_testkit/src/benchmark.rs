@@ -181,7 +181,7 @@ impl Drop for ProcessResourceMonitor {
 }
 
 #[cfg(target_os = "linux")]
-fn process_rss_bytes() -> io::Result<u64> {
+pub(crate) fn process_rss_bytes() -> io::Result<u64> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     parse_linux_rss(&status)
 }
@@ -200,7 +200,7 @@ fn parse_linux_rss(status: &str) -> io::Result<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_rss_bytes() -> io::Result<u64> {
+pub(crate) fn process_rss_bytes() -> io::Result<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     // SAFETY: `info` points to writable storage of the exact structure requested by
     // RUSAGE_INFO_V4, and the call targets the current process. Success initializes it.
@@ -219,7 +219,7 @@ fn process_rss_bytes() -> io::Result<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_rss_bytes() -> io::Result<u64> {
+pub(crate) fn process_rss_bytes() -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "RSS collection is supported on Linux and macOS",
@@ -227,7 +227,7 @@ fn process_rss_bytes() -> io::Result<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_allocator_bytes() -> io::Result<u64> {
+pub(crate) fn process_allocator_bytes() -> io::Result<u64> {
     // SAFETY: the default zone is process-global and remains valid for the process lifetime.
     let zone = unsafe { libc::malloc_default_zone() };
     if zone.is_null() {
@@ -241,13 +241,13 @@ fn process_allocator_bytes() -> io::Result<u64> {
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn process_allocator_bytes() -> io::Result<u64> {
+pub(crate) fn process_allocator_bytes() -> io::Result<u64> {
     // SAFETY: mallinfo2 takes no pointers and returns process-global allocator statistics.
     Ok(unsafe { libc::mallinfo2() }.uordblks as u64)
 }
 
 #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-fn process_allocator_bytes() -> io::Result<u64> {
+pub(crate) fn process_allocator_bytes() -> io::Result<u64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "allocator collection is supported on macOS and GNU/Linux",

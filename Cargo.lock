@@ -3282,6 +3282,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tracing-subscriber",
 ]
 
 [[package]]

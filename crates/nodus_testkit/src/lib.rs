@@ -3,6 +3,7 @@
 pub mod benchmark;
 pub mod cluster;
 pub mod fault;
+pub mod soak;
 
 use nodus_security::SessionRegistry;
 use std::net::SocketAddr;

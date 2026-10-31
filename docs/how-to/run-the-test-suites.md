@@ -152,6 +152,23 @@ not use the CI job's Go-based service setup.
 Restore drills write JSON recovery evidence and Prometheus textfile metrics under
 `target/restore-drill/`. CI uploads the S3 report even when the job fails.
 
+## Mixed-activity smoke drill
+
+Run the opt-in PR2 workload with backup, automatic compaction, snapshot-required
+follower catch-up, restart, split, and rebalance activity:
+
+```bash
+NODUS_SOAK_ARTIFACT_DIR=target/pr2-mixed-activity-smoke \
+cargo test --release --locked -p nodus_integration_tests \
+  --test mixed_activity_soak -- --ignored --nocapture
+```
+
+The [workload definition](../../benchmarks/workloads/mixed_activity_soak.md)
+describes the fixed schedule and versioned artifacts. The drill checks exact
+acknowledged rows on every node and records resource observations; its short
+observation window does not prove bounded resources, production budgets, or the
+final 24-hour soak gate.
+
 ## Running one test by name
 
 Any suite can be filtered. For example, the shard migration protocol tests:

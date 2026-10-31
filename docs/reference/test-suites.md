@@ -10,6 +10,7 @@ Where tests live and what each place is for. For the commands, see
 | `crates/<crate>/src` | Unit tests next to the code they verify. | `just test` |
 | `tests/integration` | Starts NodusDB and checks server and admin behaviour end to end. | `just test-integration` |
 | `tests/integration/tests/restore_drill.rs` | Persistent full, incremental, and PITR restores with SQL, role, index, and restart assertions; JSON and Prometheus recovery evidence. | Filesystem by default; live S3 when configured |
+| `tests/integration/tests/mixed_activity_soak.rs` | Bounded three-node load with backup, compaction, migration, snapshot catch-up, graceful restart, and schema-versioned resource evidence. | Opt-in ignored drill; run explicitly in release mode |
 | `tests/compatibility` | PostgreSQL wire and client behaviour, including the JDBC and Npgsql driver suites. | `just test-compat` |
 | `tests/sqllogictest` | SQL golden cases and the runner that executes them. | `just test-sql` |
 | `tests/fault` | Crash, recovery, and fault-injection tests. | `just test-fault` |
