@@ -385,15 +385,18 @@ async fn metrics(cluster: &ClusterFixture, index: usize) -> Result<MetricSamples
         .map_err(|error| anyhow::anyhow!(error))
 }
 
-async fn data_group_applied(cluster: &ClusterFixture, index: usize, group: &str) -> Result<u64> {
+async fn data_group_applied(
+    cluster: &ClusterFixture,
+    index: usize,
+    group: &str,
+) -> Result<Option<u64>> {
     let groups = cluster.admin_get(index, "/api/v1/cluster/groups").await?;
-    groups["groups"]
+    Ok(groups["groups"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|candidate| candidate["id"] == group)
-        .and_then(|candidate| candidate["applied"].as_u64())
-        .with_context(|| format!("node {} omitted applied index for {group}", index + 1))
+        .and_then(|candidate| candidate["applied"].as_u64()))
 }
 
 async fn wait_for_data_group_catchup(cluster: &ClusterFixture, group: &str) -> Result<u64> {
@@ -404,11 +407,11 @@ async fn wait_for_data_group_catchup(cluster: &ClusterFixture, group: &str) -> R
         for index in 0..cluster.nodes.len() {
             applied.push(data_group_applied(cluster, index, group).await?);
         }
-        if applied.iter().all(|value| *value == leader) {
-            return Ok(leader);
+        if leader.is_some() && applied.iter().all(|value| *value == leader) {
+            return Ok(leader.unwrap());
         }
         if Instant::now() >= deadline {
-            bail!("data group {group} did not converge: leader={leader}, applied={applied:?}");
+            bail!("data group {group} did not converge: leader={leader:?}, applied={applied:?}");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -820,7 +823,9 @@ async fn execute(
 
     set_phase(&phase, "follower_down");
     let stopped_at = workload.acknowledged_count();
-    let follower_applied = data_group_applied(&cluster, 2, &group).await?;
+    let follower_applied = data_group_applied(&cluster, 2, &group)
+        .await?
+        .context("node 3 omitted applied index before stopping")?;
     let started = Instant::now();
     cluster.stop(2).await?;
     record_activity(
@@ -839,7 +844,9 @@ async fn execute(
     wait_for_log_growth(&cluster, &group).await?;
     let started = Instant::now();
     let second = wait_for_snapshot_and_purge(&cluster, &group, first_builds).await?;
-    let leader_applied = data_group_applied(&cluster, 0, &group).await?;
+    let leader_applied = data_group_applied(&cluster, 0, &group)
+        .await?
+        .context("node 1 omitted leader applied index")?;
     let missed_log_entries = leader_applied
         .checked_sub(follower_applied)
         .context("leader applied index regressed below stopped follower")?;
