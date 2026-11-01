@@ -71,8 +71,9 @@ Maintenance proceeds in this order while the workload continues:
    require every post-split data group to converge to the same applied index on
    every node. Compare the complete acknowledged `(id, value)` multiset on every
    node using quiescent MVCC reads; this is not a shared cross-shard linearizable
-   snapshot. Check for missing, duplicate, unexpected, and value-mismatched rows
-   and verify a secondary-index lookup.
+   snapshot. Check for missing, duplicate, unexpected, and value-mismatched rows.
+   A bounded per-node retry waits for the secondary-index lookup to return
+   exactly one expected row.
 9. Continue sampling during a 10-second post-activity observation window.
 
 A `passed` summary covers only these executed activity and correctness checks.

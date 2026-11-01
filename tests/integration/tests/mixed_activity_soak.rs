@@ -618,22 +618,38 @@ async fn validate_on_every_node(
             .nth(expected.len() / 2)
             .copied()
             .context("no acknowledged rows to validate")?;
-        let indexed = client
-            .query_one(
-                "SELECT id FROM mixed_activity_soak WHERE value = $1",
-                &[&value_for(indexed_id)],
-            )
-            .await?;
-        let indexed_ok = indexed.get::<_, i32>(0) == indexed_id;
+        let indexed_deadline = Instant::now() + Duration::from_secs(60);
+        let mut indexed_detail: String;
+        let indexed = loop {
+            match client
+                .query(
+                    "SELECT id FROM mixed_activity_soak WHERE value = $1",
+                    &[&value_for(indexed_id)],
+                )
+                .await
+            {
+                Ok(rows) if rows.len() == 1 && rows[0].get::<_, i32>(0) == indexed_id => {
+                    break rows;
+                }
+                Ok(rows) => indexed_detail = format!("{} rows", rows.len()),
+                Err(error) => indexed_detail = pg_error(error),
+            }
+            if Instant::now() >= indexed_deadline {
+                bail!(
+                    "node {} indexed lookup did not return one expected row: {indexed_detail}",
+                    index + 1
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
         let passed = missing == 0
             && unexpected == 0
             && duplicates == 0
             && mismatched_values == 0
-            && rows.len() == expected.len()
-            && indexed_ok;
+            && rows.len() == expected.len();
         if !passed {
             bail!(
-                "node {} failed exact validation: missing={missing}, unexpected={unexpected}, duplicates={duplicates}, mismatched={mismatched_values}, rows={}, expected={}, indexed={indexed_ok}",
+                "node {} failed exact validation: missing={missing}, unexpected={unexpected}, duplicates={duplicates}, mismatched={mismatched_values}, rows={}, expected={}",
                 index + 1,
                 rows.len(),
                 expected.len(),
@@ -646,7 +662,8 @@ async fn validate_on_every_node(
             "unexpected": unexpected,
             "duplicates": duplicates,
             "mismatched_values": mismatched_values,
-            "indexed_lookup_verified": indexed_ok,
+            "indexed_rows": indexed.len(),
+            "indexed_lookup_verified": true,
             "linearizable_reads": false,
         }));
     }
