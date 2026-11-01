@@ -407,8 +407,10 @@ async fn wait_for_data_group_catchup(cluster: &ClusterFixture, group: &str) -> R
         for index in 0..cluster.nodes.len() {
             applied.push(data_group_applied(cluster, index, group).await?);
         }
-        if leader.is_some() && applied.iter().all(|value| *value == leader) {
-            return Ok(leader.unwrap());
+        if let Some(leader) = leader
+            && applied.iter().all(|value| *value == Some(leader))
+        {
+            return Ok(leader);
         }
         if Instant::now() >= deadline {
             bail!("data group {group} did not converge: leader={leader:?}, applied={applied:?}");
