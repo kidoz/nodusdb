@@ -78,9 +78,11 @@ impl Workload {
         let mut errors = errors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if errors.len() < 20 {
-            errors.push(error.to_string());
+        if errors.len() == 20 {
+            errors.rotate_left(1);
+            errors.pop();
         }
+        errors.push(error.to_string());
     }
 
     fn summary(&self) -> Value {
@@ -202,7 +204,7 @@ async fn writer(client: Arc<tokio_postgres::Client>, workload: Arc<Workload>) ->
                 }
                 Ok(count) => bail!("insert for id {id} affected {count} rows"),
                 Err(error) => {
-                    workload.record_error(&error, true);
+                    workload.record_error(&format!("insert id {id}: {error}"), true);
                     workload.write_retries.fetch_add(1, Ordering::Relaxed);
                     if error.contains("SQLSTATE 23505") {
                         let confirmation = tokio::time::timeout(

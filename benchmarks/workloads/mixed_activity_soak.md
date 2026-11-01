@@ -34,8 +34,8 @@ timeout. SQL failures and timeouts are recorded and retried with a per-operation
 120-second deadline. Successfully acknowledged inserts enter the expected-row
 oracle. A duplicate-key retry after an uncertain outcome is included only after
 an independent read confirms the complete expected value; a different value
-fails the drill. Failure summaries include current workload counters and
-separate read/write errors.
+fails the drill. Failure summaries include current workload counters and the 20
+most recent read/write errors.
 
 Maintenance proceeds in this order while the workload continues:
 
