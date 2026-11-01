@@ -156,12 +156,21 @@ fn pg_error(error: tokio_postgres::Error) -> String {
 
 async fn wait_for_acknowledged(workload: &Workload, target: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(1_800);
+    let mut last_progress = Instant::now();
+    let mut last_acknowledged = workload.acknowledged_count();
     while workload.acknowledged_count() < target {
-        if Instant::now() >= deadline {
+        let acknowledged = workload.acknowledged_count();
+        if acknowledged != last_acknowledged {
+            last_acknowledged = acknowledged;
+            last_progress = Instant::now();
+        }
+        if last_progress.elapsed() >= Duration::from_secs(180) {
             bail!(
-                "workload reached {} of {target} required acknowledged writes",
-                workload.acknowledged_count()
+                "workload made no acknowledged progress for 180 seconds; reached {acknowledged} of {target} required writes"
             );
+        }
+        if Instant::now() >= deadline {
+            bail!("workload reached {acknowledged} of {target} required acknowledged writes");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

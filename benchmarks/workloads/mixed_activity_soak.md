@@ -35,7 +35,8 @@ timeout. SQL failures and timeouts are recorded and retried with a per-operation
 oracle. A duplicate-key retry after an uncertain outcome is included only after
 an independent read confirms the complete expected value; a different value
 fails the drill. Failure summaries include current workload counters and the 20
-most recent read/write errors.
+most recent read/write errors. Waiting for an acknowledgement target is bounded
+by 1,800 seconds overall and 180 seconds without acknowledged progress.
 
 Maintenance proceeds in this order while the workload continues:
 
