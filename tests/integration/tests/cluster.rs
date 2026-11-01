@@ -255,6 +255,16 @@ async fn an_mtls_restarted_node_rebinds_its_peer_listener_and_recovers_data() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, String>(0), "durable");
+
+    leader
+        .simple_query("INSERT INTO mtls_restart (id, v) VALUES (2, 'after-restart')")
+        .await
+        .unwrap();
+    let row = rejoined
+        .query_one("SELECT v FROM mtls_restart WHERE id = 2", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "after-restart");
 }
 
 /// Killing the leader does not lose committed data: the surviving majority
