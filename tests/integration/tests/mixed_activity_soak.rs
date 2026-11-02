@@ -567,11 +567,6 @@ async fn validate_on_every_node(
     expected: &BTreeSet<i32>,
     split_map: &Value,
 ) -> Result<Value> {
-    cluster
-        .pg_client(0)
-        .await?
-        .batch_execute("CREATE INDEX mixed_activity_value_idx ON mixed_activity_soak (value)")
-        .await?;
     let groups = split_map["shards"]
         .as_array()
         .context("split map omitted shards")?
@@ -590,6 +585,11 @@ async fn validate_on_every_node(
             "applied_on_every_node": wait_for_data_group_catchup(cluster, &group).await?,
         }));
     }
+    cluster
+        .pg_client(0)
+        .await?
+        .batch_execute("CREATE INDEX mixed_activity_value_idx ON mixed_activity_soak (value)")
+        .await?;
     let mut nodes = Vec::new();
     for index in 0..cluster.nodes.len() {
         let client = cluster.pg_client(index).await?;
