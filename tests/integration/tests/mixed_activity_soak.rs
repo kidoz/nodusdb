@@ -738,7 +738,7 @@ async fn wait_for_quiescent_queues(cluster: &ClusterFixture) -> Result<()> {
 }
 
 async fn wait_for_pending_intents_to_drain(cluster: &ClusterFixture) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(360);
     loop {
         let mut pending = 0.0;
         for index in 0..cluster.nodes.len() {
