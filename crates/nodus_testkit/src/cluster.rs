@@ -85,6 +85,14 @@ impl ClusterNode {
         self.running.is_some()
     }
 
+    pub fn local_index_entry_count(&self, table: &str, index: &str) -> Result<usize> {
+        self.running
+            .as_ref()
+            .context("node is stopped")?
+            .handle
+            .local_index_entry_count(table, index)
+    }
+
     fn config(&self) -> NodusConfig {
         let mut config = NodusConfig::default();
         config.admin.password = Some("nodus".into());

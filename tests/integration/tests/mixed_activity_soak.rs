@@ -637,8 +637,45 @@ async fn validate_on_every_node(
                 Err(error) => indexed_detail = pg_error(error),
             }
             if Instant::now() >= indexed_deadline {
+                let plan = match client
+                    .query(
+                        "EXPLAIN (COSTS OFF) SELECT id FROM mixed_activity_soak WHERE value = $1",
+                        &[&value_for(indexed_id)],
+                    )
+                    .await
+                {
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row.get::<_, String>(0))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    Err(error) => pg_error(error),
+                };
+                let ready = match client
+                    .query(
+                        "SELECT i.indisready FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid WHERE c.relname = $1",
+                        &[&"mixed_activity_value_idx"],
+                    )
+                    .await
+                {
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row.get::<_, bool>(0))
+                        .collect::<Vec<_>>(),
+                    Err(_) => vec![],
+                };
+                let entry_counts = cluster
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        node.local_index_entry_count(
+                            "mixed_activity_soak",
+                            "mixed_activity_value_idx",
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 bail!(
-                    "node {} indexed lookup did not return one expected row: {indexed_detail}",
+                    "node {} indexed lookup did not return one expected row: {indexed_detail}; entries={entry_counts:?}; ready={ready:?}; plan={plan}",
                     index + 1
                 );
             }

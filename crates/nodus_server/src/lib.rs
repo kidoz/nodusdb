@@ -45,6 +45,8 @@ use tower_http::cors::{Any, CorsLayer};
 pub struct ServerHandle {
     #[cfg(any(test, feature = "test-utils"))]
     catalog: Arc<nodus_catalog::MemoryCatalog>,
+    #[cfg(any(test, feature = "test-utils"))]
+    local_kv: Arc<dyn nodus_storage_api::KvEngine>,
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub pgwire_task: JoinHandle<anyhow::Result<()>>,
@@ -61,6 +63,25 @@ pub struct ServerHandle {
 impl ServerHandle {
     pub fn catalog(&self) -> Arc<nodus_catalog::MemoryCatalog> {
         self.catalog.clone()
+    }
+
+    pub fn local_index_entry_count(&self, table: &str, index_name: &str) -> anyhow::Result<usize> {
+        let table = self.catalog.get_table("default", "public", table)?;
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.name == index_name)
+            .ok_or_else(|| anyhow::anyhow!("index {index_name} not found"))?;
+        let range = nodus_storage_api::KeyRange {
+            start: bytes::Bytes::from(format!("i:{}:", index.id)),
+            end: bytes::Bytes::from(format!("i:{};", index.id)),
+        };
+        let mut count = 0;
+        for pair in self.local_kv.scan(range, u64::MAX)? {
+            pair?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
@@ -1664,6 +1685,8 @@ pub async fn run_server_full(
     Ok(ServerHandle {
         #[cfg(any(test, feature = "test-utils"))]
         catalog,
+        #[cfg(any(test, feature = "test-utils"))]
+        local_kv,
         pgwire_addr,
         http_addr,
         pgwire_task,

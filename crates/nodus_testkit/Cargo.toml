@@ -16,7 +16,7 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
-nodus_server = { path = "../nodus_server" }
+nodus_server = { path = "../nodus_server", features = ["test-utils"] }
 nodus_security = { path = "../nodus_security" }
 nodus_config = { path = "../nodus_config" }
 rcgen = "0.14.10"
