@@ -598,6 +598,28 @@ async fn sharded_table_replicates_and_survives_leader_failure() {
         "follower should serve both replicated sharded rows"
     );
 
+    leader
+        .simple_query("CREATE INDEX sharded_val_idx ON sharded (val)")
+        .await
+        .unwrap();
+    for index in 0..cluster.nodes.len() {
+        let client = cluster.pg_client(index).await.unwrap();
+        let mut indexed = false;
+        for _ in 0..75 {
+            if let Ok(rows) = client
+                .query("SELECT id FROM sharded WHERE val = 'two'", &[])
+                .await
+                && rows.len() == 1
+                && rows[0].get::<_, i32>(0) == 2
+            {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(indexed, "node {} missing secondary-index row", index + 1);
+    }
+
     // Kill the data-group (and meta) leader. The surviving two nodes are a
     // majority of both groups.
     cluster.stop(0).await.unwrap();
