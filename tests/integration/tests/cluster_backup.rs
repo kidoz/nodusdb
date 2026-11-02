@@ -131,6 +131,25 @@ async fn cluster_backup_covers_every_shard_exactly_once() {
     let ids = rows_on(&seed, 5).await;
     assert_eq!(ids, [1, 2, 3, 10, 20]);
 
+    seed.batch_execute("CREATE INDEX t_note_idx ON t (note)")
+        .await
+        .unwrap();
+    for index in 0..cluster.nodes.len() {
+        let client = connect(cluster.nodes[index].pgwire_addr()).await;
+        let mut indexed = false;
+        for _ in 0..75 {
+            if let Ok(rows) = client.query("SELECT id FROM t WHERE note = 'b'", &[]).await
+                && rows.len() == 1
+                && rows[0].get::<_, i32>(0) == 2
+            {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(indexed, "node {} missing post-split index row", index + 1);
+    }
+
     // The journaled backup on the meta leader covers every shard exactly once.
     let body = post(&cluster, 0, "/api/v1/backups").await;
     assert_eq!(body["status"], "Completed", "backup: {body}");
