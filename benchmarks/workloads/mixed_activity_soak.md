@@ -58,8 +58,9 @@ Maintenance proceeds in this order while the workload continues:
    follower cannot catch up from the complete missed prefix and must receive a
    snapshot.
 6. Restart node 3 on its original ports and persistent directory, then require
-   readiness and three live nodes. After pausing writes, also require the same
-   data-group applied index on every replica before migration.
+   readiness and three live nodes within bounded 300-second waits. After pausing
+   writes, also require the same data-group applied index on every replica
+   before migration.
 7. With reads continuing, drain Raft queues and pending intents, allowing 360
    seconds so the 300-second abandoned-intent TTL and a janitor sweep can elapse,
    then split and rebalance across all three nodes. Accept the documented

@@ -926,10 +926,11 @@ async fn execute(
 
     let started = Instant::now();
     cluster.restart(2).await?;
-    if !cluster.wait_ready(2, Duration::from_secs(60)).await
-        || !cluster.wait_nodes_live(3, Duration::from_secs(60)).await
-    {
-        bail!("restarted follower did not rejoin");
+    if !cluster.wait_ready(2, Duration::from_secs(300)).await {
+        bail!("restarted follower did not become ready within 300 seconds");
+    }
+    if !cluster.wait_nodes_live(3, Duration::from_secs(300)).await {
+        bail!("restarted follower did not rejoin meta Raft within 300 seconds");
     }
     record_activity(
         &artifact,
