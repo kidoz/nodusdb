@@ -1,5 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
+#[cfg(test)]
+mod flush_tests;
 #[cfg(test)]
 mod powercut_tests;
 mod snapshot;
@@ -447,6 +449,9 @@ impl LsmKvEngine {
         Ok(())
     }
 
+    /// Publishes committed keys as an SSTable and rotates the WAL. Keys remain
+    /// in the memtable until the manifest names both files, so a publication
+    /// error preserves live reads and can be retried without losing commits.
     pub fn flush(&self) -> Result<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
@@ -491,39 +496,40 @@ impl LsmKvEngine {
                 .values()
                 .flat_map(|keys| keys.iter().map(|(k, _)| k.clone()))
                 .collect();
-            let mut to_flush = BTreeMap::new();
-            mem_guard.retain(|k, chain| {
-                if active_keys.contains(k) {
-                    true
-                } else {
-                    to_flush.insert(k.clone(), chain.clone());
-                    false
-                }
-            });
-            let retained: usize = mem_guard.iter().map(|(k, c)| chain_bytes(k, c)).sum();
-            self.set_memtable_bytes(retained);
+            // Stage a copy without removing the live rows. Any error before
+            // manifest publication must leave them readable and retryable;
+            // otherwise a later flush could advance the replay floor past
+            // the WAL records of rows discarded by this failed attempt.
+            let to_flush: BTreeMap<_, _> = mem_guard
+                .iter()
+                .filter(|(key, _)| !active_keys.contains(*key))
+                .map(|(key, chain)| (key.clone(), chain.clone()))
+                .collect();
+            let has_retained_keys = mem_guard.len() != to_flush.len();
 
-            if !to_flush.is_empty() {
-                // Durably + atomically publish committed data as an SSTable.
+            let new_sst = if to_flush.is_empty() {
+                None
+            } else {
+                // Build a complete file, still an orphan until the manifest
+                // names it. WAL creation below can fail independently.
                 let sst_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
-                let sst = Sstable::build(dir.join(format!("{sst_id}.sst")), &to_flush)?;
-                let count = {
-                    let mut sstables = self.sstables.write().unwrap();
-                    sstables.push(sst);
-                    sstables.len()
-                };
-                self.emit_sstable_count(count);
-            }
+                let sst_path = dir.join(format!("{sst_id}.sst"));
+                Some(Sstable::build(&sst_path, &to_flush).with_context(|| {
+                    format!("failed to build flush SSTable {}", sst_path.display())
+                })?)
+            };
 
             // Rotate to a fresh WAL segment; older segments stay on disk for the
             // backup WAL-archiver / PITR. The manifest swap below makes the new
             // file set durable (recovery reads the manifest, not file names).
             let predecessor = self.active_wal_id.load(Ordering::Relaxed);
             let wal_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
-            let new_wal = Arc::new(FileWalEngine::with_encryption(
-                dir.join(format!("{wal_id}.log")),
-                self._wal_key,
-            )?);
+            let wal_path = dir.join(format!("{wal_id}.log"));
+            let new_wal = Arc::new(
+                FileWalEngine::with_encryption(&wal_path, self._wal_key).with_context(|| {
+                    format!("failed to create flush WAL {}", wal_path.display())
+                })?,
+            );
             // Record this segment's lineage as its first record so PITR can
             // verify an unbroken archived chain despite sparse segment ids, and
             // so crash recovery can walk back to any segment still holding a
@@ -549,10 +555,19 @@ impl LsmKvEngine {
             let mut wal_guard = self.wal.write().unwrap();
             let previous_wal = (*wal_guard).replace(new_wal);
             self.active_wal_id.store(wal_id, Ordering::Relaxed);
+            let added_sstable = new_sst.is_some();
+            let previous_sstable_count = {
+                let mut sstables = self.sstables.write().unwrap();
+                let previous_count = sstables.len();
+                if let Some(sst) = new_sst {
+                    sstables.push(sst);
+                }
+                previous_count
+            };
             // Advance the replay floor only when nothing in an older segment
             // can still be needed: this flush retained no uncommitted intents
             // AND no intent append is in flight. If intents were retained
-            // (`mem_guard` still holds their keys), an older segment may carry
+            // (keys excluded from `to_flush`), an older segment may carry
             // their `WriteIntent`/committed-version records while the matching
             // `CommitTxn` will land in this new segment, so the floor must
             // stay put to keep the whole lineage in the replay window. An
@@ -561,7 +576,7 @@ impl LsmKvEngine {
             // is still pending, so a floor advance would drop a transaction
             // whose commit lands after the rotation.
             let previous_floor = self.min_replay_wal.load(Ordering::Relaxed);
-            if mem_guard.is_empty() && self.inflight_appends.load(Ordering::SeqCst) == 0 {
+            if !has_retained_keys && self.inflight_appends.load(Ordering::SeqCst) == 0 {
                 self.min_replay_wal.store(wal_id, Ordering::Relaxed);
             }
             self.pause_before_manifest_save();
@@ -569,13 +584,30 @@ impl LsmKvEngine {
                 // Publication failed: the manifest on disk still names the old
                 // segment. Roll the in-memory rotation back so future appends
                 // keep landing in the published segment recovery will replay,
-                // instead of an orphan the manifest never names. (The SSTable
-                // push above is not rolled back: after a crash its data is
-                // rebuilt from the retained WAL lineage, so it stays correct.)
+                // instead of an orphan the manifest never names. Remove the
+                // tentative SSTable from the serving set too: its rows are
+                // still in memory, so reads must not depend on an orphan file.
                 *wal_guard = previous_wal;
                 self.active_wal_id.store(predecessor, Ordering::Relaxed);
                 self.min_replay_wal.store(previous_floor, Ordering::Relaxed);
-                return Err(error);
+                self.sstables
+                    .write()
+                    .unwrap()
+                    .truncate(previous_sstable_count);
+                return Err(error.context("failed to publish flush manifest"));
+            }
+
+            // The durable file set now owns these versions. Writers have been
+            // excluded by `mem_guard` throughout staging and publication, so
+            // only the unresolved intent keys need to remain in memory.
+            mem_guard.retain(|key, _| active_keys.contains(key));
+            let retained = mem_guard
+                .iter()
+                .map(|(key, chain)| chain_bytes(key, chain))
+                .sum();
+            self.set_memtable_bytes(retained);
+            if added_sstable {
+                self.emit_sstable_count(previous_sstable_count + 1);
             }
         }
 

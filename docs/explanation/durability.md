@@ -57,6 +57,14 @@ A `MANIFEST` file records the authoritative file set — the live SSTable ids an
 the active WAL segment — and is written atomically. A new SSTable becomes live
 only when the manifest names it.
 
+Committed keys stay in the memtable until the manifest publishes the new
+SSTable and WAL segment. If SSTable creation, WAL rotation, or manifest
+publication fails before that commit point, the keys remain readable and the
+flush can be retried. A failed manifest publication also rolls back the
+tentative SSTable and WAL from the live file set, so reads do not depend on
+unpublished orphan files. Only a successful publication removes the flushed
+keys and updates the memtable byte count.
+
 That single indirection is what makes flush and compaction crash-safe:
 
 - A crash *before* the manifest swap orphans the new file. Recovery ignores it.
