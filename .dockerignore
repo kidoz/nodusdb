@@ -7,4 +7,5 @@ frontend/coverage/
 **/*.md
 .agents/
 .claude/
+.codex/
 .idea/
