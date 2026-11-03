@@ -13,7 +13,7 @@ thiserror.workspace = true
 serde.workspace = true
 uuid.workspace = true
 # sha2 0.11 pairs with hmac 0.13 (digest 0.11) for PBKDF2-HMAC-SHA256.
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 hmac = "0.13.0"
 subtle = "2.6.1"
 base64 = "0.23.1"

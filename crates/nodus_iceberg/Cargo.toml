@@ -28,7 +28,7 @@ tracing.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 tempfile = "3"
-parquet = "58"
+parquet = "58.4.1"
 
 [lints]
 workspace = true

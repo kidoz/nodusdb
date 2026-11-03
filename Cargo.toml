@@ -46,47 +46,48 @@ license = "MIT"
 repository = "https://github.com/kidoz/nodusdb"
 
 [workspace.dependencies]
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 axum = "0.8.9"
 tower-http = { version = "0.7.1", features = ["cors", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order", "arbitrary_precision"] }
-prometheus-client = "0.25.1"
+serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+prometheus-client = "0.25.2"
 reqwest = { version = "0.13.5", features = ["json", "query"] }
 figment = { version = "0.10.19", features = ["toml", "env"] }
-pgwire = "0.41.0"
+pgwire = "0.42.1"
 sqlparser = "0.63.0"
 postgres-types = { version = "0.2.14", features = ["array-impls", "derive", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 tokio-postgres = "0.7.18"
 async-trait = "0.1.92"
 futures-util = "0.3.34"
-uuid = { version = "1.26.1", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.29.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 bytes = "1.12.1"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 openraft = { version = "0.9.25", features = ["serde"] }
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 md-5 = "0.11.0"
 rust_decimal = "1.43.0"
-num-bigint = "0.4.8"
+num-bigint = "0.5.1"
 num-traits = "0.2.19"
-unicode-normalization = "0.1.25"
-proptest = "1.11.0"
+unicode-normalization = "0.1.26"
+proptest = "1.12.0"
 criterion = "0.8.2"
 iceberg = "=0.10.1"
 iceberg-catalog-rest = "=0.10.1"
 object_store = { version = "0.14.2", features = ["aws"] }
-typetag = "0.2"
-arrow-array = "58"
-arrow-schema = "58"
-arrow-ipc = "58"
+typetag = "0.2.23"
+# Keep Arrow/Parquet on the major version exposed by iceberg 0.10.1.
+arrow-array = "58.4.1"
+arrow-schema = "58.4.1"
+arrow-ipc = "58.4.1"
 # The REST client currently exposes reqwest 0.12 in its custom-client API.
-iceberg-http = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls"] }
+iceberg-http = { package = "reqwest", version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

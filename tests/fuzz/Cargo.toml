@@ -23,7 +23,7 @@ path = "../../crates/nodus_raftstore"
 path = "../../crates/nodus_storage_wal"
 
 [dependencies.serde_json]
-version = "1.0.151"
+version = "1.0.154"
 
 [[bin]]
 name = "fuzz_sql_parser"

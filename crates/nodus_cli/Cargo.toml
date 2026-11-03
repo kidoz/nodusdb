@@ -28,7 +28,7 @@ nodus_config = { path = "../nodus_config" }
 iceberg.workspace = true
 arrow-array.workspace = true
 axum.workspace = true
-parquet = "58"
+parquet = "58.4.1"
 
 [lints]
 workspace = true
