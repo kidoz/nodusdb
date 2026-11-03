@@ -8,10 +8,6 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::scan::ArrowRecordBatchStream;
 use iceberg::spec::{FormatVersion, ManifestContentType, ManifestList};
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
-use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
-};
 use serde::Serialize;
 use tokio::time::{Instant, timeout_at};
 
@@ -52,51 +48,16 @@ pub struct SnapshotReader {
 
 impl SnapshotReader {
     /// Discover catalog configuration and load a table once. The deadline starts
-    /// here and is shared by subsequent planning and batch reads. Redirects are
-    /// disabled so a catalog cannot redirect the bearer token to another host.
+    /// here and is shared by subsequent planning and batch reads. HTTP redirects
+    /// are disabled and catalog URI overrides must preserve scheme, host and port.
     #[tracing::instrument(skip_all, name = "iceberg.open")]
     pub async fn open(config: CatalogOptions, options: ReadOptions) -> Result<Self, Error> {
         config.validate()?;
         options.validate()?;
         let deadline = Instant::now() + config.timeout;
-        let client = iceberg_http::Client::builder()
-            .redirect(iceberg_http::redirect::Policy::none())
-            .timeout(config.timeout)
-            .build()
-            .map_err(|_| Error::InvalidOptions("could not construct catalog HTTP client".into()))?;
-        let storage = crate::storage::ReadStorageFactory(config.storage);
-        let mut properties = config.storage_properties;
-        properties.insert(
-            REST_CATALOG_PROP_URI.into(),
-            config.uri.trim_end_matches('/').into(),
-        );
-        if let Some(warehouse) = config.warehouse {
-            properties.insert(REST_CATALOG_PROP_WAREHOUSE.into(), warehouse);
-        }
-        if let Some(token) = config.bearer_token {
-            properties.insert("token".into(), token);
-        }
-        properties.insert(
-            "header.X-Iceberg-Access-Delegation".into(),
-            "vended-credentials".into(),
-        );
-        let namespace = NamespaceIdent::from_vec(options.namespace.clone())
-            .map_err(|e| operation("namespace validation", e))?;
-        let identifier = TableIdent::new(namespace, options.table.clone());
-        let table = timeout_at(deadline, async {
-            let catalog = RestCatalogBuilder::default()
-                .with_client(client)
-                .with_storage_factory(Arc::new(storage))
-                .load("nodus-external", properties)
-                .await
-                .map_err(|e| operation("catalog configuration", e))?;
-            catalog
-                .load_table(&identifier)
-                .await
-                .map_err(|e| operation("load table", e))
-        })
-        .await
-        .map_err(|_| Error::Timeout)??;
+        let table = timeout_at(deadline, crate::catalog::load_table(config, &options))
+            .await
+            .map_err(|_| Error::Timeout)??;
         Self::from_table(table, options, deadline)
     }
 

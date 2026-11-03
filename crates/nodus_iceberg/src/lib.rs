@@ -4,6 +4,7 @@
 //! external client: it does not access NodusDB SQL/catalog state or use admin
 //! credentials. The external catalog and storage authorize requests.
 
+mod catalog;
 mod config;
 mod reader;
 mod storage;
@@ -20,14 +21,14 @@ pub enum Error {
     /// The requested feature is outside the verified read-only subset.
     #[error("unsupported Iceberg feature: {0}")]
     Unsupported(&'static str),
-    /// A safe operation label and upstream error class, without remote contents.
+    /// A safe operation label and error class, without remote contents.
     #[error(
         "Iceberg {operation} failed ({kind}); check catalog permissions, table metadata and storage access"
     )]
     Operation {
         /// Operation that failed.
         operation: &'static str,
-        /// Upstream classification, not its potentially sensitive message.
+        /// Error classification, not a potentially sensitive upstream message.
         kind: iceberg::ErrorKind,
     },
     /// The deadline includes metadata loading, planning and batch consumption.

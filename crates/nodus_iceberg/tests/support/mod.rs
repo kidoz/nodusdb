@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 pub struct ServerState {
     pub response: Arc<Mutex<Value>>,
+    pub catalog_config: Arc<Mutex<Value>>,
+    pub redirect: Arc<Mutex<Option<String>>>,
     pub requests: Arc<Mutex<Vec<(String, String)>>>,
     pub status: Arc<Mutex<StatusCode>>,
     pub delay: Arc<Mutex<Duration>>,
@@ -175,6 +177,10 @@ impl Fixture {
         }
         let state = ServerState {
             response: Arc::new(Mutex::new(response)),
+            catalog_config: Arc::new(Mutex::new(json!({
+                "defaults": {}, "overrides": {"prefix": "warehouse-prefix"}
+            }))),
+            redirect: Arc::new(Mutex::new(None)),
             requests: Arc::new(Mutex::new(vec![])),
             status: Arc::new(Mutex::new(StatusCode::OK)),
             delay: Arc::new(Mutex::new(Duration::ZERO)),
@@ -271,6 +277,9 @@ async fn handler(State(state): State<ServerState>, request: Request) -> Response
         .lock()
         .unwrap()
         .push((request.method().to_string(), request.uri().to_string()));
+    if let Some(location) = state.redirect.lock().unwrap().clone() {
+        return (StatusCode::TEMPORARY_REDIRECT, [("location", location)]).into_response();
+    }
     if let Some(key) = request.uri().path().strip_prefix("/test-bucket/warehouse/") {
         // A minimal S3 HTTP fixture verifies range reads and use of credentials
         // returned by load-table. It does not validate AWS signature cryptography.
@@ -329,8 +338,7 @@ async fn handler(State(state): State<ServerState>, request: Request) -> Response
     }
     if request.uri().path() == "/catalog/v1/config" {
         assert_eq!(request.uri().query(), Some("warehouse=test-warehouse"));
-        return Json(json!({"defaults": {}, "overrides": {"prefix": "warehouse-prefix"}}))
-            .into_response();
+        return Json(state.catalog_config.lock().unwrap().clone()).into_response();
     }
     if request.uri().path() == "/catalog/v1/warehouse-prefix/namespaces/analytics/tables/events" {
         let status = *state.status.lock().unwrap();

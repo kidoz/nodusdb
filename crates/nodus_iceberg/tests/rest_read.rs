@@ -8,6 +8,59 @@ use serde_json::json;
 use support::Fixture;
 
 #[tokio::test]
+async fn catalog_uri_overrides_and_redirects_cannot_send_tokens_to_another_origin() {
+    let fixture = Fixture::new().await;
+    let other = Fixture::new().await;
+    fixture.state.catalog_config.lock().unwrap()["overrides"]["uri"] = json!(other.uri);
+    let error = SnapshotReader::open(fixture.config(), fixture.options())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Unsupported(_)));
+    assert!(!format!("{error:?} {error}").contains("catalog-token"));
+    assert_eq!(fixture.state.requests.lock().unwrap().len(), 1);
+    assert!(other.state.requests.lock().unwrap().is_empty());
+
+    *fixture.state.redirect.lock().unwrap() = Some(format!("{}/v1/config", other.uri));
+    assert!(
+        SnapshotReader::open(fixture.config(), fixture.options())
+            .await
+            .is_err()
+    );
+    assert!(other.state.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn same_origin_uri_override_keeps_local_auth_and_storage_properties() {
+    let fixture = Fixture::new_s3().await;
+    {
+        let mut discovery = fixture.state.catalog_config.lock().unwrap();
+        discovery["overrides"]["uri"] = json!(format!("{}/", fixture.uri));
+        discovery["overrides"]["token"] = json!("must-not-replace-local-token");
+        discovery["overrides"]["header.Authorization"] = json!("must-not-replace-local-token");
+    }
+    let mut config = fixture.config();
+    // Local overrides must still win over the load-table storage config.
+    fixture.state.response.lock().unwrap()["config"]["s3.endpoint"] =
+        json!("http://invalid.invalid");
+    config.storage_properties.insert(
+        "s3.endpoint".into(),
+        fixture.uri.trim_end_matches("/catalog").into(),
+    );
+    let mut batches = SnapshotReader::open(config, fixture.options())
+        .await
+        .unwrap()
+        .scan()
+        .await
+        .unwrap();
+    let mut rows = 0;
+    while let Some(batch) = batches.next_batch().await.unwrap() {
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, 3);
+}
+
+#[tokio::test]
 async fn v1_manifest_lists_and_deleted_data_entries_are_read_correctly() {
     let fixture = Fixture::new_v1().await;
     let reader = SnapshotReader::open(fixture.config(), fixture.options())

@@ -23,6 +23,12 @@ it through `NODUS_ICEBERG_TOKEN`. The client never reads `NODUS_ADMIN_TOKEN` for
 catalog authentication, and rejects the global `--token` option for these
 commands. An unset Iceberg token permits an unauthenticated development catalog.
 
+HTTP redirects are rejected. A catalog URI override may change the base path
+only within the configured origin: scheme, host and effective port must stay
+the same. Cross-origin overrides and HTTPS downgrades fail before a table
+request is sent. Catalog properties cannot replace the caller's bearer token
+or supply authentication headers.
+
 The following examples are illustrative: substitute your endpoint, warehouse,
 namespace and table, and set `NODUS_ICEBERG_TOKEN` in your shell first.
 
