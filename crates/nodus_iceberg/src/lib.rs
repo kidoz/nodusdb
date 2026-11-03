@@ -1,7 +1,9 @@
 //! Read-only Iceberg REST interoperability, isolated from NodusDB's OLTP engine.
 //!
-//! A read pins the loaded table's snapshot and returns Arrow batches. This is an
-//! external client: it does not access NodusDB SQL/catalog state or use admin
+//! A read pins the loaded table's snapshot and read schema and returns Arrow
+//! batches. Current reads use the current table schema; explicit time travel
+//! uses the snapshot's historical schema. This external client does not access
+//! NodusDB SQL/catalog state or use admin
 //! credentials. The external catalog and storage authorize requests.
 
 mod catalog;

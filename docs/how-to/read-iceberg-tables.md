@@ -40,7 +40,7 @@ namespace and table, and set `NODUS_ICEBERG_TOKEN` in your shell first.
 ```
 
 Inspection prints a versioned JSON object with the table UUID, format version,
-selected snapshot ID, its Iceberg schema, and output column names. Credentials,
+selected snapshot ID, the read schema, and output column names. Credentials,
 storage locations, and catalog properties are omitted. Repeat `--namespace` for
 a multi-level namespace; a dot inside a component is a literal dot.
 Lakekeeper 0.14.2 expects the warehouse name for catalog discovery; use the
@@ -64,8 +64,12 @@ selected snapshot. Row order is unspecified, so a limit is not a deterministic
 sample. `--limit 0` writes a schema-only file after snapshot validation.
 
 Use `--snapshot-id ID` to select a retained historical snapshot. Without it, the
-operation loads current metadata once and pins that snapshot. A missing or
-expired snapshot fails; the client never silently falls back to current data.
+operation loads current metadata once and pins both the current snapshot and
+the current table schema. Schema-only changes such as column additions,
+renames, drops, and type promotions take effect without a subsequent data write.
+Explicit `--snapshot-id` reads use that snapshot's historical schema, even when
+the ID equals the current snapshot. A missing or expired snapshot fails; the
+client never silently falls back to current data.
 
 The destination must not exist. The client writes a private temporary file in
 the destination directory and publishes it only after all requested batches

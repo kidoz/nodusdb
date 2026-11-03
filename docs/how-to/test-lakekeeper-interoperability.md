@@ -21,7 +21,7 @@ project's containers, network, and data. Docker images and the Python environmen
 remain cached. The stack publishes only loopback ports and never attaches to an
 existing catalog or bucket.
 
-A successful run prints seven `PASS` lines and `7/7 checks passed`. Any missing
+A successful run prints eight `PASS` lines and `8/8 checks passed`. Any missing
 service, failed assertion, timeout, or cleanup failure causes a nonzero exit;
 there is no skip-on-missing-Docker path.
 
@@ -50,7 +50,7 @@ project for manual removal. It never removes another project's resources.
 | --- | --- |
 | Current and historical snapshots | Exact rows and snapshot IDs; inspection UUID/version agrees with the writer |
 | Projection and limits | Requested column order, bounded row count, schema-only zero-row output |
-| Schema and partition evolution | Renamed field retains values by field ID; added optional field is null in old files; old and new partition specs coexist; historical schema remains readable |
+| Schema and partition evolution | Metadata-only rename/add/drop/type-promotion changes apply before another data write; re-added names do not resurrect dropped values; old and new partition specs coexist; historical schema remains readable |
 | v1 and empty tables | v1 Parquet reads correctly; snapshotless tables preserve their schema |
 | Vended credentials | Temporary STS credentials read their table but cannot read a sentinel outside its prefix; CLI succeeds without ambient AWS credentials |
 | Failures and output publication | Missing table/snapshot/column/object and invalid storage credentials fail; failed scans leave no output or temporary files; existing destination is preserved |

@@ -61,6 +61,144 @@ async fn same_origin_uri_override_keeps_local_auth_and_storage_properties() {
 }
 
 #[tokio::test]
+async fn schema_only_rename_and_add_apply_to_current_reads_but_not_time_travel() {
+    let fixture = Fixture::new().await;
+    {
+        let mut response = fixture.state.response.lock().unwrap();
+        let metadata = &mut response["metadata"];
+        let mut schema = metadata["schemas"][0].clone();
+        schema["schema-id"] = json!(1);
+        schema["fields"][1]["name"] = json!("label");
+        schema["fields"].as_array_mut().unwrap().push(json!({
+            "id": 3, "name": "note", "required": false, "type": "string"
+        }));
+        metadata["schemas"].as_array_mut().unwrap().push(schema);
+        metadata["current-schema-id"] = json!(1);
+        metadata["last-column-id"] = json!(3);
+    }
+    let mut historical = fixture.options();
+    historical.snapshot_id = Some(20);
+    let old = SnapshotReader::open(fixture.config(), historical.clone())
+        .await
+        .unwrap();
+    assert_eq!(old.summary().columns, ["id", "name"]);
+    assert_eq!(old.summary().schema.schema_id(), 0);
+    historical.columns = vec!["label".into()];
+    assert!(matches!(
+        SnapshotReader::open(fixture.config(), historical).await,
+        Err(Error::InvalidOptions(_))
+    ));
+    let mut dropped_name = fixture.options();
+    dropped_name.columns = vec!["name".into()];
+    assert!(matches!(
+        SnapshotReader::open(fixture.config(), dropped_name).await,
+        Err(Error::InvalidOptions(_))
+    ));
+    let mut options = fixture.options();
+    options.columns = vec!["note".into(), "label".into(), "id".into()];
+    let reader = SnapshotReader::open(fixture.config(), options)
+        .await
+        .unwrap();
+    assert_eq!(reader.summary().snapshot_id, Some(20));
+    assert_eq!(reader.summary().schema.schema_id(), 1);
+    let expected_schema = reader.schema();
+    // A later catalog response cannot replace the selected schema or snapshot.
+    fixture.make_empty();
+    let mut batches = reader.scan().await.unwrap();
+    let mut ids = vec![];
+    let mut labels = vec![];
+    while let Some(batch) = batches.next_batch().await.unwrap() {
+        assert_eq!(batch.schema(), expected_schema);
+        assert_eq!(batch.column(0).null_count(), batch.num_rows());
+        let label = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let id = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            ids.push(id.value(row));
+            labels.push(if label.is_null(row) {
+                None
+            } else {
+                Some(label.value(row).to_owned())
+            });
+        }
+    }
+    assert_eq!(ids, [20, 21, 22]);
+    assert_eq!(labels, [Some("alpha".into()), None, Some("".into())]);
+    let batch = old
+        .scan()
+        .await
+        .unwrap()
+        .next_batch()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.schema().field(1).name(), "name");
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "alpha"
+    );
+}
+
+#[tokio::test]
+async fn current_schema_does_not_resurrect_dropped_and_readded_field_values() {
+    let fixture = Fixture::new().await;
+    {
+        let mut response = fixture.state.response.lock().unwrap();
+        let metadata = &mut response["metadata"];
+        let mut schema = metadata["schemas"][0].clone();
+        schema["schema-id"] = json!(1);
+        // Re-adding the same name gets a new ID, and cannot recover field 2.
+        schema["fields"][1]["id"] = json!(3);
+        metadata["schemas"].as_array_mut().unwrap().push(schema);
+        metadata["current-schema-id"] = json!(1);
+        metadata["last-column-id"] = json!(3);
+    }
+    let mut batches = SnapshotReader::open(fixture.config(), fixture.options())
+        .await
+        .unwrap()
+        .scan()
+        .await
+        .unwrap();
+    let mut rows = 0;
+    while let Some(batch) = batches.next_batch().await.unwrap() {
+        assert_eq!(batch.column(1).null_count(), batch.num_rows());
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, 3);
+
+    // Explicit time travel to the very same snapshot still uses its old schema.
+    let mut historical = fixture.options();
+    historical.snapshot_id = Some(20);
+    let reader = SnapshotReader::open(fixture.config(), historical)
+        .await
+        .unwrap();
+    assert_eq!(reader.summary().schema.schema_id(), 0);
+    let mut batches = reader.scan().await.unwrap();
+    let batch = batches.next_batch().await.unwrap().unwrap();
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "alpha"
+    );
+}
+
+#[tokio::test]
 async fn v1_manifest_lists_and_deleted_data_entries_are_read_correctly() {
     let fixture = Fixture::new_v1().await;
     let reader = SnapshotReader::open(fixture.config(), fixture.options())

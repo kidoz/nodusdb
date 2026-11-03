@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::scan::ArrowRecordBatchStream;
 use iceberg::spec::{FormatVersion, ManifestContentType, ManifestList};
@@ -31,7 +31,7 @@ pub struct ReadSummary {
     pub format_version: u8,
     /// Snapshot pinned for this operation, or null for an empty new table.
     pub snapshot_id: Option<i64>,
-    /// Schema of the selected snapshot (the current schema for an empty table).
+    /// Current table schema, or the snapshot schema for explicit time travel.
     pub schema: iceberg::spec::SchemaRef,
     /// Selected top-level columns in output order.
     pub columns: Vec<String>,
@@ -78,11 +78,11 @@ impl SnapshotReader {
             })?),
             None => metadata.current_snapshot(),
         };
-        let schema = match snapshot {
-            Some(snapshot) => snapshot
+        let schema = match (options.snapshot_id, snapshot) {
+            (Some(_), Some(snapshot)) => snapshot
                 .schema(metadata)
                 .map_err(|e| operation("snapshot schema", e))?,
-            None => metadata.current_schema().clone(),
+            _ => metadata.current_schema().clone(),
         };
         let arrow_schema =
             schema_to_arrow_schema(&schema).map_err(|e| operation("Arrow schema", e))?;
@@ -206,7 +206,6 @@ impl SnapshotReader {
             let mut scan = self
                 .table
                 .scan()
-                .select(&self.summary.columns)
                 .with_batch_size(Some(self.options.batch_size))
                 .with_concurrency_limit(1)
                 .with_data_file_concurrency_limit(1)
@@ -214,11 +213,42 @@ impl SnapshotReader {
             if let Some(id) = self.summary.snapshot_id {
                 scan = scan.snapshot_id(id);
             }
-            scan.build()
+            let tasks = scan
+                .build()
                 .map_err(|e| operation("build scan", e))?
-                .to_arrow()
+                .plan_files()
                 .await
-                .map_err(|e| operation("plan scan", e))
+                .map_err(|e| operation("plan scan", e))?;
+            let schema = self.summary.schema.clone();
+            let field_ids = self
+                .summary
+                .columns
+                .iter()
+                .map(|name| {
+                    schema.field_id_by_name(name).ok_or(Error::Unsupported(
+                        "projection is missing from the selected schema",
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Iceberg 0.10.1 plans with the snapshot's schema even for current
+            // reads. File membership remains snapshot-pinned, while Arrow must
+            // resolve names, missing fields and promotions by the read schema's
+            // field IDs. Do not rewrite the snapshot or its persisted metadata.
+            let tasks = tasks
+                .map_ok(move |mut task| {
+                    task.schema = schema.clone();
+                    task.project_field_ids = field_ids.clone();
+                    task
+                })
+                .boxed();
+            self.table
+                .reader_builder()
+                .with_batch_size(self.options.batch_size)
+                .with_data_file_concurrency_limit(1)
+                .build()
+                .read(tasks)
+                .map(|result| result.stream())
+                .map_err(|e| operation("read scan", e))
         })
         .await
         .map_err(|_| Error::Timeout)??;

@@ -18,7 +18,7 @@ import boto3
 from botocore.exceptions import ClientError
 import pyarrow as pa
 from pyiceberg.transforms import IdentityTransform
-from pyiceberg.types import StringType
+from pyiceberg.types import LongType, StringType
 
 from stack import COMPOSE, ROOT, Stack, command
 from writer import HostCatalog, add_position_delete
@@ -229,6 +229,26 @@ class Gate:
         evolved_schema = SCHEMA.set(1, pa.field("label", pa.string())).append(
             pa.field("note", pa.string())
         )
+        # DDL changes metadata without creating a new data snapshot. Exercise
+        # this state before append can conceal a reader using snapshot schema.
+        schema_only, schema_summary = self.scan("schema-only-evolution")
+        check_table(schema_only, self.table.scan().to_arrow())
+        assert (
+            schema_summary["snapshot_id"] == self.table.current_snapshot().snapshot_id
+        )
+        projected, _ = self.scan(
+            "schema-only-projection",
+            "events",
+            "--column",
+            "note",
+            "--column",
+            "label",
+            "--column",
+            "id",
+        )
+        check_table(
+            projected, self.table.scan().to_arrow().select(["note", "label", "id"])
+        )
         evolved_row = {**ROWS[0], "id": 5, "label": "new", "note": "added"}
         del evolved_row["name"]
         self.table.append(pa.Table.from_pylist([evolved_row], schema=evolved_schema))
@@ -249,6 +269,34 @@ class Gate:
             "pre-evolution", "events", "--snapshot-id", str(self.first_snapshot)
         )
         check_table(historical, self.original)
+
+    def schema_only_promotion_drop_and_readd(self):
+        schema = pa.schema([("id", pa.int32()), ("name", pa.string())])
+        original = pa.Table.from_pylist(
+            [{"id": 1, "name": "alpha"}, {"id": 2, "name": None}], schema=schema
+        )
+        table = self.create("schema_only", schema=schema)
+        table.append(original)
+        snapshot_id = table.current_snapshot().snapshot_id
+        with table.update_schema() as update:
+            update.update_column("id", field_type=LongType()).delete_column("name")
+        actual, summary = self.scan("schema-only-drop", "schema_only")
+        check_table(actual, table.scan().to_arrow())
+        assert actual.column_names == ["id"]
+        assert actual.schema.field("id").type == pa.int64()
+        assert summary["snapshot_id"] == snapshot_id
+        with table.update_schema() as update:
+            update.add_column("name", StringType())
+        actual, summary = self.scan("schema-only-readd", "schema_only")
+        check_table(actual, table.scan().to_arrow())
+        assert actual["name"].null_count == original.num_rows, (
+            "dropped field values resurrected"
+        )
+        assert summary["snapshot_id"] == snapshot_id
+        historical, _ = self.scan(
+            "schema-only-historical", "schema_only", "--snapshot-id", str(snapshot_id)
+        )
+        check_table(historical, original)
 
     def v1_and_empty(self):
         table = self.create("v1", version="1")
@@ -360,6 +408,7 @@ CHECKS = [
     "current_and_historical",
     "projection_and_limit",
     "schema_and_partition_evolution",
+    "schema_only_promotion_drop_and_readd",
     "v1_and_empty",
     "vended_credentials",
     "failures_do_not_publish",

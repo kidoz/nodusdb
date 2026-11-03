@@ -76,7 +76,8 @@ pub struct ReadOptions {
     pub namespace: Vec<String>,
     /// Table name.
     pub table: String,
-    /// Retained snapshot ID; omission pins the current snapshot at load time.
+    /// Retained snapshot ID and its historical schema; omission pins the current
+    /// snapshot and current table schema at load time.
     pub snapshot_id: Option<i64>,
     /// Top-level columns in output order; empty means all columns.
     pub columns: Vec<String>,
