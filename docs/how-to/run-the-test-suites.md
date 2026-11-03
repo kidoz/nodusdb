@@ -116,10 +116,12 @@ MinIO stack with:
 
 ```sh
 just test-iceberg-live
+just test-iceberg-auth-live # adds Keycloak OIDC and OpenFGA table permissions
 ```
 
-It requires Docker Compose and `uv`, runs without external credentials, and
-writes `target/iceberg-live/report.json`. See
+Both require Docker Compose and `uv` and run without external credentials. The
+ordinary gate writes `target/iceberg-live/report.json`; the authenticated gate
+writes `target/iceberg-live/auth-report.json`. See
 [test Lakekeeper interoperability](test-lakekeeper-interoperability.md) for
 the pinned versions, checks, and cleanup behavior.
 

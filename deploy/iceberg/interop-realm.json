@@ -1,0 +1,59 @@
+{
+  "realm": "interop",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 1800,
+  "defaultSignatureAlgorithm": "RS256",
+  "clientScopes": [
+    {
+      "name": "catalog-audience",
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "catalog-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "lakekeeper",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "owner",
+      "secret": "${ICEBERG_TEST_PASSWORD}",
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "defaultClientScopes": ["catalog-audience"]
+    },
+    {
+      "clientId": "reader",
+      "secret": "${ICEBERG_TEST_PASSWORD}",
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "defaultClientScopes": ["catalog-audience"]
+    },
+    {
+      "clientId": "short-lived",
+      "secret": "${ICEBERG_TEST_PASSWORD}",
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "defaultClientScopes": ["catalog-audience"],
+      "attributes": {"access.token.lifespan": "10"}
+    },
+    {
+      "clientId": "wrong-audience",
+      "secret": "${ICEBERG_TEST_PASSWORD}",
+      "protocol": "openid-connect",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "defaultClientScopes": []
+    }
+  ]
+}

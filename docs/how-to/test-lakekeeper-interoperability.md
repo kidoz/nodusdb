@@ -44,6 +44,46 @@ The runner handles Ctrl-C and termination with cleanup. A forced kill or Docker
 daemon failure can prevent cleanup; the error identifies the unique Compose
 project for manual removal. It never removes another project's resources.
 
+## Test catalog authentication and table permissions
+
+Run the authenticated variant with:
+
+```sh
+just test-iceberg-auth-live
+```
+
+This runs the same eight interoperability groups through an OIDC-protected
+Lakekeeper catalog, then four security groups. The overlay adds digest-pinned
+Keycloak 26.6.0 and OpenFGA 1.14.0. Keycloak issues signed service-account tokens;
+Lakekeeper validates them against its discovery document and JWKS, and OpenFGA
+evaluates real table grants. No authentication or authorization proxy substitutes
+for the catalog.
+
+Success prints `12/12 checks passed` and writes
+`target/iceberg-live/auth-report.json`. You can also pass `--authenticated` to
+`run.py`, together with `--binary` or `--report`. The report includes the
+authentication mode, provider versions, and hashes of the auth overlay and realm
+configuration. Failures and cleanup status are recorded as in the ordinary gate.
+
+The checks require HTTP 401 for missing, malformed, wrongly signed,
+wrong-audience, and expired tokens. A short-lived token must first work, then
+expire; a newly issued token for the same identity must restore access. The
+expiry wait is bounded and includes the validator's clock-skew allowance.
+
+A reader receives a SELECT grant on one table, reads its exact rows, and is
+denied a second table that the owner can read. Removing the grant must revoke
+access. Permission failures must be HTTP 403 or 404; transport errors and 5xx
+responses cannot pass as denials. Every failed CLI scan must leave no output or
+temporary file. CLI output, service logs, and the final JSON report are checked
+for credentials and JWTs.
+
+Client secrets are generated per run and injected into the imported realm using
+Keycloak environment placeholders. The checked-in realm contains no secret.
+OpenFGA uses a disposable in-memory datastore. Its port is internal; published
+catalog, object-store, and token endpoints bind only to loopback. This setup
+tests OIDC and catalog permissions over local HTTP. TLS, token refresh, and
+production identity-provider deployment remain outside this gate.
+
 ## Check coverage
 
 | Check | Required behavior |
@@ -73,11 +113,12 @@ the existing source-pinned `deploy/docker/minio.Dockerfile`. Python dependencies
 are locked in `tools/testing/iceberg/uv.lock`, including PyIceberg 0.12.0 and
 PyArrow 26.0.0. No Python dependency enters the NodusDB runtime.
 
-The stack deliberately has no catalog identity provider. It verifies actual S3
-signature validation and downscoped temporary credentials, **not catalog OIDC or
-RBAC**, TLS, real AWS, Polaris, large-table performance, or production readiness.
-Passwords are generated per run and storage credentials remain in temporary
-process memory or private files that are removed after the run.
+The ordinary stack has no catalog identity provider; the authenticated overlay
+adds the OIDC and OpenFGA checks above. Both modes verify actual S3 signatures and
+downscoped temporary credentials. TLS, real AWS, Polaris, large-table performance,
+and production readiness remain unverified. Passwords are generated per run and
+credentials remain in temporary process memory, private files, or disposable
+service containers that are removed after the run.
 
 Lakekeeper contacts storage through `http://minio:9000`. Host clients use its
 published loopback endpoint. The PyIceberg adapter changes only that endpoint;
@@ -86,8 +127,8 @@ manifests or REST responses. For this release, catalog discovery uses the
 warehouse **name** (`interop`), while Lakekeeper returns its UUID as the REST
 namespace prefix.
 
-CI runs this gate in the `Live Lakekeeper interoperability` job and uploads its
-JSON report, including on failure. The fast protocol fixtures remain covered by
+CI runs both variants in the `Live Lakekeeper interoperability` job and uploads
+their JSON reports, including on failure. The fast protocol fixtures remain covered by
 the ordinary optional-feature test job.
 
 The harness itself has checks against false passes:
@@ -101,3 +142,7 @@ UV_PROJECT_ENVIRONMENT="$PWD/target/iceberg-venv" \
 For upstream setup details, see the pinned
 [Lakekeeper example](https://github.com/lakekeeper/lakekeeper/tree/v0.14.2/examples/minimal)
 and [PyIceberg implementation](https://github.com/apache/iceberg-python/tree/pyiceberg-0.12.0).
+The authentication setup follows Lakekeeper's pinned
+[Keycloak overlay](https://github.com/lakekeeper/lakekeeper/blob/v0.14.2/docker-compose/keycloak-overlay.yaml)
+and [OpenFGA overlay](https://github.com/lakekeeper/lakekeeper/blob/v0.14.2/docker-compose/openfga-overlay.yaml),
+with realm secrets supplied through [Keycloak placeholders](https://www.keycloak.org/server/importExport#_using_environment_variables_within_the_realm_configuration_files).

@@ -1,0 +1,52 @@
+# Overlay for the disposable OIDC/OpenFGA interoperability gate.
+services:
+  lakekeeper:
+    environment:
+      LAKEKEEPER__OPENID_PROVIDER_URI: http://keycloak:8080/realms/interop
+      LAKEKEEPER__OPENID_AUDIENCE: lakekeeper
+      LAKEKEEPER__AUTHZ_BACKEND: openfga
+      LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      openfga:
+        condition: service_healthy
+
+  migrate:
+    environment:
+      LAKEKEEPER__AUTHZ_BACKEND: openfga
+      LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
+    depends_on:
+      openfga:
+        condition: service_healthy
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.6.0@sha256:b0e5dbced1775de4d629f103c0a9cfc057decc62ce8d3cb1c54f8849a6c6eb62
+    command: [start-dev, --import-realm, --hostname=http://keycloak:8080]
+    environment:
+      ICEBERG_TEST_PASSWORD: ${ICEBERG_TEST_PASSWORD:?run the test runner}
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./interop-realm.json:/opt/keycloak/data/import/interop-realm.json:ro
+    ports:
+      - 127.0.0.1::8080
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'exec 3<>/dev/tcp/127.0.0.1/9000; printf "GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; read -r status <&3; [[ "$$status" == *"200"* ]]'
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 10s
+
+  openfga:
+    image: openfga/openfga:v1.14.0@sha256:f0d5591d7ddda326ac4b84dbc9d9192cb13e97f79957749006ef0774b0d818f6
+    command: [run, --datastore-engine, memory]
+    environment:
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_LOG_LEVEL: warn
+    healthcheck:
+      test: [CMD, /usr/local/bin/grpc_health_probe, -addr=127.0.0.1:8081]
+      interval: 2s
+      timeout: 5s
+      retries: 60

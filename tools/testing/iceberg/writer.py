@@ -33,9 +33,10 @@ class HostCatalog(RestCatalog):
     The protected method is deliberately tied to the pinned PyIceberg version.
     """
 
-    def __init__(self, uri, endpoint):
+    def __init__(self, uri, endpoint, token=None):
         self.host_endpoint = endpoint
-        super().__init__("interop", uri=uri, warehouse="interop")
+        auth = {"token": token} if token is not None else {}
+        super().__init__("interop", uri=uri, warehouse="interop", **auth)
 
     def _load_file_io(self, properties=None, location=None):
         return load_file_io(

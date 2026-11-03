@@ -4,11 +4,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pyarrow as pa
 
 from run import Gate, check_table, logical_type
+from auth import AuthChecks, assert_redacted, safe_detail
 
 
 class ResultChecks(unittest.TestCase):
@@ -81,6 +82,64 @@ class FailedScanChecks(unittest.TestCase):
             )
             with self.assertRaises(AssertionError):
                 gate.scan("failed", error="expected-error")
+
+
+class AuthEvidenceChecks(unittest.TestCase):
+    def test_disclosure_checks_cover_known_secrets_and_unknown_jwts(self):
+        for output, credentials in [
+            ("credential=synthetic-secret", ["synthetic-secret"]),
+            ('{"token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature"}', []),
+        ]:
+            with self.subTest(output_type=bool(credentials)):
+                with self.assertRaises(AssertionError):
+                    assert_redacted(output, credentials)
+        assert_redacted('{"checks":[],"status":"passed"}', ["synthetic-secret"])
+
+    def test_report_failure_details_do_not_serialize_credentials(self):
+        self.assertEqual(
+            safe_detail(AssertionError("echo synthetic-secret"), ["synthetic-secret"]),
+            "failure detail redacted",
+        )
+        self.assertIsNone(safe_detail(RuntimeError("synthetic-secret"), []))
+        self.assertEqual(
+            safe_detail(AssertionError("safe failure"), []), "safe failure"
+        )
+
+    def test_permission_denial_requires_an_expected_http_status(self):
+        gate = AuthChecks()
+        gate.catalog_response = Mock(return_value=(500, None))
+        with self.assertRaises(AssertionError):
+            gate.require_status("table", "token", {403, 404})
+        gate.catalog_response.return_value = (200, {})
+        with self.assertRaises(AssertionError):
+            gate.require_status("config", None, {401})
+
+    def test_token_override_preserves_admin_separation(self):
+        gate = object.__new__(Gate)
+        gate.stack = Mock(url="http://localhost", secrets=["catalog-owner-token"])
+        gate.binary = "nodus_cli"
+        gate.storage = "storage.json"
+        gate.credentials = []
+        gate.env = {
+            "NODUS_ICEBERG_TOKEN": "catalog-owner-token",
+            "NODUS_ADMIN_TOKEN": "admin-token",
+        }
+        failed = subprocess.CompletedProcess([], 1, "", "failure")
+        with patch("run.command", return_value=failed) as command:
+            gate.invoke("inspect", token=None)
+            env = command.call_args.kwargs["env"]
+            self.assertNotIn("NODUS_ICEBERG_TOKEN", env)
+            self.assertEqual(env["NODUS_ADMIN_TOKEN"], "admin-token")
+            gate.invoke("inspect", token="reader-token")
+            self.assertEqual(
+                command.call_args.kwargs["env"]["NODUS_ICEBERG_TOKEN"], "reader-token"
+            )
+            gate.invoke("inspect")
+            self.assertEqual(
+                command.call_args.kwargs["env"]["NODUS_ICEBERG_TOKEN"],
+                "catalog-owner-token",
+            )
+        self.assertEqual(gate.env["NODUS_ICEBERG_TOKEN"], "catalog-owner-token")
 
 
 if __name__ == "__main__":

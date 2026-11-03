@@ -20,7 +20,8 @@ import pyarrow as pa
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import LongType, StringType
 
-from stack import COMPOSE, ROOT, Stack, command
+from auth import AUTH_CHECKS, INHERIT_TOKEN, AuthChecks, assert_redacted, safe_detail
+from stack import AUTH_COMPOSE, COMPOSE, REALM, ROOT, Stack, command
 from writer import HostCatalog, add_position_delete
 
 
@@ -90,7 +91,9 @@ def check_table(actual, expected):
         )
 
 
-class Gate:
+class Gate(AuthChecks):
+    check_table = staticmethod(check_table)
+
     def __init__(self, stack, binary, directory):
         self.stack = stack
         self.binary = binary
@@ -109,6 +112,8 @@ class Gate:
                 "NODUS_ADMIN_TOKEN": "must-not-be-used-for-iceberg",
             }
         )
+        if stack.admin_token is not None:
+            self.env["NODUS_ICEBERG_TOKEN"] = stack.admin_token
         self.s3 = boto3.client(
             "s3",
             endpoint_url=stack.s3_url,
@@ -117,7 +122,9 @@ class Gate:
             aws_secret_access_key=stack.password,
         )
         stack.create_warehouse(self.s3)
-        self.catalog = HostCatalog(stack.url + "/catalog", stack.s3_url)
+        self.catalog = HostCatalog(
+            stack.url + "/catalog", stack.s3_url, stack.admin_token
+        )
         self.catalog.create_namespace("interop")
         self.properties = {"s3.endpoint": stack.s3_url, "s3.allow-http": "true"}
         self.storage = self.write_properties("storage.json", self.properties)
@@ -130,7 +137,9 @@ class Gate:
             json.dump(properties, stream)
         return path
 
-    def invoke(self, operation, table="events", *extra, storage=None):
+    def invoke(
+        self, operation, table="events", *extra, storage=None, token=INHERIT_TOKEN
+    ):
         args = [
             self.binary,
             "iceberg",
@@ -149,18 +158,25 @@ class Gate:
             "20",
             *extra,
         ]
-        result = command(args, env=self.env, check=False, timeout=30)
-        for secret in [self.stack.password, *self.credentials]:
-            assert secret not in result.stdout + result.stderr, (
-                "CLI disclosed a storage credential"
-            )
+        env = self.env.copy()
+        if token is not INHERIT_TOKEN:
+            env.pop("NODUS_ICEBERG_TOKEN", None)
+            if token is not None:
+                env["NODUS_ICEBERG_TOKEN"] = token
+        result = command(args, env=env, check=False, timeout=30)
+        assert_redacted(
+            result.stdout + result.stderr, self.stack.secrets + self.credentials
+        )
         return result
 
-    def scan(self, name, table="events", *extra, storage=None, error=None):
+    def scan(
+        self, name, table="events", *extra, storage=None, error=None,
+        token=INHERIT_TOKEN,
+    ):
         output = self.directory / (name + ".arrow")
         before = set(self.directory.iterdir())
         result = self.invoke(
-            "scan", table, "--output", str(output), *extra, storage=storage
+            "scan", table, "--output", str(output), *extra, storage=storage, token=token
         )
         if error is not None:
             assert result.returncode != 0, "expected read failure succeeded"
@@ -418,13 +434,19 @@ CHECKS = [
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--authenticated", action="store_true",
+        help="enable Keycloak and OpenFGA checks",
+    )
     if not __debug__:
         parser.error("run without Python optimization; assertions are part of this gate")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/nodus_cli")
-    parser.add_argument(
-        "--report", type=Path, default=ROOT / "target/iceberg-live/report.json"
-    )
+    parser.add_argument("--report", type=Path)
     args = parser.parse_args()
+    if args.report is None:
+        name = "auth-report.json" if args.authenticated else "report.json"
+        args.report = ROOT / "target/iceberg-live" / name
+    checks = CHECKS + AUTH_CHECKS if args.authenticated else CHECKS
     binary = args.binary.resolve()
     if not binary.is_file():
         parser.error("build nodus_cli with --features iceberg first")
@@ -434,6 +456,7 @@ def main():
         "version": 1,
         "status": "failed",
         "lakekeeper": "0.14.2",
+        "authenticated": args.authenticated,
         "pyiceberg": "0.12.0",
         "pyarrow": pa.__version__,
         "python": sys.version.split()[0],
@@ -445,9 +468,20 @@ def main():
         "checks": [],
         "cleanup": "not_started",
     }
+    if args.authenticated:
+        report.update(
+            {
+                "keycloak": "26.6.0", "openfga": "1.14.0",
+                "auth_compose_sha256": hashlib.sha256(
+                    AUTH_COMPOSE.read_bytes()
+                ).hexdigest(),
+                "realm_sha256": hashlib.sha256(REALM.read_bytes()).hexdigest(),
+            }
+        )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n")
-    stack = Stack()
+    stack = Stack(authenticated=args.authenticated)
+    gate = None
     phase = "startup"
 
     def interrupted(*_):
@@ -459,7 +493,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="nodus-iceberg-") as directory:
             phase = "bootstrap_writer"
             gate = Gate(stack, binary, Path(directory))
-            for phase in CHECKS:
+            for phase in checks:
                 started = time.monotonic()
                 getattr(gate, phase)()
                 report["checks"].append(
@@ -474,8 +508,9 @@ def main():
     except (Exception, KeyboardInterrupt) as error:
         # External error text can include temporary tokens or request bodies.
         report["failure"] = {"phase": phase, "type": type(error).__name__}
-        if isinstance(error, AssertionError):
-            report["failure"]["detail"] = str(error)
+        detail = safe_detail(error, stack.secrets + (gate.credentials if gate else []))
+        if detail is not None:
+            report["failure"]["detail"] = detail
         print(f"FAIL {phase}: {type(error).__name__}", file=sys.stderr)
     finally:
         try:
@@ -488,9 +523,11 @@ def main():
                 f"Cleanup failed; remove Compose project {stack.project}",
                 file=sys.stderr,
             )
-        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        encoded = json.dumps(report, indent=2) + "\n"
+        assert_redacted(encoded, stack.secrets + (gate.credentials if gate else []))
+        args.report.write_text(encoded)
     print(
-        f"{len(report['checks'])}/{len(CHECKS)} checks passed; report: {args.report}",
+        f"{len(report['checks'])}/{len(checks)} checks passed; report: {args.report}",
         flush=True,
     )
     return 0 if report["status"] == "passed" else 1

@@ -44,6 +44,12 @@ test-iceberg-live:
     UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
     UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py
 
+# Run the real OIDC and table-permission Iceberg gate
+test-iceberg-auth-live:
+    cargo build -p nodus_cli --features iceberg --locked
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py --authenticated
+
 # Run crash and fault-injection tests
 test-fault:
     cargo test -p nodus_fault_tests

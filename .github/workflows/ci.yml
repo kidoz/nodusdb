@@ -69,12 +69,14 @@ jobs:
         run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
       - name: Read PyIceberg tables through Lakekeeper and MinIO
         run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py
+      - name: Verify catalog OIDC and table permissions through Keycloak and OpenFGA
+        run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py --authenticated
       - name: Upload interoperability evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: iceberg-live-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/iceberg-live/report.json
+          path: target/iceberg-live/*report.json
           if-no-files-found: warn
           retention-days: 14
 

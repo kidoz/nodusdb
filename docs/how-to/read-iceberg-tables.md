@@ -159,8 +159,10 @@ request shape, not AWS signature cryptography.
 The separate [live Lakekeeper gate](test-lakekeeper-interoperability.md), run with
 `just test-iceberg-live`, uses pinned Lakekeeper and MinIO services plus an
 independent PyIceberg writer. It verifies schema/partition evolution, temporary
-storage credentials, and read/failure behavior against real services. Catalog
-OIDC/RBAC, Polaris, real AWS, and large-table performance remain unverified.
+storage credentials, and read/failure behavior against real services. Its
+authenticated variant, `just test-iceberg-auth-live`, adds Keycloak OIDC and
+OpenFGA table grants, revocation, token expiry, and credential-redaction checks.
+TLS, Polaris, real AWS, and large-table performance remain unverified.
 
 See the [official Rust implementation](https://github.com/apache/iceberg-rust)
 and [Iceberg REST specification](https://iceberg.apache.org/rest-catalog-spec/)
