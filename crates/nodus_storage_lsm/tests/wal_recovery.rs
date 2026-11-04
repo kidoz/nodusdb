@@ -3,6 +3,7 @@ use nodus_storage_api::{KvEngine, TxnId};
 use nodus_storage_lsm::LsmKvEngine;
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn directory_image(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -103,6 +104,18 @@ fn authentication_failure_in_predecessor_segment_rejects_startup_without_truncat
             .unwrap();
         other.sync().unwrap();
     }
+    // A repairable active tail must stay intact when an older required
+    // segment fails authentication later in the preflight walk.
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("MANIFEST")).unwrap()).unwrap();
+    let active = meta["active_wal"].as_u64().unwrap();
+    let mut tail = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(format!("{active}.log")))
+        .unwrap();
+    tail.write_all(&[1, 2, 3]).unwrap();
+    tail.sync_all().unwrap();
+    drop(tail);
     let image = directory_image(dir.path());
     let result = LsmKvEngine::with_wal(dir.path(), key);
     assert_eq!(directory_image(dir.path()), image);

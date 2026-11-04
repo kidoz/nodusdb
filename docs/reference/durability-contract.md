@@ -50,6 +50,10 @@ is what the commit-acknowledgement ordering rests on.
 | Unknown valid-frame WAL and Raft log records fail recovery rather than being skipped | `nodus_storage_wal`: `recover_rejects_a_newer_record_version`, `recover_rejects_undecodable_supported_version_payloads`; `nodus_raftstore`: `store_construction_fails_closed_on_unknown_log_envelope`, `store_construction_fails_closed_on_malformed_log_entry_json` |
 | Incorrect or missing WAL encryption keys, short encrypted payloads, and undecodable legacy records reject recovery without changing the segment | `nodus_storage_wal`: `incorrect_encryption_configuration_preserves_wal_bytes`, `authentication_failure_after_valid_prefix_preserves_entire_wal`, `complete_frames_with_short_encrypted_payloads_are_not_truncated`, `undecodable_legacy_frames_are_not_skipped_or_truncated` |
 | Wrong/missing-key LSM startup and predecessor authentication failure preserve intact files; retries recover acknowledged commits across rotation and exclude aborts | `nodus_storage_lsm`, integration test `wal_recovery`: `failed_encrypted_startup_preserves_files_and_correct_key_recovers_commits`, `authentication_failure_in_predecessor_segment_rejects_startup_without_truncation` |
+| Missing active/middle/root WALs, invalid links or headers, and invalid recovery bounds reject startup without changing files; restoring missing WALs recovers committed rows | `nodus_storage_lsm`, integration test `wal_chain`: `missing_active_middle_or_root_wal_rejects_startup_and_restores_commits`, `malformed_segment_headers_and_links_reject_without_modifying_files`, `invalid_manifest_wal_ids_and_floor_fail_without_creating_files`, `dangling_active_wal_symlink_cannot_create_its_target` (Unix) |
+| Chain validation precedes all tail repair; reclaimed predecessors below the replay floor and unpublished WALs remain unnecessary | `nodus_storage_lsm`, integration test `wal_chain`: `missing_predecessor_does_not_repair_active_tail_until_chain_is_valid`, `replay_floor_allows_reclaimed_predecessors_and_ignores_orphan_wals`; `wal_recovery`: `authentication_failure_in_predecessor_segment_rejects_startup_without_truncation` |
+| WAL scanning is read-only, deferred repair refuses a changed length, and existing-file opens do not create missing WALs | `nodus_storage_wal`: `scan_defers_tail_repair_until_explicitly_requested`, `deferred_tail_repair_refuses_a_changed_file_length`, `open_existing_never_creates_a_missing_wal_and_preserves_append_support` |
+| Restart reserves orphan file ids without adopting their contents; new WAL creation cannot append to existing segments and file ids cannot wrap | `nodus_storage_lsm`, integration test `wal_chain`: `restart_reserves_orphan_ids_without_reading_or_reusing_their_files`; `nodus_storage_lsm`: `file_id_exhaustion_never_wraps_into_existing_ids`; `nodus_storage_wal`: `exclusive_creation_never_appends_to_an_existing_segment` |
 | Incomplete encrypted tails are repaired at every byte boundary, and later appends survive reopen | `nodus_storage_wal`: `encrypted_incomplete_tail_is_repaired_before_later_appends` |
 | WAL segment power cut keeps exactly the fsynced prefix; garbled or flipped tails are rejected | `nodus_storage_wal`: `power_cut_preserves_exactly_the_synced_prefix`, `power_cut_with_garbled_tail_recovers_the_synced_prefix` |
 | Power cut on either side of the flush's manifest rename (old or new manifest, orphan files present or lost, never a hybrid) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_flush_publishes_old_or_new_manifest` |
@@ -124,6 +128,50 @@ executor batch. Outside an explicit transaction, that batch is one autocommit
 transaction: a late decoding, planning, or constraint failure rolls back rows
 from every chunk. Inside an existing user transaction, COPY joins that
 transaction and leaves commit or rollback ownership with the user.
+
+## Required WAL chain
+
+For an existing manifest, the active WAL must already exist. Startup does not
+create an empty replacement if it is missing, including when a dangling symlink
+names a missing target. Missing required predecessors fail recovery too. Errors
+identify the failing WAL or manifest and preserve all files during validation.
+Restore the matching missing segment from a verified source or restore a
+consistent backup; do not manufacture an empty log to bypass the error.
+
+Startup scans the complete required chain read-only before opening the active
+WAL for append or repairing any tail. Active ids are positive, file-id arithmetic
+must not overflow, and the replay floor cannot exceed the active id. A segment
+header, when present, must be its first and only header. Predecessor ids must be
+positive and strictly decrease; cycles, forward/self links, premature roots and
+links that skip a positive required replay floor are errors.
+
+A positive `min_replay_wal` names the oldest required segment, inclusive. Each
+required segment must have its header, including the floor segment, and the
+chain must reach that exact id. Its predecessor may be below the floor and need
+not exist, so legitimate archived-WAL reclamation remains supported. With floor
+zero (including older manifests without the field), recovery follows declared
+links to a root. Headerless roots and explicit headers with no predecessor remain
+supported. Unpublished WALs outside this chain are not read or replayed. Their
+numeric filenames, and numeric final/partial SSTable filenames, reserve file ids
+so restart cannot reuse an orphan output. New WALs are created exclusively;
+allocation fails instead of wrapping ids or appending a second segment header
+to an existing file. Strict validation can reject malformed WALs that older
+binaries accepted; restore a verified copy/backup rather than editing headers
+or using legacy migration to bypass that error.
+
+Only after every required segment and link passes validation may recovery
+truncate incomplete or checksum-failing tails and replay records from oldest to
+newest. A later missing/undecodable/unauthentic segment therefore cannot cause
+an earlier tail to be changed. The scan's repair plan refuses changed file
+lengths and never creates files. Tail-repair I/O errors can still leave an
+uncertain repair outcome; repairs across multiple files are not transactional.
+Exclude all concurrent writers and filesystem changes throughout startup:
+the plan is not an inter-process lock or a check against same-length changes.
+
+This changes no WAL records, manifest fields, or format versions. The existing
+CRC tail policy remains unchanged. Without durable synced-length or format-mode
+metadata, arbitrary deletion at valid record boundaries (including loss of a
+header in an otherwise valid historical-looking root) cannot always be detected.
 
 ## Manifest recovery
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 mod legacy;
+mod recovery;
 pub use legacy::migrate_legacy_manifest;
 #[cfg(test)]
 mod flush_tests;
@@ -363,6 +364,7 @@ impl LsmKvEngine {
                 });
             }
         };
+        let fresh = manifest.is_none();
         let (mut sst_ids, active_wal_id, min_replay_wal): (Vec<u64>, u64, u64) = match manifest {
             Some(m) => (m.sstables, m.active_wal, m.min_replay_wal),
             None => {
@@ -376,16 +378,39 @@ impl LsmKvEngine {
             .iter()
             .map(|id| Sstable::open(path.join(format!("{id}.sst"))))
             .collect();
-        let next = sst_ids
+        let published_max = sst_ids
             .iter()
             .copied()
             .max()
             .unwrap_or(0)
-            .max(active_wal_id)
-            + 1;
+            .max(active_wal_id);
+        let next = recovery::next_file_id(path, published_max)?;
+
+        // Read and validate the complete required chain before opening append
+        // handles or repairing a tail. A missing active segment is never a new
+        // empty store when a published manifest already names it.
+        let scans = if fresh {
+            Vec::new()
+        } else {
+            recovery::scan_chain(path, active_wal_id, min_replay_wal, key)?
+        };
 
         let wal_path = path.join(format!("{active_wal_id}.log"));
-        let wal = Arc::new(FileWalEngine::with_encryption(&wal_path, key)?);
+        let wal = Arc::new(
+            if fresh {
+                FileWalEngine::create_new(&wal_path, key)
+            } else {
+                FileWalEngine::open_existing(&wal_path, key)
+            }
+            .with_context(|| format!("opening active WAL {}", wal_path.display()))?,
+        );
+        let segments = scans
+            .into_iter()
+            .map(|scan| {
+                scan.repair_tail()?;
+                Ok(scan.into_records())
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let engine = Self {
             snapshot_gate: RwLock::new(()),
@@ -412,7 +437,7 @@ impl LsmKvEngine {
             telemetry_observer: OnceLock::new(),
         };
 
-        engine.recover()?;
+        engine.replay(segments);
         // Recompute the memtable size from what the WAL replay restored, and make
         // sure a manifest exists (writes the initial one for fresh dirs).
         let restored = engine
@@ -430,6 +455,22 @@ impl LsmKvEngine {
     /// Path of the manifest file, when persistent.
     fn manifest_path(&self) -> Option<PathBuf> {
         self.data_dir.as_ref().map(|d| d.join(MANIFEST_FILE))
+    }
+
+    fn allocate_file_id(&self) -> Result<u64> {
+        loop {
+            let id = self.next_file_id.load(Ordering::SeqCst);
+            let next = id
+                .checked_add(1)
+                .context("LSM file id space exhausted; refusing counter wraparound")?;
+            if self
+                .next_file_id
+                .compare_exchange(id, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(id);
+            }
+        }
     }
 
     /// Atomically persists the current file set (live SSTables + active WAL).
@@ -527,7 +568,7 @@ impl LsmKvEngine {
             } else {
                 // Build a complete file, still an orphan until the manifest
                 // names it. WAL creation below can fail independently.
-                let sst_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+                let sst_id = self.allocate_file_id()?;
                 let sst_path = dir.join(format!("{sst_id}.sst"));
                 Some(Sstable::build(&sst_path, &to_flush).with_context(|| {
                     format!("failed to build flush SSTable {}", sst_path.display())
@@ -538,10 +579,10 @@ impl LsmKvEngine {
             // backup WAL-archiver / PITR. The manifest swap below makes the new
             // file set durable (recovery reads the manifest, not file names).
             let predecessor = self.active_wal_id.load(Ordering::Relaxed);
-            let wal_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+            let wal_id = self.allocate_file_id()?;
             let wal_path = dir.join(format!("{wal_id}.log"));
             let new_wal = Arc::new(
-                FileWalEngine::with_encryption(&wal_path, self._wal_key).with_context(|| {
+                FileWalEngine::create_new(&wal_path, self._wal_key).with_context(|| {
                     format!("failed to create flush WAL {}", wal_path.display())
                 })?,
             );
@@ -712,7 +753,7 @@ impl LsmKvEngine {
             !chain.versions.is_empty()
         });
 
-        let new_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+        let new_id = self.allocate_file_id()?;
         let new_sst = Sstable::build(dir.join(format!("{new_id}.sst")), &merged)?;
 
         // Atomic swap: install the single compacted SSTable, persist the manifest
@@ -844,54 +885,7 @@ impl LsmKvEngine {
         self.append_pause.release.notify_all();
     }
 
-    fn recover(&self) -> Result<()> {
-        let Some(dir) = self.data_dir.clone() else {
-            return Ok(());
-        };
-        let active = self.active_wal_id.load(Ordering::Relaxed);
-        let floor = self.min_replay_wal.load(Ordering::Relaxed);
-
-        // Walk the WAL-segment lineage backward from the active segment down to
-        // the replay floor, collecting each segment's records. A flush rotates
-        // to a fresh segment but retains keys with uncommitted intents in the
-        // memtable; those intents' `WriteIntent` records live in the *older*
-        // segment while the matching `CommitTxn` lands in a newer one. Replaying
-        // only the active segment (the previous behavior) therefore dropped any
-        // transaction whose intent predated a flush — a committed-data-loss bug.
-        // Replaying the whole lineage oldest→newest reconstructs it correctly;
-        // versions are ordered by commit ts, so re-applying data already flushed
-        // to an SSTable is idempotent (duplicate versions dedup on compaction).
-        let mut segments: Vec<Vec<WalRecord>> = Vec::new();
-        let mut cur = Some(active);
-        let mut visited: HashSet<u64> = HashSet::new();
-        while let Some(id) = cur {
-            if id < floor || !visited.insert(id) {
-                break;
-            }
-            let seg_path = dir.join(format!("{id}.log"));
-            if !seg_path.exists() {
-                break;
-            }
-            // Reuse the already-open active segment; open older segments read-only.
-            let records = if id == active {
-                match self.wal.read().unwrap().as_ref() {
-                    Some(w) => w.recover()?,
-                    None => break,
-                }
-            } else {
-                FileWalEngine::with_encryption(&seg_path, self._wal_key)?.recover()?
-            };
-            // A segment's predecessor is named in its `SegmentHeader` (first
-            // record). The very first segment ever created has none, which ends
-            // the walk.
-            let predecessor = records.iter().find_map(|r| match r {
-                WalRecord::V1(WalRecordV1::SegmentHeader { predecessor }) => *predecessor,
-                _ => None,
-            });
-            segments.push(records);
-            cur = predecessor;
-        }
-
+    fn replay(&self, segments: Vec<Vec<WalRecord>>) {
         {
             let mut mem_guard = self.memtable.write().unwrap();
             let mut int_guard = self.intents.write().unwrap();
@@ -966,7 +960,6 @@ impl LsmKvEngine {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -1520,6 +1513,15 @@ impl KvEngine for LsmKvEngine {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_id_exhaustion_never_wraps_into_existing_ids() {
+        let engine = LsmKvEngine::new();
+        engine.next_file_id.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(engine.allocate_file_id().unwrap(), u64::MAX - 1);
+        assert!(engine.allocate_file_id().is_err());
+        assert_eq!(engine.next_file_id.load(Ordering::Relaxed), u64::MAX);
+    }
 
     /// Commits `key=value` at `ts` in one transaction.
     fn put(engine: &LsmKvEngine, key: &str, value: &str, ts: Timestamp) {

@@ -472,23 +472,19 @@ fn power_cut_around_flush_publishes_old_or_new_manifest() {
     // lags the commit point.
     let post = TempDir::new().unwrap();
     copy_dir(dir.path(), post.path());
-    // Robustness beyond the legitimate states: even if the new segment file
-    // itself were lost, the published SSTable still carries the data.
+    // Losing a WAL already named by the durable manifest is media loss, not a
+    // legitimate pre-publication crash state. Even when this SSTable contains
+    // the known row, recovery must not assume the missing WAL was empty.
     let post_no_wal = TempDir::new().unwrap();
     copy_dir(dir.path(), post_no_wal.path());
     let active = engine.active_wal_id.load(Ordering::Relaxed);
+    let published_wal = std::fs::read(post.path().join(format!("{active}.log"))).unwrap();
     std::fs::remove_file(post_no_wal.path().join(format!("{active}.log"))).unwrap();
     drop(engine);
 
     // Every image is a consistent store holding the acknowledged write, and
     // stays writable after recovery.
-    for image in [
-        pre.path(),
-        pre_no_wal.path(),
-        pre_bare.path(),
-        post.path(),
-        post_no_wal.path(),
-    ] {
+    for image in [pre.path(), pre_no_wal.path(), pre_bare.path(), post.path()] {
         let recovered = LsmKvEngine::with_wal(image, None).unwrap();
         assert_eq!(
             recovered.get(b"stable", 100).unwrap(),
@@ -507,6 +503,35 @@ fn power_cut_around_flush_publishes_old_or_new_manifest() {
             Some(Bytes::from("x"))
         );
     }
+
+    let before: BTreeMap<_, _> = std::fs::read_dir(post_no_wal.path())
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert!(LsmKvEngine::with_wal(post_no_wal.path(), None).is_err());
+    let after: BTreeMap<_, _> = std::fs::read_dir(post_no_wal.path())
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert_eq!(after, before, "missing published WAL must not be recreated");
+    std::fs::write(
+        post_no_wal.path().join(format!("{active}.log")),
+        published_wal,
+    )
+    .unwrap();
+    let restored = LsmKvEngine::with_wal(post_no_wal.path(), None).unwrap();
+    assert_eq!(
+        restored.get(b"stable", 100).unwrap(),
+        Some(Bytes::from("s"))
+    );
 }
 
 /// The checkpoint (`replace_snapshot`) publication has the same commit-point

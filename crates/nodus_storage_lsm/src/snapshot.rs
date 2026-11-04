@@ -136,14 +136,18 @@ impl LsmKvEngine {
             self.memtable_bytes.store(size, Ordering::Relaxed);
             return Ok(());
         };
-        let allocate = || loop {
-            let id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
-            if !dir.join(format!("{id}.sst")).exists() && !dir.join(format!("{id}.log")).exists() {
-                break id;
+        let allocate = || -> Result<u64> {
+            loop {
+                let id = self.allocate_file_id()?;
+                if !dir.join(format!("{id}.sst")).exists()
+                    && !dir.join(format!("{id}.log")).exists()
+                {
+                    break Ok(id);
+                }
             }
         };
-        let sst_id = allocate();
-        let wal_id = allocate();
+        let sst_id = allocate()?;
+        let wal_id = allocate()?;
         // Existing SSTable and WAL formats: old readers can reopen either side
         // of publication. Intents are checkpointed into a fresh WAL, never
         // stranded in immutable SSTables.
@@ -160,7 +164,7 @@ impl LsmKvEngine {
             !chain.versions.is_empty()
         });
         let sst = Sstable::build(dir.join(format!("{sst_id}.sst")), &committed)?;
-        let wal = Arc::new(FileWalEngine::with_encryption(
+        let wal = Arc::new(FileWalEngine::create_new(
             dir.join(format!("{wal_id}.log")),
             self._wal_key,
         )?);

@@ -111,13 +111,19 @@ sizes.
 
 ## Recovery
 
-On startup the engine reads the authoritative manifest and reopens its SSTables.
-It follows the active WAL's predecessor chain back to the manifest's replay
-floor, then replays those segments from oldest to newest. This keeps an intent
-written before rotation paired with its later commit. The catalog then loads
-its state from the store, like any other reader. Fresh directories initialize
-an empty file set; historical pre-manifest directories must migrate before
-normal startup.
+On startup the engine reads the authoritative manifest and scans its required
+WAL chain without changing files. Every required segment must exist; recovery
+cannot assume a missing active log was empty. Headers and predecessor links must
+be consistent, and a positive replay floor must be reached exactly. Segments
+below that floor may already have been reclaimed.
+
+Once the whole chain validates, recovery can repair torn tails and replay
+records from oldest to newest. This keeps an intent written before rotation
+paired with its later commit, and prevents a missing older segment from causing
+changes to a newer log before startup fails. The catalog then loads its state
+from the store, like any other reader. Fresh directories initialize an empty
+file set; historical pre-manifest directories must migrate before normal
+startup. See the [required WAL chain contract](../reference/durability-contract.md#required-wal-chain).
 
 Older WAL segments remain available for backup archiving and point-in-time
 recovery. Local reclamation requires both backup retention and the published
