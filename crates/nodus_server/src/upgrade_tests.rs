@@ -22,12 +22,40 @@ struct Node {
     raft: NodusRaft,
     service: RaftUpgradeCoordinator,
     server: tokio::task::JoinHandle<()>,
+    server_shutdown: axum_server::Handle<std::net::SocketAddr>,
 }
 impl Node {
     async fn stop(self) {
-        self.service.manager.shutdown_all().await;
-        self.server.abort();
-        let _ = self.server.await;
+        let Node {
+            kv,
+            raft,
+            service,
+            mut server,
+            server_shutdown,
+        } = self;
+        service.manager.shutdown_all().await;
+        // Closing the listener alone leaves accepted connections (and their
+        // `RaftState`, which holds the engine) alive. Stop them explicitly so
+        // the storage can actually be released and reopened.
+        server_shutdown.shutdown();
+        if tokio::time::timeout(Duration::from_secs(5), &mut server)
+            .await
+            .is_err()
+        {
+            server.abort();
+            let _ = server.await;
+        }
+        // Detached Raft I/O workers can outlive shutdown; reopening the LSM
+        // before they release it races tail validation against a final append.
+        let old_storage = Arc::downgrade(&kv);
+        drop((kv, raft, service));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while old_storage.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("old Raft storage must be released before reopen");
     }
 }
 async fn node(
@@ -83,6 +111,8 @@ async fn node(
         .await
         .unwrap();
     let tls = crate::load_raft_tls_config(&cluster.tls).unwrap();
+    let server_shutdown = axum_server::Handle::new();
+    let shutdown = server_shutdown.clone();
     let server = tokio::spawn(async move {
         // Match production: mTLS listeners are transport-authenticated; the
         // plain loopback fixture listener opts into unauthenticated access.
@@ -101,6 +131,7 @@ async fn node(
                 axum_server::tls_rustls::RustlsConfig::from_config(cfg),
             )
             .unwrap()
+            .handle(shutdown)
             .serve(app.into_make_service())
             .await
             .unwrap();
@@ -119,6 +150,7 @@ async fn node(
         raft,
         service,
         server,
+        server_shutdown,
     }
 }
 async fn wait_leader(nodes: &[Node]) -> usize {

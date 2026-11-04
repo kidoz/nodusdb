@@ -569,7 +569,18 @@ async fn exercise_learner_snapshot(mvcc: bool) {
         server.abort();
         let _ = server.await;
     }
+    // Core shutdown/HTTP cancellation can precede detached Raft I/O workers
+    // releasing their storage. Reopen only after the old engine is gone;
+    // otherwise this fixture races tail validation against a final append.
+    let old_storage = Arc::downgrade(&engines[1]);
     drop((rafts, stores, engines));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while old_storage.strong_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old Raft storage must be released before reopen");
     let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("kv-2"), None).unwrap());
     let group = Arc::new(NamespacedKvEngine::new(kv.clone(), "shard-a"));
     assert_eq!(
