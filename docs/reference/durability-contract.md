@@ -59,7 +59,10 @@ is what the commit-acknowledgement ordering rests on.
 | Orphan SSTable absent from the manifest (crash before swap) | `nodus_storage_lsm`: `orphan_sstable_not_in_manifest_is_ignored` |
 | Corrupt or torn existing manifest rejects startup without replacing it | `nodus_storage_lsm`: `corrupt_manifest_rejects_startup_without_replacing_manifest` |
 | Manifest decoding/read failures preserve every file, reject orphan adoption, and recover WAL-only commits after repair | `nodus_storage_lsm`, integration test `manifest_recovery`: `corrupt_manifest_rejects_orphans_and_preserves_wal_only_commits`, `unreadable_manifest_rejects_startup_before_creating_files`, `dangling_manifest_symlink_is_not_a_missing_legacy_manifest` (Unix) |
-| Fresh stores, pre-manifest SSTable/WAL layouts, and older manifests without a replay floor remain readable | `nodus_storage_lsm`, integration test `manifest_recovery`: `absent_manifest_initializes_empty_and_new_directories`, `pre_manifest_layout_recovers_and_publishes_authoritative_manifest`, `legacy_manifest_without_replay_floor_recovers_cross_segment_commits` |
+| Fresh stores initialize, pre-manifest layouts migrate explicitly, and older manifests without a replay floor remain readable | `nodus_storage_lsm`, integration test `manifest_recovery`: `absent_manifest_initializes_empty_and_new_directories`, `pre_manifest_layout_recovers_and_publishes_authoritative_manifest`, `legacy_manifest_without_replay_floor_recovers_cross_segment_commits` |
+| Missing manifest after writes, flush, compaction, or snapshot install preserves files and rejects startup; restoring the correct manifest recovers rows and snapshot metadata | `nodus_storage_lsm`, integration test `manifest_recovery`: `missing_manifest_after_writes_flush_compaction_or_snapshot_is_not_fresh`, `missing_manifest_with_only_partial_storage_files_is_not_fresh` |
+| Explicit legacy migration validates files without repair, rejects modern WALs and ambiguous inventories, and preserves data on validation failures | `nodus_storage_lsm`, integration test `legacy_migration`: `explicit_migration_validates_plaintext_and_encrypted_legacy_stores`, `migration_validation_failures_preserve_every_file`, `wrong_or_missing_migration_key_preserves_encrypted_wal`, `migration_refuses_symlinked_data_files` (Unix) |
+| Legacy manifest publication cannot overwrite a concurrent manifest; abrupt exit leaves no manifest or a complete one | `nodus_storage_lsm`: `legacy::tests::publication_does_not_overwrite_a_manifest_created_after_validation`, `abrupt_exit_around_publication_leaves_missing_or_complete_manifest` (process exit, not power loss) |
 | Flush mid-transaction strands an intent | `nodus_storage_lsm`: `flush_retains_uncommitted_intents` |
 | Archive cleanup while a commit spans WAL segments | `nodus_storage_lsm`: `archived_wal_reclamation_preserves_cross_segment_commits` |
 | Cleanup after an unpublished or corrupt manifest | `nodus_storage_lsm`: `wal_reclamation_uses_published_manifest_and_fails_closed` |
@@ -137,14 +140,39 @@ bypass the error. With the correct manifest restored, recovery uses its file set
 and replays the required WAL lineage, including commits not yet flushed into an
 SSTable. This change introduces no new manifest fields or durable format.
 
-Only an absent manifest enables fresh-directory initialization or historical
-pre-manifest discovery: numeric `*.sst` files are loaded, `*.sst.tmp` files are
-ignored, and the active WAL is `max_sst_id + 1` (or `1.log` without SSTables).
-A manifest is published after successful recovery. Older manifests lacking
-`min_replay_wal` still default to replay floor zero. The compatibility discovery
-path cannot distinguish a genuine pre-manifest layout from a modern store whose
-manifest was removed; safe automatic reconstruction of a lost manifest is not
-provided.
+An absent manifest permits initialization only when no storage artifacts exist.
+Numeric WAL files, final or partial SSTables, and manifest publication residue
+reject startup without creating a replacement manifest or repairing a WAL.
+Unrelated files and subdirectories do not count as LSM storage artifacts.
+Even an empty existing `1.log` requires explicit handling: it could be residue
+from interrupted initialization. Older manifests lacking `min_replay_wal` still
+default to replay floor zero. The on-disk format is unchanged.
+
+Automatic pre-manifest discovery is removed. For a verified historical layout,
+use the [offline legacy migration procedure](../how-to/migrate-legacy-storage.md).
+The operator explicitly names every final SSTable and the active WAL; all final
+SSTables must be listed, the active WAL must be `max_sst_id + 1` (or `1.log`
+without SSTables), and it must already exist. Every numeric WAL is inspected
+read-only. Incomplete/checksum-failing frames, authentication/decoding failures,
+modern segment headers or commit batches, symlinked data files, and manifest
+publication residue reject migration before any writes. SSTable iteration and
+indexed lookup must validate. Partial `*.sst.tmp` files remain untouched and
+are excluded from the manifest.
+
+Only after validation does migration write and sync `LEGACY_MANIFEST.tmp`,
+publish it through a no-overwrite hard link to `MANIFEST`, sync the directory,
+then remove the staging link and sync again. Validation failures preserve every
+file. Publication I/O failures or process exit can leave a staging file or a
+complete manifest; no existing manifest is replaced. This requires a filesystem
+supporting hard links and directory sync. Stop the node and exclude all writers:
+the offline command does not provide inter-process locking. Filesystem access
+controls authorize this local operation; no HTTP admin token is used.
+
+This procedure does not reconstruct a lost modern manifest or prove that a
+caller-supplied historical inventory contains all committed data. Modern WAL
+markers are rejected, but an unrotated modern WAL can be indistinguishable from
+a historical one. Use deployment provenance to establish a genuine legacy
+store, and restore a consistent manifest/backup for modern manifest loss.
 
 ## Local WAL archive cleanup
 

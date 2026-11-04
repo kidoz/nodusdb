@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+mod legacy;
+pub use legacy::migrate_legacy_manifest;
 #[cfg(test)]
 mod flush_tests;
 #[cfg(test)]
@@ -327,9 +329,9 @@ impl LsmKvEngine {
     /// Opens a persistent store, recovering its published files and WAL.
     ///
     /// An existing manifest must be readable and decodable before any WAL is
-    /// opened or repaired. Only an absent manifest enables fresh-directory or
-    /// historical pre-manifest discovery (SSTable N, active WAL N+1). Do not
-    /// delete an unreadable manifest to force that compatibility path.
+    /// opened or repaired. An absent manifest permits initialization only when
+    /// no storage artifacts exist. Historical pre-manifest stores require
+    /// explicit offline [`migrate_legacy_manifest`] before normal startup.
     pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
         let path = data_dir.as_ref();
         std::fs::create_dir_all(path)?;
@@ -364,24 +366,8 @@ impl LsmKvEngine {
         let (mut sst_ids, active_wal_id, min_replay_wal): (Vec<u64>, u64, u64) = match manifest {
             Some(m) => (m.sstables, m.active_wal, m.min_replay_wal),
             None => {
-                let mut ids = Vec::new();
-                let mut max_id = 0;
-                for entry in std::fs::read_dir(path)? {
-                    let p = entry?.path();
-                    // Historical discovery considers numeric `*.sst` files;
-                    // partial `*.sst.tmp` files are ignored. There is no
-                    // authoritative orphan distinction without a manifest.
-                    if p.extension().and_then(|s| s.to_str()) == Some("sst")
-                        && let Some(name) = p.file_stem().and_then(|n| n.to_str())
-                        && let Ok(id) = name.parse::<u64>()
-                    {
-                        max_id = std::cmp::max(max_id, id);
-                        ids.push(id);
-                    }
-                }
-                // Pre-manifest naming used active WAL max_sst_id + 1.
-                // Replay its available lineage without a persisted floor.
-                (ids, max_id + 1, 0)
+                legacy::ensure_fresh_directory(path)?;
+                (Vec::new(), 1, 0)
             }
         };
 
@@ -428,7 +414,7 @@ impl LsmKvEngine {
 
         engine.recover()?;
         // Recompute the memtable size from what the WAL replay restored, and make
-        // sure a manifest exists (writes the initial one for legacy/fresh dirs).
+        // sure a manifest exists (writes the initial one for fresh dirs).
         let restored = engine
             .memtable
             .read()

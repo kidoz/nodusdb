@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use nodus_mvcc::VersionChain;
-use nodus_storage_api::{KeyRange, KvEngine, TxnId};
-use nodus_storage_lsm::{LsmKvEngine, sstable::Sstable};
+use nodus_storage_api::{KeyRange, KvEngine, SnapshotRow, SnapshotScope, TxnId};
+use nodus_storage_lsm::{LsmKvEngine, migrate_legacy_manifest, sstable::Sstable};
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -239,6 +239,8 @@ fn pre_manifest_layout_recovers_and_publishes_authoritative_manifest() {
     }
     std::fs::write(dir.path().join("99.sst.tmp"), b"unpublished partial file").unwrap();
     let original = directory_image(dir.path());
+    rejected_without_changes(dir.path(), "missing");
+    migrate_legacy_manifest(dir.path(), &[1], 2, None).unwrap();
     let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
     assert_eq!(
         engine.get(b"sst", 30).unwrap(),
@@ -276,4 +278,107 @@ fn legacy_manifest_without_replay_floor_recovers_cross_segment_commits() {
     )
     .unwrap();
     assert_rows(&LsmKvEngine::with_wal(dir.path(), None).unwrap());
+}
+
+#[test]
+fn missing_manifest_after_writes_flush_compaction_or_snapshot_is_not_fresh() {
+    for stage in ["wal-only", "flush", "compaction", "snapshot"] {
+        let dir = tempfile::tempdir().unwrap();
+        let expected_key = if stage == "snapshot" {
+            "installed"
+        } else {
+            "kept"
+        };
+        let recovery_metadata;
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            put(&engine, "kept", "durable", 10);
+            match stage {
+                "wal-only" => {}
+                "flush" => engine.flush().unwrap(),
+                "compaction" => {
+                    for ts in [20, 30, 40, 50] {
+                        put(&engine, "kept", "durable", ts);
+                        engine.flush().unwrap();
+                    }
+                    engine.compact().unwrap();
+                }
+                "snapshot" => engine
+                    .replace_snapshot(
+                        &SnapshotScope::default(),
+                        vec![SnapshotRow::committed(
+                            Bytes::from("installed"),
+                            Bytes::from("durable"),
+                            50,
+                        )],
+                        vec![],
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            put(&engine, "tail", "wal-only", 60);
+            recovery_metadata = engine
+                .get(nodus_storage_api::recovery::RECOVERY_GENERATION_KEY, 100)
+                .unwrap();
+            assert_eq!(recovery_metadata.is_some(), stage == "snapshot");
+        }
+        // A fully-built orphan would cause directory discovery to select a
+        // nonexistent WAL 1000 instead of the published one.
+        let mut ghost = VersionChain::new();
+        let txn = TxnId::new();
+        ghost.write_intent(txn, b"unpublished".to_vec()).unwrap();
+        ghost.commit(txn, 70).unwrap();
+        Sstable::build(
+            dir.path().join("999.sst"),
+            &BTreeMap::from([(Bytes::from("ghost"), ghost)]),
+        )
+        .unwrap();
+        let manifest = std::fs::read(dir.path().join("MANIFEST")).unwrap();
+        std::fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+        rejected_without_changes(dir.path(), "missing");
+
+        std::fs::write(dir.path().join("MANIFEST"), manifest).unwrap();
+        let restored = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let rows = restored
+            .scan(
+                KeyRange {
+                    start: Bytes::new(),
+                    end: Bytes::from_static(b"\xff"),
+                },
+                100,
+            )
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (row.key, row.value)
+            })
+            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        if let Some(value) = recovery_metadata {
+            expected.push((
+                Bytes::from_static(nodus_storage_api::recovery::RECOVERY_GENERATION_KEY),
+                value,
+            ));
+        }
+        expected.extend([
+            (Bytes::from(expected_key), Bytes::from("durable")),
+            (Bytes::from("tail"), Bytes::from("wal-only")),
+        ]);
+        assert_eq!(rows, expected, "stage {stage}");
+    }
+}
+
+#[test]
+fn missing_manifest_with_only_partial_storage_files_is_not_fresh() {
+    for name in [
+        "1.log",
+        "99.sst.tmp",
+        "MANIFEST.tmp",
+        "SNAPSHOT_MANIFEST.tmp",
+        "LEGACY_MANIFEST.tmp",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(name), b"interrupted storage publication").unwrap();
+        rejected_without_changes(dir.path(), "missing");
+    }
 }

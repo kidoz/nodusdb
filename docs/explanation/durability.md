@@ -76,10 +76,12 @@ publication. Scanning the directory instead would discard the commit point:
 an unpublished SSTable could become live, or a guessed WAL id could omit
 committed rows. Restoring the correct manifest preserves that distinction.
 
-Directory discovery remains only for an absent manifest, supporting empty
-stores and the historical pre-manifest naming scheme. It cannot distinguish
-that historical layout from a modern store with its manifest removed. Deleting
-a damaged manifest therefore does not provide safe repair; see the
+An absent manifest permits initialization only when no storage artifacts exist.
+If WALs, SSTables, or publication residue remain, startup stops without guessing
+which files were authoritative. Historical layouts require an explicit offline
+migration with a supplied file inventory; modern stores require their correct
+manifest or a consistent backup. Deleting a damaged manifest therefore does
+not bypass recovery checks; see the
 [manifest recovery contract](../reference/durability-contract.md#manifest-recovery).
 
 ## Compaction
@@ -113,8 +115,9 @@ On startup the engine reads the authoritative manifest and reopens its SSTables.
 It follows the active WAL's predecessor chain back to the manifest's replay
 floor, then replays those segments from oldest to newest. This keeps an intent
 written before rotation paired with its later commit. The catalog then loads
-its state from the store, like any other reader. Only fresh and historical
-pre-manifest directories use directory discovery.
+its state from the store, like any other reader. Fresh directories initialize
+an empty file set; historical pre-manifest directories must migrate before
+normal startup.
 
 Older WAL segments remain available for backup archiving and point-in-time
 recovery. Local reclamation requires both backup retention and the published

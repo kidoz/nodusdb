@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use nodus_monitoring::ClusterOverview;
 use reqwest::Client;
+mod storage;
 
 #[cfg(feature = "iceberg")]
 mod iceberg;
@@ -31,6 +32,11 @@ fn build_client(token: Option<&str>) -> anyhow::Result<Client> {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Offline storage operations (requires filesystem access, not an admin token)
+    Storage {
+        #[command(subcommand)]
+        cmd: storage::StorageCommand,
+    },
     /// Read external Iceberg tables (uses catalog credentials, not admin credentials)
     #[cfg(feature = "iceberg")]
     Iceberg {
@@ -345,6 +351,13 @@ enum SessionCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Commands::Storage { cmd } = &cli.command {
+        anyhow::ensure!(
+            cli.token.is_none(),
+            "--token is not used for offline storage operations"
+        );
+        return storage::run(cmd);
+    }
     #[cfg(feature = "iceberg")]
     if let Commands::Iceberg { cmd } = &cli.command {
         anyhow::ensure!(
@@ -360,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
     let client = build_client(token.as_deref())?;
 
     match &cli.command {
+        Commands::Storage { cmd } => storage::run(cmd)?,
         #[cfg(feature = "iceberg")]
         Commands::Iceberg { cmd } => iceberg::run(cmd).await?,
         Commands::Version => {

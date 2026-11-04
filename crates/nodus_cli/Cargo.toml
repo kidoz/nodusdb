@@ -13,6 +13,8 @@ iceberg = ["dep:nodus_iceberg", "dep:arrow-ipc", "dep:tempfile", "dep:arrow-arra
 
 [dependencies]
 nodus_common = { path = "../nodus_common" }
+nodus_storage_lsm = { path = "../nodus_storage_lsm" }
+hex = "0.4.3"
 clap.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
@@ -30,6 +32,7 @@ tempfile = { version = "3", optional = true }
 rustix = { version = "=1.1.6", features = ["process"], optional = true }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio-postgres.workspace = true
 nodus_testkit = { path = "../nodus_testkit" }
 nodus_config = { path = "../nodus_config" }

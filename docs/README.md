@@ -30,6 +30,7 @@ Recipes for people who already know what they want.
 - [Read external Iceberg tables](how-to/read-iceberg-tables.md)
 - [Test Lakekeeper interoperability](how-to/test-lakekeeper-interoperability.md)
 - [Back up and restore](how-to/back-up-and-restore.md)
+- [Migrate historical pre-manifest storage](how-to/migrate-legacy-storage.md)
 - [Run the test suites](how-to/run-the-test-suites.md)
 - [Run the benchmarks](how-to/run-benchmarks.md)
 - [Prepare a change for review](how-to/prepare-a-change-for-review.md)
