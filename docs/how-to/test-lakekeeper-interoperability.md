@@ -84,6 +84,40 @@ catalog, object-store, and token endpoints bind only to loopback. This setup
 tests OIDC and catalog permissions over local HTTP. TLS, token refresh, and
 production identity-provider deployment remain outside this gate.
 
+## Test large-table resources and cancellation
+
+```sh
+just test-iceberg-resource-live
+```
+
+This Linux/macOS gate uses the same private Lakekeeper/MinIO stack and writes
+`target/iceberg-live/resource-report.json`. It checks four fixed datasets, from
+131,072 rows to 1,048,576 rows, up to 256 data files, and binary values up to
+8 KiB. Each gets three measured CLI scans and full independent result checks.
+The gate records process peak RSS, observed time to first complete Arrow batch,
+total scan time and CPU time, then applies committed regression budgets.
+
+A paced S3 fixture also verifies SIGINT and a two-second deadline after data
+consumption starts. Failed reads must exit promptly and leave no output or
+temporary file. All services and data are removed on success or failure.
+Plan for roughly 2 GiB of temporary data/output space in addition to cached
+builds and images. The gate uses the development CLI build; its thresholds are
+regression ceilings for these fixtures.
+
+See the [workload and measurement contract](../../benchmarks/workloads/iceberg_resources.md)
+and [initial baseline](../../benchmarks/reports/iceberg-resources-2026-11-03.md) for
+dataset shapes, methods, limits and evidence boundaries. To record a new
+diagnostic baseline without changing the budgets:
+
+```sh
+UV_PROJECT_ENVIRONMENT="$PWD/target/iceberg-venv" \
+  uv run --locked --project tools/testing/iceberg --python 3.12 \
+  python -B tools/testing/iceberg/resources.py --record-baseline \
+  --report target/iceberg-live/resource-baseline.json
+```
+
+This reports `baseline_recorded`; it cannot count as a budget-enforced pass.
+
 ## Check coverage
 
 | Check | Required behavior |
@@ -115,8 +149,9 @@ PyArrow 26.0.0. No Python dependency enters the NodusDB runtime.
 
 The ordinary stack has no catalog identity provider; the authenticated overlay
 adds the OIDC and OpenFGA checks above. Both modes verify actual S3 signatures and
-downscoped temporary credentials. TLS, real AWS, Polaris, large-table performance,
-and production readiness remain unverified. Passwords are generated per run and
+downscoped temporary credentials. The resource gate adds local measurements for
+the fixed development-profile workloads above. TLS, real AWS, Polaris, broader
+performance and production readiness remain unverified. Passwords are generated per run and
 credentials remain in temporary process memory, private files, or disposable
 service containers that are removed after the run.
 
@@ -127,7 +162,7 @@ manifests or REST responses. For this release, catalog discovery uses the
 warehouse **name** (`interop`), while Lakekeeper returns its UUID as the REST
 namespace prefix.
 
-CI runs both variants in the `Live Lakekeeper interoperability` job and uploads
+CI runs all three gates in the `Live Lakekeeper interoperability` job and uploads
 their JSON reports, including on failure. The fast protocol fixtures remain covered by
 the ordinary optional-feature test job.
 

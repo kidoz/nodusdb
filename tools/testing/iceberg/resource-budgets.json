@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "build_profile": "debug",
+  "workload_sha256": "cb516dfb09052fd9f1f4c59d444a3b07e6c193a8c2626505b4b4f4039d6cf9ef",
+  "scenarios": {
+    "small": {
+      "peak_rss_bytes": 134217728,
+      "first_batch_seconds": 3,
+      "elapsed_seconds": 15
+    },
+    "large": {
+      "peak_rss_bytes": 134217728,
+      "first_batch_seconds": 3,
+      "elapsed_seconds": 45
+    },
+    "many_files": {
+      "peak_rss_bytes": 100663296,
+      "first_batch_seconds": 3,
+      "elapsed_seconds": 30
+    },
+    "wide": {
+      "peak_rss_bytes": 402653184,
+      "first_batch_seconds": 3,
+      "elapsed_seconds": 20
+    }
+  },
+  "scaling": {
+    "rss_ratio": 1.75,
+    "rss_delta_bytes": 50331648
+  },
+  "interrupts": {
+    "sigint_exit_seconds": 2,
+    "deadline_grace_seconds": 2
+  },
+  "baseline": {
+    "recorded_at": "2026-11-03",
+    "report_sha256": "a10a3bd7e15e8313f8d20a4ac22ae9ffcc79b389a133cc84f656b27602ab2f93",
+    "host": {
+      "system": "Darwin",
+      "release": "27.2.0",
+      "machine": "arm64",
+      "logical_cpus": 16,
+      "python": "3.12.16",
+      "pyarrow": "26.0.0",
+      "local_rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+      "cpu_model": "Apple M4 Max",
+      "memory_bytes": 51539607552,
+      "docker": {
+        "cpus": 16,
+        "memory_bytes": 8318709760,
+        "storage_driver": "overlayfs"
+      },
+      "scratch_disk_total_bytes": 994662584320,
+      "scratch_disk_free_bytes": 4084686848
+    },
+    "note": "Initial local dev-profile baseline; broad CI regression ceilings, not production SLOs. Three samples per workload. See benchmarks/reports/iceberg-resources-2026-11-03.md."
+  }
+}

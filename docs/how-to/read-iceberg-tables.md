@@ -163,7 +163,10 @@ independent PyIceberg writer. It verifies schema/partition evolution, temporary
 storage credentials, and read/failure behavior against real services. Its
 authenticated variant, `just test-iceberg-auth-live`, adds Keycloak OIDC and
 OpenFGA table grants, revocation, token expiry, and credential-redaction checks.
-TLS, Polaris, real AWS, and large-table performance remain unverified.
+`just test-iceberg-resource-live` verifies larger datasets, measures CLI memory
+and latency, and checks cancellation/deadline cleanup against explicit fixture
+budgets. TLS, Polaris, real AWS, broader performance and production readiness
+remain unverified.
 
 See the [official Rust implementation](https://github.com/apache/iceberg-rust)
 and [Iceberg REST specification](https://iceberg.apache.org/rest-catalog-spec/)

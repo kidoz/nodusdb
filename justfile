@@ -50,6 +50,12 @@ test-iceberg-auth-live:
     UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
     UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py --authenticated
 
+# Measure Iceberg resources and verify cancellation against fixed budgets
+test-iceberg-resource-live:
+    cargo build -p nodus_cli --features iceberg --locked
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/resources.py
+
 # Compare native SQL Iceberg reads with an independent PyIceberg writer
 test-iceberg-sql-live:
     cargo build -p nodus_cli --features iceberg --locked

@@ -1,6 +1,8 @@
 # Benchmarks
 
-Benchmark source code belongs beside the crate it measures, under `crates/<crate>/benches`.
+Criterion benchmark source belongs beside the crate it measures, under
+`crates/<crate>/benches`. The external Iceberg resource gate lives alongside its
+independent-writer harness under `tools/testing/iceberg`.
 
 Use this directory for benchmark plans, workload descriptions, captured reports, and comparison notes. Do not store generated Criterion output here; it belongs under `target/criterion`.
 
@@ -9,6 +11,7 @@ Current benchmark entrypoints:
 ```bash
 just bench
 cargo bench --locked -p nodus_integration_tests --bench server_bench
+just test-iceberg-resource-live
 ```
 
 The second command runs the [server SQL workloads](workloads/server_sql.md).
@@ -19,3 +22,8 @@ contains the current repeated measurements and evidence limits; the
 earlier single-run baseline. The
 [release qualification manifest](reports/release-qualification-2026-10-25.md) records
 the clean-commit local, hosted-CI, recovery, and release-gate evidence.
+
+The Iceberg command runs the [external-reader resource workloads](workloads/iceberg_resources.md)
+with exact-result verification and fixed regression budgets. Its
+[initial baseline](reports/iceberg-resources-2026-11-03.md) records local observations
+and the limits of that evidence.

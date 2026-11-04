@@ -49,6 +49,20 @@ The output directory must not already contain `measurements.jsonl`; use a fresh
 directory for each run. Generated artifacts stay under `target/` and are not
 committed.
 
+## Measure the external Iceberg reader
+
+```sh
+just test-iceberg-resource-live
+```
+
+This runs larger independently written Iceberg tables through the development
+CLI build, verifies complete results, measures memory and latency, and enforces
+fixture-specific regression budgets. It also checks SIGINT and deadline cleanup.
+See the [workload contract](../../benchmarks/workloads/iceberg_resources.md) for
+methods and the [Lakekeeper testing guide](test-lakekeeper-interoperability.md)
+for prerequisites and diagnostic baseline capture. Reports go to
+`target/iceberg-live/resource-report.json`.
+
 ## Check that they still compile
 
 Compiling the benchmarks is much faster than running them, and it is what CI
