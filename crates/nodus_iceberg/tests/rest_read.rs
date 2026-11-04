@@ -434,3 +434,54 @@ async fn local_validation_precedes_network_access() {
     ));
     assert!(fixture.state.requests.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn pruning_with_current_names_keeps_old_snapshot_schema_out_of_arrow() {
+    use nodus_iceberg::{ScanLiteral, ScanOp, ScanPredicate};
+    let fixture = Fixture::new().await;
+    {
+        let mut response = fixture.state.response.lock().unwrap();
+        let metadata = &mut response["metadata"];
+        let mut schema = metadata["schemas"][0].clone();
+        schema["schema-id"] = json!(1);
+        schema["fields"][1]["name"] = json!("label");
+        schema["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": 3, "name": "note", "required": false, "type": "string"}));
+        metadata["schemas"].as_array_mut().unwrap().push(schema);
+        metadata["current-schema-id"] = json!(1);
+        metadata["last-column-id"] = json!(3);
+    }
+    let reader = SnapshotReader::open(fixture.config(), fixture.options())
+        .await
+        .unwrap();
+    let mut scan = reader
+        .scan_pruned(vec![
+            ScanPredicate {
+                field_id: 2,
+                column: "label".into(),
+                op: ScanOp::Eq,
+                value: ScanLiteral::String("alpha".into()),
+            },
+            ScanPredicate {
+                field_id: 3,
+                column: "note".into(),
+                op: ScanOp::IsNull,
+                value: ScanLiteral::Null,
+            },
+        ])
+        .await
+        .unwrap();
+    // These fixture files have no bound metrics. They cannot be pruned, and
+    // Arrow must not apply an old-name row predicate to the renamed read schema.
+    let mut rows = 0;
+    while let Some(batch) = scan.next_batch().await.unwrap() {
+        assert_eq!(batch.schema().field(1).name(), "label");
+        assert_eq!(batch.column(2).null_count(), batch.num_rows());
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, 3);
+    assert_eq!(scan.stats().planned_files, 1);
+    assert_eq!(scan.stats().rows_read, 3);
+}

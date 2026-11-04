@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
 pub const VERSION: u8 = 1;
+/// Private worker protocol. Durable descriptors/profiles remain version one.
+pub const WORKER_VERSION: u8 = 2;
 pub const MAX_FRAME: usize = 64 * 1024;
 pub const STORED_FUNCTION: &str = "__nodus_iceberg_v1";
 
@@ -20,6 +22,8 @@ pub struct Settings {
     pub worker_address_space_mib: u64,
     pub max_result_bytes: usize,
     pub max_rows: usize,
+    pub max_scan_rows: usize,
+    pub max_scan_bytes: usize,
     pub max_concurrent_scans: usize,
 }
 impl Default for Settings {
@@ -33,6 +37,8 @@ impl Default for Settings {
             worker_address_space_mib: 2048,
             max_result_bytes: 16 * 1024 * 1024,
             max_rows: 100_000,
+            max_scan_rows: 1_000_000,
+            max_scan_bytes: 256 * 1024 * 1024,
             max_concurrent_scans: 2,
         }
     }
@@ -53,6 +59,8 @@ impl Settings {
             || self.worker_address_space_mib > 131072
             || !(1..=64 * 1024 * 1024).contains(&self.max_result_bytes)
             || !(1..=1_000_000).contains(&self.max_rows)
+            || !(1..=10_000_000).contains(&self.max_scan_rows)
+            || !(1..=1024 * 1024 * 1024).contains(&self.max_scan_bytes)
             || !(1..=8).contains(&self.max_concurrent_scans)
         {
             return Err("invalid iceberg resource limits");
@@ -95,6 +103,40 @@ pub struct Descriptor {
     pub table_uuid: String,
     pub fields: Vec<Field>,
 }
+/// An AND-connected scan predicate, bound to a registered field identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanPredicate {
+    pub field_id: i32,
+    pub column: String,
+    pub op: ScanOp,
+    pub value: ScanLiteral,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ScanOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    IsNull,
+    IsNotNull,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ScanLiteral {
+    Null,
+    Int(i64),
+    Bool(bool),
+    String(String),
+    Date(i32),
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanStats {
+    pub planned_files: u64,
+    pub planned_file_bytes: u64,
+    pub rows_read: u64,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -108,6 +150,9 @@ pub struct Request {
     pub limit: usize,
     pub timeout_ms: u64,
     pub address_space_bytes: u64,
+    /// Absent only in a version-one, unfiltered request.
+    #[serde(default)]
+    pub predicates: Vec<ScanPredicate>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -118,6 +163,8 @@ pub enum Response {
         snapshot_id: Option<i64>,
     },
     Row(Vec<Option<String>>),
+    /// Version two only; planned file sizes are not network-byte measurements.
+    ScanStats(ScanStats),
     Done {
         rows: usize,
     },
@@ -175,5 +222,36 @@ mod tests {
         settings.worker_executable = "/bin/worker".into();
         settings.profiles_file = "/etc/profiles.json".into();
         assert!(settings.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    #[test]
+    fn v1_requests_remain_unfiltered_and_durable_versions_do_not_change() {
+        let request = serde_json::json!({"version":1, "profile":{"uri":"http://localhost", "warehouse":null, "bearer_token":null, "storage_properties":{}}, "namespace":["n"], "table":"t", "expected":null, "columns":[], "limit":10, "timeout_ms":1000, "address_space_bytes":1000000});
+        let parsed: Request = serde_json::from_value(request).unwrap();
+        assert!(parsed.predicates.is_empty());
+        assert_eq!(parsed.version, 1);
+        assert_eq!(VERSION, 1);
+        assert_eq!(WORKER_VERSION, 2);
+    }
+    #[test]
+    fn scan_limits_validate_separately_and_old_settings_get_safe_defaults() {
+        let old: Settings = serde_json::from_str(r#"{"enabled":false,"max_rows":10}"#).unwrap();
+        assert_eq!(old.max_scan_rows, 1000000);
+        assert_eq!(old.max_scan_bytes, 256 * 1024 * 1024);
+        let mut configured = Settings {
+            enabled: true,
+            worker_executable: "/bin/w".into(),
+            profiles_file: "/etc/p".into(),
+            ..old
+        };
+        configured.max_scan_rows = 0;
+        assert!(configured.validate().is_err());
+        configured.max_scan_rows = 1;
+        configured.max_scan_bytes = 0;
+        assert!(configured.validate().is_err());
     }
 }

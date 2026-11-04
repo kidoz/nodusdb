@@ -71,6 +71,42 @@ async fn iceberg_sql_live() {
         actual, expected,
         "SQL values differ from independent PyIceberg scan"
     );
+    client.batch_execute("CREATE VIEW lake_filters AS SELECT * FROM nodus_iceberg('lake', 'interop', 'filter_events')").await.unwrap();
+    let filter_path =
+        std::env::var("NODUS_ICEBERG_SQL_FILTERS").expect("independent WHERE results");
+    let cases: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(filter_path).unwrap()).unwrap();
+    for case in cases.as_array().unwrap() {
+        let sql = case["sql"].as_str().unwrap();
+        let mut actual = text_rows(client.simple_query(sql).await.unwrap());
+        let expected: Vec<Vec<Option<String>>> =
+            serde_json::from_value(case["rows"].clone()).unwrap();
+        if let Some(limit) = case["limit"].as_u64() {
+            assert_eq!(actual.len(), expected.len().min(limit as usize), "{sql}");
+            let mut available = expected;
+            for row in actual {
+                let index = available
+                    .iter()
+                    .position(|candidate| *candidate == row)
+                    .expect("LIMIT returned a nonqualifying/duplicate row");
+                available.remove(index);
+            }
+        } else {
+            let mut expected = expected;
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{sql}");
+        }
+    }
+    let prepared = client
+        .prepare("SELECT name FROM lake_events WHERE id >= $1 AND active = $2 LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(prepared.columns().len(), 1);
+    assert_eq!(prepared.columns()[0].type_().name(), "text");
+    let filtered = client.query(&prepared, &[&1i64, &false]).await.unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].get::<_, Option<String>>(0), None);
     let statement = client
         .prepare("SELECT name AS label, id, payload, active FROM lake_events LIMIT 2")
         .await
@@ -101,7 +137,7 @@ async fn iceberg_sql_live() {
         "UPDATE lake_events SET name = 'changed'",
         "INSERT INTO lake_events (id) VALUES (8)",
         "TRUNCATE lake_events",
-        "SELECT * FROM lake_events WHERE id = 1",
+        "SELECT * FROM lake_events WHERE id = 1 OR id = 2",
         "SELECT count(*) FROM lake_events",
     ] {
         assert!(
@@ -195,7 +231,7 @@ async fn iceberg_sql_live() {
         1
     );
     client
-        .batch_execute("DROP VIEW lake_events, lake_wide")
+        .batch_execute("DROP VIEW lake_events, lake_wide, lake_filters")
         .await
         .unwrap();
     drop(client);

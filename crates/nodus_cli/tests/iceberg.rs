@@ -150,3 +150,157 @@ async fn cli_empty_table_writes_a_valid_schema_only_stream() {
     assert_eq!(arrow.schema().fields().len(), 2);
     assert!(arrow.next().is_none());
 }
+
+#[tokio::test]
+async fn worker_rejects_a_filtered_legacy_request_before_source_access() {
+    use nodus_common::iceberg::{
+        self as wire, Profile, Request, Response, ScanLiteral, ScanOp, ScanPredicate,
+    };
+    use tokio::io::AsyncWriteExt;
+    let fixture = Fixture::new_s3().await;
+    let request = Request {
+        version: 1,
+        profile: Profile {
+            uri: fixture.uri.clone(),
+            warehouse: Some("test-warehouse".into()),
+            bearer_token: Some("catalog-token".into()),
+            storage_properties: Default::default(),
+        },
+        namespace: vec!["analytics".into()],
+        table: "events".into(),
+        expected: None,
+        columns: vec!["id".into()],
+        limit: 10,
+        timeout_ms: 1000,
+        address_space_bytes: 2 * 1024 * 1024 * 1024,
+        predicates: vec![ScanPredicate {
+            field_id: 1,
+            column: "id".into(),
+            op: ScanOp::Eq,
+            value: ScanLiteral::Int(20),
+        }],
+    };
+    let mut frame = vec![];
+    wire::write_frame(&mut frame, &request).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nodus_cli"))
+        .args(["iceberg", "worker"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&frame).await.unwrap();
+    drop(stdin);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.status.success());
+    let response: Response = wire::read_frame(&mut result.stdout.as_slice()).unwrap();
+    assert!(
+        matches!(response, Response::Error(message) if message == "unsupported Iceberg worker version")
+    );
+    assert!(fixture.state.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_v2_returns_raw_candidates_and_pruning_statistics() {
+    use nodus_common::iceberg::{
+        self as wire, Descriptor, Profile, Request, Response, ScanLiteral, ScanOp, ScanPredicate,
+    };
+    use tokio::io::AsyncWriteExt;
+    async fn invoke(request: &Request) -> Vec<Response> {
+        let mut bytes = vec![];
+        wire::write_frame(&mut bytes, request).unwrap();
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nodus_cli"))
+            .args(["iceberg", "worker"])
+            .env_clear()
+            .env("TOKIO_WORKER_THREADS", "1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&bytes).await.unwrap();
+        drop(stdin);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(result.status.success());
+        let mut input = result.stdout.as_slice();
+        let mut frames = vec![];
+        while !input.is_empty() {
+            frames.push(wire::read_frame(&mut input).unwrap());
+        }
+        frames
+    }
+    let fixture = Fixture::new_s3().await;
+    let mut request = Request {
+        version: wire::WORKER_VERSION,
+        profile: Profile {
+            uri: fixture.uri.clone(),
+            warehouse: Some("test-warehouse".into()),
+            bearer_token: Some("catalog-token".into()),
+            storage_properties: Default::default(),
+        },
+        namespace: vec!["analytics".into()],
+        table: "events".into(),
+        expected: None,
+        columns: vec![],
+        predicates: vec![],
+        limit: 100,
+        timeout_ms: 10000,
+        address_space_bytes: 2 * 1024 * 1024 * 1024,
+    };
+    let inspection = invoke(&request).await;
+    let Response::Schema {
+        version,
+        table_uuid,
+        fields,
+        ..
+    } = &inspection[0]
+    else {
+        panic!("{inspection:?}");
+    };
+    assert_eq!(*version, 2);
+    request.expected = Some(Descriptor {
+        version: 1,
+        profile: "lake".into(),
+        namespace: request.namespace.clone(),
+        table: request.table.clone(),
+        table_uuid: table_uuid.clone(),
+        fields: fields.clone(),
+    });
+    request.columns = vec!["id".into()];
+    request.predicates = vec![ScanPredicate {
+        field_id: 1,
+        column: "id".into(),
+        op: ScanOp::Eq,
+        value: ScanLiteral::Int(21),
+    }];
+    let result = invoke(&request).await;
+    assert!(
+        matches!(result.last(), Some(Response::Done { rows: 3 })),
+        "{result:?}"
+    );
+    assert!(result.iter().any(|frame| matches!(frame, Response::ScanStats(stats) if stats.planned_files == 1 && stats.rows_read == 3)));
+    let ids: Vec<_> = result
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Response::Row(row) => Some(row[0].clone()),
+            _ => None,
+        })
+        .collect();
+    // Missing file metrics prevent file pruning in this fixture. SQL filtering
+    // belongs to the executor; the worker must not consume LIMIT before it.
+    assert_eq!(
+        ids,
+        [Some("20".into()), Some("21".into()), Some("22".into())]
+    );
+}

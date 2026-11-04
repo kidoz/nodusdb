@@ -1,5 +1,7 @@
+use nodus_common::iceberg::{ScanPredicate, ScanStats};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -149,6 +151,15 @@ impl SnapshotReader {
     /// silently resurrect rows by ignoring equality or positional deletes.
     #[tracing::instrument(skip_all, name = "iceberg.scan")]
     pub async fn scan(self) -> Result<BatchReader, Error> {
+        self.scan_pruned(vec![]).await
+    }
+
+    /// Prune files using registered field identities. No row predicate is passed
+    /// to Arrow: callers must apply their exact residual before their row limit.
+    #[tracing::instrument(skip_all, name = "iceberg.scan_pruned")]
+    pub async fn scan_pruned(self, predicates: Vec<ScanPredicate>) -> Result<BatchReader, Error> {
+        let metrics = Arc::new(Metrics::default());
+        let observed = metrics.clone();
         let stream = timeout_at(self.deadline, async {
             if let Some(id) = self.summary.snapshot_id {
                 let snapshot =
@@ -213,6 +224,21 @@ impl SnapshotReader {
             if let Some(id) = self.summary.snapshot_id {
                 scan = scan.snapshot_id(id);
             }
+            let snapshot_schema = match self.summary.snapshot_id {
+                Some(id) => self
+                    .table
+                    .metadata()
+                    .snapshot_by_id(id)
+                    .ok_or(Error::Unsupported("pinned snapshot is missing"))?
+                    .schema(self.table.metadata())
+                    .map_err(|e| operation("snapshot schema", e))?,
+                None => self.summary.schema.clone(),
+            };
+            if let Some(predicate) =
+                crate::pruning::predicate(&predicates, &self.summary.schema, &snapshot_schema)?
+            {
+                scan = scan.with_filter(predicate);
+            }
             let tasks = scan
                 .build()
                 .map_err(|e| operation("build scan", e))?
@@ -236,6 +262,14 @@ impl SnapshotReader {
             // field IDs. Do not rewrite the snapshot or its persisted metadata.
             let tasks = tasks
                 .map_ok(move |mut task| {
+                    observed.files.fetch_add(1, Ordering::Relaxed);
+                    observed
+                        .bytes
+                        .fetch_add(task.file_size_in_bytes, Ordering::Relaxed);
+                    // The upstream task predicate is bound to the snapshot's old
+                    // schema. Preserve only file pruning; SQL residuals use the
+                    // validated current schema and are evaluated by NodusDB.
+                    task.predicate = None;
                     task.schema = schema.clone();
                     task.project_field_ids = field_ids.clone();
                     task
@@ -253,6 +287,8 @@ impl SnapshotReader {
         .await
         .map_err(|_| Error::Timeout)??;
         Ok(BatchReader {
+            metrics,
+            rows: 0,
             stream,
             deadline: self.deadline,
             remaining: self.options.limit,
@@ -263,7 +299,15 @@ impl SnapshotReader {
 }
 
 /// Incremental batch reader with one operation deadline and optional row limit.
+#[derive(Default)]
+struct Metrics {
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
 pub struct BatchReader {
+    metrics: Arc<Metrics>,
+    rows: u64,
     stream: ArrowRecordBatchStream,
     deadline: Instant,
     remaining: Option<usize>,
@@ -272,6 +316,15 @@ pub struct BatchReader {
 }
 
 impl BatchReader {
+    /// Planning counters for consumed tasks, not network bytes or row groups.
+    pub fn stats(&self) -> ScanStats {
+        ScanStats {
+            planned_files: self.metrics.files.load(Ordering::Relaxed),
+            planned_file_bytes: self.metrics.bytes.load(Ordering::Relaxed),
+            rows_read: self.rows,
+        }
+    }
+
     /// Read the next batch. Errors terminate this reader; dropping it cancels
     /// consumption. Memory scales with batches and upstream metadata decoding,
     /// not the total result row count. This is not a hard process-memory sandbox.
@@ -334,6 +387,7 @@ impl BatchReader {
             bytes = batch.get_array_memory_size(),
             "Iceberg batch read"
         );
+        self.rows += batch.num_rows() as u64;
         self.finished = false;
         Ok(Some(batch))
     }

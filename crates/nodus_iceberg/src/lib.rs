@@ -8,10 +8,12 @@
 
 mod catalog;
 mod config;
+mod pruning;
 mod reader;
 mod storage;
 
 pub use config::{CatalogOptions, ReadOptions, StorageBackend};
+pub use nodus_common::iceberg::{ScanLiteral, ScanOp, ScanPredicate, ScanStats};
 pub use reader::{BatchReader, ReadSummary, SnapshotReader};
 
 /// Errors deliberately omit upstream response bodies, URLs and credentials.

@@ -190,3 +190,12 @@ rejections, CancelRequest before rows, statement deadlines, atomic failed
 registration, and restart recovery. The gate owns a fresh stack, private profiles,
 and a stalled HTTP endpoint; it removes services and credentials on exit.
 Evidence is written to `target/iceberg-live/sql-report.json`.
+
+The SQL gate also builds eight data files across an unpartitioned-to-identity
+partition evolution, compares typed AND/NULL predicates with PyIceberg, verifies
+hidden filter columns and LIMIT after residual filtering, and exercises prepared
+filter parameters. Version-two worker statistics must show fewer planned files
+and planned bytes for a selective ID predicate; the selected file count must
+match PyIceberg planning. Surviving false-positive rows must still be present in
+the worker stream, proving that exact SQL filtering remains necessary.
+Version-one unfiltered worker compatibility is checked separately in the same gate.

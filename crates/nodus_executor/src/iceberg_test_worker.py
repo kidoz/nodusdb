@@ -25,14 +25,17 @@ if MODE == 'error':
     sys.exit(0)
 fields = [dict(id=i + 1, name=name, sql_type=ty, source_type=ty, nullable=True)
           for i, (name, ty) in enumerate([('id', 'BIGINT'), ('name', 'TEXT'), ('active', 'BOOLEAN')])]
+if MODE == 'dates':
+    fields.append(dict(id=4, name='day', sql_type='DATE', source_type='DATE', nullable=True))
 if MODE == 'ambiguous':
     fields[0]['name'] = 'a.b'
 selected = request['columns'] or [f['name'] for f in fields]
 fields = [next(f for f in fields if f['name'] == name) for name in selected]
-frame({'Schema': dict(version=1, table_uuid='changed' if MODE == 'drift' and request['expected'] else 'uuid', fields=fields, snapshot_id=123)})
+frame({'Schema': dict(version=request['version'], table_uuid='changed' if MODE == 'drift' and request['expected'] else 'uuid', fields=fields, snapshot_id=123)})
 count = 0
 if request['expected']:
-    for row in [{'id': '1', 'name': 'alpha', 'active': 'true'}, {'id': '2', 'name': None, 'active': 'false'}][:request['limit']]:
+    rows = [{'id': '1', 'name': 'alpha', 'active': 'true', 'day': '2026-01-01'}, {'id': '2', 'name': None, 'active': 'false', 'day': '-0001-12-31'}]
+    for row in rows[:request['limit']]:
         frame({'Row': [row[name] for name in selected]})
         count += 1
 frame({'Done': {'rows': count}})

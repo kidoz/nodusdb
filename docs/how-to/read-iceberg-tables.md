@@ -191,6 +191,8 @@ worker_memory_mib = 512
 worker_address_space_mib = 2048
 max_result_bytes = 16777216
 max_rows = 100000
+max_scan_rows = 1000000
+max_scan_bytes = 268435456
 max_concurrent_scans = 2
 ```
 
@@ -226,7 +228,9 @@ register one namespace component and the remote table name:
 CREATE VIEW lake_events AS
 SELECT * FROM nodus_iceberg('lake', 'analytics', 'events');
 
-SELECT name AS label, id FROM lake_events LIMIT 100;
+SELECT name AS label, id FROM lake_events
+WHERE id >= 100 AND active = true
+LIMIT 100;
 ```
 
 Registration inspects the source completely before one replicated catalog
@@ -247,11 +251,30 @@ Column names must be ASCII identifiers (`[A-Za-z_][A-Za-z0-9_]*`) of at most
 128 bytes; this avoids ambiguous quoted/qualified identifiers in persisted plans.
 Nested values, time, UUID, and other types fail registration explicitly.
 
-Direct reads support column projection, aliases, duplicates, and `LIMIT`.
-Predicates, joins, ordering, aggregation, DISTINCT, and OFFSET on the external
-scan fail explicitly. There is no SQL time travel, predicate pushdown, DML,
-external schema alteration, or cross-system transaction. Each statement reads
-its own external snapshot, independent of NodusDB's MVCC transaction snapshot.
+Direct reads support column projection, aliases, duplicates, `WHERE`, and
+`LIMIT`. The first filter subset accepts AND-connected `=`, `!=`, `<`, `<=`,
+`>`, `>=` comparisons against typed integer, boolean, text, or ISO date
+literals, plus `IS NULL`/`IS NOT NULL` on registered primitive columns. Integer
+constants must be integers; implicit string-to-number casts are rejected.
+Comparisons to SQL NULL select no rows. Dates compare chronologically, including
+BCE dates. String/date literals are limited to 4 KiB; filters to 64 terms and 16
+nesting levels. Parameters work through PostgreSQL prepared queries.
+
+Supported predicates conservatively prune Iceberg manifests/data files. Every
+candidate row is checked again with exact SQL NULL semantics in NodusDB, before
+LIMIT. Columns used only by WHERE are scanned but omitted from the result.
+File pruning binds by field ID across metadata-only renames. An added field,
+type promotion, or out-of-range narrowing disables that atom's pruning; exact
+filtering still runs. Arrow does not receive the snapshot's old row predicate.
+Planning counters (`planned_files`, `planned_file_bytes`, `rows_read`) appear in
+the version-two worker contract and tracing; file sizes are not measured network
+bytes. Row-group/page predicate pushdown is outside this slice.
+
+OR, NOT, arbitrary scalar expressions/functions, column casts, joins, ordering,
+aggregation, DISTINCT, and OFFSET on the external scan fail explicitly. There is
+no SQL time travel, DML, external schema alteration, or cross-system transaction.
+Each statement reads its own external snapshot, independent of NodusDB's MVCC
+transaction snapshot.
 
 The query deadline is the smaller of `statement_timeout` and
 `iceberg.timeout_seconds`. PostgreSQL CancelRequest and client disconnect abort
@@ -268,10 +291,24 @@ Total accounted result memory/output is bounded by `max_result_bytes`, including
 streamed results. The worker decodes 64-row batches, but Parquet pages and
 metadata can require more memory and are covered by worker supervision. At most
 `max_concurrent_scans` workers run on a node; excess requests fail immediately.
-A missing LIMIT reads at most `max_rows + 1` and fails on overflow. An explicit
-LIMIT above `max_rows` fails. No resource limit silently truncates a result.
+A missing LIMIT fails if qualifying output exceeds `max_rows`; an explicit
+LIMIT above `max_rows` fails. Input work is separately bounded after file pruning
+by `max_scan_rows` (default 1,000,000 candidate rows) and `max_scan_bytes` (default
+256 MiB of accounted candidate values, including hidden filter columns).
+Nonmatching rows still count against these budgets. Reaching an input budget
+fails the query, even if it has emitted fewer rows than LIMIT. LIMIT stops only
+after the requested number of exact matches. No resource limit silently truncates
+a result.
 Streaming can deliver rows before a terminal read error; clients must check
 command completion before accepting the result.
+
+The private worker protocol is now version two. Install the new worker before
+the new server on each node. New workers retain version-one unfiltered requests
+and responses; old workers reject the extra version-two predicate field before
+source access. The new server never retries a filtered request without its
+predicates. Profiles and persisted descriptors remain version one. Before downgrading the
+server, remove `max_scan_rows` and `max_scan_bytes` from its TOML/environment
+configuration: older binaries reject these unknown settings.
 
 External views use the existing durable view/TableFunction codec. Older binaries
 can decode it and fail closed on the unknown function; they cannot read the
@@ -285,4 +322,5 @@ Run `just test-iceberg-sql-live` to compare SQL values against an independent
 PyIceberg scan and verify typed extended queries, cancellation before the first
 row, deadlines, failed-publication atomicity, durable registration across
 restart, and real wide-Parquet decoder termination at a 64 MiB RSS threshold
-with continued SQL server availability.
+with continued SQL server availability. It also compares WHERE results with
+PyIceberg across partition evolution and records reductions in planned data files.

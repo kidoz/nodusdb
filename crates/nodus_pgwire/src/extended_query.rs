@@ -98,11 +98,15 @@ impl NodusExtendedQueryHandler {
         &self,
         query_str: &str,
         ctx: &nodus_executor::ExecutionContext,
+        parameter_count: usize,
     ) -> Vec<FieldInfo> {
+        // Preserve placeholder structure without executing a predicate or
+        // inventing concrete parameter values during a schema-only probe.
+        let parameters = vec![nodus_executor::Value::Null; parameter_count];
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(query_str)
             && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[])
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &parameters)
             && let Some(probe) = describe_probe_plan(&plan)
             && let Ok(out) = execute_off_reactor(self.executor.clone(), ctx.clone(), probe).await
         {
@@ -123,6 +127,7 @@ impl NodusExtendedQueryHandler {
         &self,
         client: &C,
         query_str: &str,
+        parameter_count: usize,
     ) -> Vec<(String, String)>
     where
         C: ClientInfo + Sync,
@@ -137,7 +142,8 @@ impl NodusExtendedQueryHandler {
         let Some(parsed) = stmts.pop() else {
             return Vec::new();
         };
-        let Ok(plan) = nodus_executor::plan_statement(&parsed, &[]) else {
+        let parameters = vec![nodus_executor::Value::Null; parameter_count];
+        let Ok(plan) = nodus_executor::plan_statement(&parsed, &parameters) else {
             return Vec::new();
         };
 
@@ -735,7 +741,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                             ))
                             .await?;
                         let metadata = self
-                            .output_metadata_for_query(client, &stmt.statement)
+                            .output_metadata_for_query(
+                                client,
+                                &stmt.statement,
+                                stmt.parameter_types.len(),
+                            )
                             .await;
                         let row_desc = if metadata.is_empty() {
                             row_description(&resp.fields)
@@ -766,7 +776,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                             .await?;
                     } else {
                         let metadata = self
-                            .output_metadata_for_query(client, &portal.statement.statement)
+                            .output_metadata_for_query(
+                                client,
+                                &portal.statement.statement,
+                                portal.statement.parameter_types.len(),
+                            )
                             .await;
                         let row_desc = if metadata.is_empty() {
                             row_description(&resp.fields)
@@ -1158,7 +1172,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let ctx = self.execution_context(client, session_id, principal_id);
 
         let query_str = stmt.statement.as_str();
-        let fields = self.describe_output_fields(query_str, &ctx).await;
+        let fields = self
+            .describe_output_fields(query_str, &ctx, stmt.parameter_types.len())
+            .await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -1188,7 +1204,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             .unwrap_or_default();
         let ctx = self.execution_context(client, session_id, principal_id);
 
-        let fields = self.describe_output_fields(query_str, &ctx).await;
+        let fields = self
+            .describe_output_fields(query_str, &ctx, portal.statement.parameter_types.len())
+            .await;
         Ok(DescribePortalResponse::new(fields))
     }
 }

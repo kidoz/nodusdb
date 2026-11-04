@@ -104,4 +104,7 @@ worker_memory_mib = 512
 worker_address_space_mib = 2048
 max_result_bytes = 16777216
 max_rows = 100000
+# Work budgets after file pruning, before SQL filtering.
+max_scan_rows = 1000000
+max_scan_bytes = 268435456
 max_concurrent_scans = 2

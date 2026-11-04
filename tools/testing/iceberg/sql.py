@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from predicates import prepare
 from run import Gate
 from stack import ROOT, Stack
 
@@ -107,6 +108,10 @@ def main():
                 "uri": stack.url + "/catalog", "warehouse": "interop",
                 "bearer_token": None, "storage_properties": gate.properties,
             }
+            filters, pruning = prepare(gate, profile, pg_text)
+            filter_path = directory / "filters.json"
+            filter_path.write_text(json.dumps(filters))
+            report["file_pruning"] = pruning
             with profiles.open("x") as output:
                 profiles.chmod(0o600)
                 json.dump({"version": 1, "profiles": {
@@ -116,6 +121,7 @@ def main():
             env = {
                 **gate.env, "NODUS_ICEBERG_SQL_PROFILES": str(profiles),
                 "NODUS_ICEBERG_SQL_EXPECTED": str(expected_path),
+                "NODUS_ICEBERG_SQL_FILTERS": str(filter_path),
             }
             result = run_gate([
                 "cargo", "test", "-p", "nodus_cli", "--features", "iceberg",
@@ -124,7 +130,8 @@ def main():
             if result:
                 raise RuntimeError("native SQL gate failed")
             report.update(status="passed", rows=len(expected), checks=[
-                "PyIceberg exact values", "extended typed projection", "LIMIT",
+                "PyIceberg exact values", "typed WHERE and NULL semantics", "partition evolution",
+                "measured file pruning", "v1 worker compatibility", "extended typed projection", "LIMIT after residual",
                 "read-only rejection", "CancelRequest before first row",
                 "statement_timeout", "atomic failed registration", "restart and rollback",
                 "real Parquet decoder memory termination and server recovery",

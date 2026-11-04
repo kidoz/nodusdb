@@ -83,7 +83,7 @@ fn iceberg_registration_projection_types_authorization_and_read_only() {
         "ALTER TABLE lake_events RENAME COLUMN name TO bad_name",
         "MERGE INTO lake_events t USING (VALUES (3)) AS s(id) ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)",
         "ALTER TABLE lake_events ADD COLUMN bad INT",
-        "SELECT * FROM lake_events WHERE id = 1",
+        "SELECT * FROM lake_events WHERE id = 1 OR id = 2",
         "SELECT count(*) FROM lake_events",
         "SELECT * FROM lake_events ORDER BY id",
         "SELECT * FROM lake_events OFFSET 1",
@@ -322,4 +322,161 @@ fn iceberg_ambiguous_quoted_column_names_fail_before_publication() {
             .get_table("default", "public", "lake_events")
             .is_err()
     );
+}
+
+#[test]
+fn iceberg_exact_residuals_hidden_columns_and_limit_after_filter() {
+    // This worker intentionally performs no pruning: the executor must still
+    // remove false/unknown rows and find a match beyond the raw LIMIT prefix.
+    let fixture = Fixture::new("normal");
+    let (exec, ctx) = executor_with_kv(Arc::new(nodus_storage_mem::MemKvEngine::new()));
+    exec.configure_iceberg(fixture.settings.clone()).unwrap();
+    sql(&exec, &ctx, REGISTER).unwrap();
+    let cases = [
+        (
+            "SELECT id FROM lake_events WHERE active = false LIMIT 1",
+            vec![vec!["2"]],
+        ),
+        (
+            "SELECT id FROM lake_events WHERE name IS NULL",
+            vec![vec!["2"]],
+        ),
+        (
+            "SELECT id FROM lake_events WHERE name IS NOT NULL AND id >= 1",
+            vec![vec!["1"]],
+        ),
+        (
+            "SELECT id FROM lake_events WHERE name = 'alpha'",
+            vec![vec!["1"]],
+        ),
+        ("SELECT id FROM lake_events WHERE id != 1", vec![vec!["2"]]),
+        ("SELECT id FROM lake_events WHERE id < 2", vec![vec!["1"]]),
+        (
+            "SELECT id FROM lake_events WHERE id <= 2 AND id > 1",
+            vec![vec!["2"]],
+        ),
+        ("SELECT id FROM lake_events WHERE name = NULL", vec![]),
+        ("SELECT id FROM lake_events WHERE name != NULL", vec![]),
+        (
+            "SELECT id FROM lake_events WHERE id > 9223372036854775806",
+            vec![],
+        ),
+        (
+            "SELECT e.id, e.id AS duplicate FROM lake_events e WHERE e.active = false LIMIT 1",
+            vec![vec!["2", "2"]],
+        ),
+    ];
+    for (query, expected) in cases {
+        let out = sql(&exec, &ctx, query).unwrap();
+        assert_eq!(
+            out.rows.iter().map(render_row).collect::<Vec<_>>(),
+            expected,
+            "{query}"
+        );
+    }
+    for query in [
+        "SELECT id FROM lake_events WHERE id = 1 OR id = 2",
+        "SELECT id FROM lake_events WHERE NOT active",
+        "SELECT id FROM lake_events WHERE id + 1 = 2",
+        "SELECT id FROM lake_events WHERE lower(name) = 'alpha'",
+        "SELECT id FROM lake_events WHERE id = '1'",
+        "SELECT id FROM lake_events WHERE name LIKE 'a%'",
+    ] {
+        assert!(
+            sql(&exec, &ctx, query)
+                .unwrap_err()
+                .to_string()
+                .contains("0A000"),
+            "{query}"
+        );
+    }
+    assert!(sql(&exec, &ctx, "SELECT id FROM lake_events WHERE wrong.id = 1").is_err());
+    assert!(
+        sql(
+            &exec,
+            &ctx,
+            "SELECT id FROM lake_events WHERE missing = 1 LIMIT 0"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn iceberg_filter_scan_budgets_are_distinct_from_output_budgets() {
+    let fixture = Fixture::new("normal");
+    let (exec, ctx) = executor_with_kv(Arc::new(nodus_storage_mem::MemKvEngine::new()));
+    let mut settings = fixture.settings.clone();
+    settings.max_rows = 1;
+    exec.configure_iceberg(settings.clone()).unwrap();
+    sql(&exec, &ctx, REGISTER).unwrap();
+    // Two scanned rows but just one qualifying output row.
+    assert_eq!(
+        sql(
+            &exec,
+            &ctx,
+            "SELECT id FROM lake_events WHERE active = false"
+        )
+        .unwrap()
+        .rows
+        .len(),
+        1
+    );
+    settings.max_scan_rows = 1;
+    exec.configure_iceberg(settings.clone()).unwrap();
+    assert!(
+        sql(
+            &exec,
+            &ctx,
+            "SELECT id FROM lake_events WHERE id = 99 LIMIT 1"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("max_scan_rows")
+    );
+    settings.max_scan_rows = 100;
+    settings.max_scan_bytes = 1;
+    exec.configure_iceberg(settings).unwrap();
+    assert!(
+        sql(
+            &exec,
+            &ctx,
+            "SELECT id FROM lake_events WHERE id = 99 LIMIT 1"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("max_scan_bytes")
+    );
+    assert!(
+        sql(
+            &exec,
+            &ctx,
+            "SELECT id FROM lake_events WHERE id = 99 LIMIT 0"
+        )
+        .unwrap()
+        .rows
+        .is_empty()
+    );
+}
+
+#[test]
+fn iceberg_date_residuals_compare_chronology_including_bce() {
+    let fixture = Fixture::new("dates");
+    let (exec, ctx) = executor_with_kv(Arc::new(nodus_storage_mem::MemKvEngine::new()));
+    exec.configure_iceberg(fixture.settings.clone()).unwrap();
+    sql(&exec, &ctx, REGISTER).unwrap();
+    for (query, expected) in [
+        ("SELECT id FROM lake_events WHERE day >= '2026-01-01'", "1"),
+        (
+            "SELECT id FROM lake_events WHERE day < '0001-01-01' LIMIT 1",
+            "2",
+        ),
+        ("SELECT id FROM lake_events WHERE day = '-0001-12-31'", "2"),
+    ] {
+        let out = sql(&exec, &ctx, query).unwrap();
+        assert_eq!(
+            out.rows.iter().map(render_row).collect::<Vec<_>>(),
+            vec![vec![expected]],
+            "{query}"
+        );
+    }
 }

@@ -3243,6 +3243,7 @@ dependencies = [
  "futures-util",
  "iceberg",
  "iceberg-catalog-rest",
+ "nodus_common",
  "object_store",
  "parquet",
  "reqwest 0.12.28",

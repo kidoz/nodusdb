@@ -46,17 +46,13 @@ fn fail(message: &'static str) -> anyhow::Error {
 
 async fn inner() -> anyhow::Result<()> {
     let request: Request = wire::read_frame(&mut std::io::stdin().lock())?;
-    if request.version != wire::VERSION {
+    if !matches!(request.version, wire::VERSION | wire::WORKER_VERSION)
+        || (request.version == wire::VERSION && !request.predicates.is_empty())
+    {
         return Err(fail("unsupported Iceberg worker version"));
     }
     #[cfg(target_os = "linux")]
-    rustix::process::setrlimit(
-        rustix::process::Resource::As,
-        rustix::process::Rlimit {
-            current: Some(request.address_space_bytes),
-            maximum: Some(request.address_space_bytes),
-        },
-    )?;
+    apply_address_space_limit(request.address_space_bytes)?;
     let reader = SnapshotReader::open(
         CatalogOptions {
             uri: request.profile.uri,
@@ -110,7 +106,7 @@ async fn inner() -> anyhow::Result<()> {
     wire::write_frame(
         &mut output,
         &Response::Schema {
-            version: wire::VERSION,
+            version: request.version,
             table_uuid: reader.summary().table_uuid.clone(),
             fields,
             snapshot_id: reader.summary().snapshot_id,
@@ -120,7 +116,7 @@ async fn inner() -> anyhow::Result<()> {
         wire::write_frame(&mut output, &Response::Done { rows: 0 })?;
         return Ok(());
     }
-    let mut scan = reader.scan().await?;
+    let mut scan = reader.scan_pruned(request.predicates).await?;
     let mut count = 0;
     while let Some(batch) = scan.next_batch().await? {
         for index in 0..batch.num_rows() {
@@ -149,6 +145,9 @@ async fn inner() -> anyhow::Result<()> {
             wire::write_frame(&mut output, &Response::Row(row))?;
             count += 1;
         }
+    }
+    if request.version == wire::WORKER_VERSION {
+        wire::write_frame(&mut output, &Response::ScanStats(scan.stats()))?;
     }
     wire::write_frame(&mut output, &Response::Done { rows: count })?;
     Ok(())
@@ -181,4 +180,64 @@ fn sql_type(data_type: &DataType) -> anyhow::Result<&'static str> {
         DataType::Decimal128(_, _) => "NUMERIC",
         _ => return Err(fail("Iceberg SQL type is not supported")),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn apply_address_space_limit(bytes: u64) -> std::io::Result<()> {
+    rustix::process::setrlimit(
+        rustix::process::Resource::As,
+        rustix::process::Rlimit {
+            current: Some(bytes),
+            maximum: Some(bytes),
+        },
+    )
+    .map_err(std::io::Error::from)
+}
+#[cfg(all(test, target_os = "linux"))]
+mod linux_limits {
+    #[test]
+    fn linux_address_space_limit_is_hard_and_isolated() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "iceberg::worker::linux_limits::address_space_probe",
+                "--nocapture",
+            ])
+            .env("NODUS_TEST_ADDRESS_SPACE_PROBE", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated kernel allocation probe failed");
+    }
+    #[test]
+    #[ignore = "invoked in an isolated process by linux_address_space_limit_is_hard_and_isolated"]
+    fn address_space_probe() {
+        assert_eq!(
+            std::env::var("NODUS_TEST_ADDRESS_SPACE_PROBE").unwrap(),
+            "1"
+        );
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let virtual_bytes = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmSize:"))
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * 1024;
+        let cap = virtual_bytes + 64 * 1024 * 1024;
+        super::apply_address_space_limit(cap).unwrap();
+        let actual = rustix::process::getrlimit(rustix::process::Resource::As);
+        assert_eq!(actual.current, Some(cap));
+        assert_eq!(actual.maximum, Some(cap));
+        let mut allocation = Vec::<u8>::new();
+        assert!(
+            allocation.try_reserve_exact(cap as usize + 1).is_err(),
+            "allocation escaped RLIMIT_AS"
+        );
+        println!(
+            "kernel RLIMIT_AS={} bytes; oversized Rust allocation rejected",
+            cap
+        );
+    }
 }
