@@ -231,7 +231,8 @@ pub trait KvEngine: Send + Sync {
 
     /// Lists every transaction with outstanding intents under `prefix`, with
     /// the matched keys and the oldest matched intent's write timestamp.
-    /// Used by the intent janitor to find intents abandoned by dead sessions.
+    /// Used to observe unresolved intents. Age and absence from a local session
+    /// map do not prove that a remote owner is dead or authorize automatic abort.
     /// Unsupported engines must fail closed (like [`Self::has_pending_intents`]):
     /// an empty answer would let the janitor conclude there is nothing to do.
     fn pending_intents(&self, _prefix: &[u8]) -> Result<Vec<PendingIntents>> {
@@ -240,9 +241,10 @@ pub trait KvEngine: Send + Sync {
 
     /// Aborts the intents recorded under exactly `txn_id` in this engine,
     /// bypassing any namespace id remapping that [`Self::abort`] applies. The
-    /// intent janitor aborts orphans by their *recorded* id (the only one
-    /// recoverable from the store after a restart), so Raft apply falls back
-    /// to this when the mapped lookup finds nothing. Default: same as `abort`
+    /// legacy recorded-id abort commands use the *recorded* id (the only one
+    /// recoverable after restart), so Raft apply falls back to this when a
+    /// mapped lookup finds nothing. Inspection-only janitor sweeps emit no such
+    /// commands. Default: same as `abort`
     /// (correct for engines without id remapping).
     fn abort_physical(&self, txn_id: TxnId) -> KvResult<()> {
         self.abort(txn_id)

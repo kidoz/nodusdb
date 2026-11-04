@@ -62,10 +62,12 @@ pub struct Metrics {
     /// Data-shard Raft groups hosted on this node, and how many lack a leader.
     pub shard_groups: Gauge,
     pub shard_groups_unavailable: Gauge,
-    /// Pending intents aborted by the abandoned-intent janitor.
+    /// Historical automatic-abort counter; uncertain-owner sweeps do not abort.
     pub janitor_aborts_total: Counter,
     /// Pending intents observed by the janitor's most recent sweep.
     pub pending_intents: Gauge,
+    /// Old transaction/group sets retained because ownership is uncertain.
+    pub janitor_uncertain_transactions: Gauge,
     /// Routed Raft commands by fixed command kind and result.
     pub raft_commands_total: LabeledCounter,
     /// Time from router submission until the applied Raft response, by command and result.
@@ -130,6 +132,7 @@ impl Default for Metrics {
             shard_groups_unavailable: Gauge::default(),
             janitor_aborts_total: Counter::default(),
             pending_intents: Gauge::default(),
+            janitor_uncertain_transactions: Gauge::default(),
             raft_commands_total: Family::default(),
             raft_dispatch_seconds: Family::new_with_constructor(
                 latency_histogram as fn() -> Histogram,
@@ -240,13 +243,18 @@ impl Metrics {
         );
         registry.register(
             "nodus_janitor_aborts_total",
-            "Pending intents aborted by the abandoned-intent janitor",
+            "Historical automatic intent aborts; uncertain-owner sweeps do not abort",
             m.janitor_aborts_total.clone(),
         );
         registry.register(
             "nodus_pending_intents",
             "Pending intents observed by the janitor's most recent sweep",
             m.pending_intents.clone(),
+        );
+        registry.register(
+            "nodus_janitor_uncertain_transactions",
+            "Old pending transaction/group sets retained because ownership is uncertain",
+            m.janitor_uncertain_transactions.clone(),
         );
         registry.register(
             "nodus_raft_commands_total",
@@ -678,6 +686,7 @@ mod tests {
         let metrics = Metrics::register(&mut registry);
         metrics.queries_total.inc();
         metrics.janitor_aborts_total.inc_by(2);
+        metrics.janitor_uncertain_transactions.set(3);
         metrics.observe_raft_command("commit_batch", "success", Duration::from_millis(2));
         metrics.observe_raft_snapshot_build("shard-meta", Duration::from_millis(25));
         metrics.observe_intent_batch(4);
@@ -697,6 +706,7 @@ mod tests {
         // prometheus-client appends its own `_total` to counter samples.
         assert!(buf.contains("nodus_queries_total"));
         assert!(buf.contains("nodus_janitor_aborts_total_total 2"));
+        assert!(buf.contains("nodus_janitor_uncertain_transactions 3"));
         assert!(buf.contains(
             "nodus_raft_commands_total_total{command=\"commit_batch\",result=\"success\"} 1"
         ));

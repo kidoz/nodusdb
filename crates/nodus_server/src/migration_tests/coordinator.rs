@@ -743,10 +743,10 @@ async fn sql_savepoints_preserve_rows_indexes_and_original_epoch() {
 
 /// The orphan/uncertain-2PC composition: an intent whose coordinator died
 /// before recording a decision blocks fence acquisition (epochs never advance
-/// past unresolved transactions), the janitor's replicated abort is the
-/// resolution, and the undecided transaction never becomes visible.
+/// past unresolved transactions). Expiry cannot authorize janitor abort; an
+/// explicit owner rollback resolves the uncertainty without making rows visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn orphan_intent_blocks_fencing_until_janitor_resolution() {
+async fn uncertain_intent_keeps_fencing_blocked_until_owner_resolution() {
     let dir = tempfile::tempdir().unwrap();
     let fx = Fixture::new(Arc::new(nodus_storage_mem::MemKvEngine::new()), dir.path()).await;
     let table = TableId::new();
@@ -781,15 +781,38 @@ async fn orphan_intent_blocks_fencing_until_janitor_resolution() {
         "quiescence rejection names the cause: {rejected:?}"
     );
 
-    // Past the TTL, the janitor resolves the orphan with a replicated abort.
+    // Expiry alone cannot resolve ownership, so fencing must remain blocked.
     let future = nodus_storage_api::wallclock_micros() + 600_000_000;
     let report = fx
         .engine
         .sweep_abandoned_intents(std::time::Duration::from_secs(300), future)
         .await
         .unwrap();
-    assert_eq!(report.aborted, 1, "the orphan is resolved: {report:?}");
+    assert_eq!(
+        report.aborted, 0,
+        "uncertain ownership is retained: {report:?}"
+    );
+    assert_eq!(report.uncertain, 1);
     assert_eq!(report.failed, 0);
+    assert!(
+        !fx.command(ShardCommand::MigrationV1(Control::Acquire {
+            operation_id: operation,
+            expected_epoch: 0,
+        }))
+        .await
+        .success
+    );
+
+    // Simulate an explicit rollback from the transaction owner, through Raft.
+    assert!(
+        fx.command(ShardCommand::AbortTxn {
+            txn_id: orphan.0.to_string(),
+            shard_id: None,
+            recorded: false,
+        })
+        .await
+        .success
+    );
 
     // The fence now acquires, and the undecided transaction never surfaced.
     assert!(

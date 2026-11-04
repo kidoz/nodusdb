@@ -72,11 +72,8 @@ repository_uri = "file:///var/lib/nodus/backups"
 # repository_uri = "s3://nodus-backups/prod/cluster-a"
 
 [txn]
-# How old a pending write intent must be before the abandoned-intent janitor
-# aborts it (seconds). Intents of transactions owned by a live session or a
-# decided cross-shard commit are never aborted. This must exceed the longest
-# legitimate transaction: a transaction coordinated by another node is
-# invisible to this node's liveness check, so the TTL is the only guard there.
+# Age threshold (seconds) for reporting unknown-owned intents as uncertain.
+# Expiry does not authorize automatic abort; the historical key name remains.
 abandoned_intent_ttl_secs = 300
 
 [audit]

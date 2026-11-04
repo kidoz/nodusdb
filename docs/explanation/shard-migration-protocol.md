@@ -71,9 +71,12 @@ meta write domain, not table-scoped online availability. Orphan and uncertain
 2PC outcomes are resolved, never inferred, before an affected participant's
 epoch advances: fencing refuses while any pending intent or undecided decision
 exists, a decided commit is re-driven by meta-leader recovery, and an intent
-whose transaction has no decision record past the abandoned-transaction TTL is
-resolved by the janitor's replicated abort (the composition is proven by
-`migration_tests::coordinator::orphan_intent_blocks_fencing_until_janitor_resolution`).
+whose ownership remains unknown is retained even past the observation threshold.
+Local absence and elapsed time cannot prove a remote coordinator dead. The
+janitor reports uncertainty and submits no automatic abort; unresolved intents
+continue blocking fencing until authoritative owner/decision resolution. The
+owner-rollback composition is covered by
+`migration_tests::coordinator::uncertain_intent_keeps_fencing_blocked_until_owner_resolution`.
 
 ## SQL writes and savepoints
 

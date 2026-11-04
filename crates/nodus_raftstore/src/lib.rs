@@ -166,7 +166,7 @@ pub enum ShardCommand {
         #[serde(default)]
         shard_id: Option<String>,
         /// `true` when `txn_id` is the id as RECORDED in this group's store
-        /// (the intent janitor's orphan aborts — the only id recoverable from
+        /// (legacy recorded-id cleanup aborts — the only id recoverable from
         /// a raw store scan after a restart), bypassing the namespace id
         /// mapping a session's abort applies. Defaults to `false`, so older
         /// binaries parse the command unchanged (they apply it as a session

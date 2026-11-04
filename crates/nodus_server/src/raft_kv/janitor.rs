@@ -1,15 +1,13 @@
-//! The abandoned-intent janitor: bounds the lifetime of write intents whose
-//! owning transaction can never finalize — its session died without cleanup,
-//! or the coordinating node crashed — so they cannot block writers with
-//! `WriteConflict`, pin MVCC GC, or stall (legacy-format) snapshot builds
-//! forever, which is what grew the Raft log without bound.
+//! Conservative intent inspection. A local liveness map and a TTL cannot prove
+//! that a remote coordinator is dead or that it can no longer commit.
+//! Old intents with no visible owner/decision are retained as uncertain.
+//! Automatic orphan abortion requires a durable, fenced ownership/decision
+//! authority that does not exist yet; this sweep submits no abort commands.
 //!
 //! Safety rules, in check order (when in doubt, skip):
 //!
-//! 1. UPGRADE GATE: no aborts while a rolling upgrade is in flight. The abort
-//!    of an orphan names the id as *recorded* in the group's store, applied
-//!    via the `abort_physical` fallback a pre-upgrade binary lacks; applying
-//!    it there would be a benign no-op and diverge the replica.
+//! 1. UPGRADE GATE: retain the existing rolling-upgrade pause and fail closed
+//!    when its authority cannot be read.
 //! 2. LIVE: an intent whose transaction is in `txn_groups` — begun here and
 //!    not yet finalized, including one mid-`commit`/`mid-abort` (those keep
 //!    their entry until finalize completes) — is never aborted.
@@ -17,21 +15,15 @@
 //!    belongs to the cross-shard recovery machinery, which re-drives the
 //!    decided commit; the janitor never touches it. An undecodable record
 //!    fails the whole sweep closed.
-//! 4. YOUNG: only intents older than `txn.abandoned_intent_ttl_secs` are
-//!    eligible. The age comes from the intent's durable HLC-scale write stamp,
-//!    so it survives a restart rather than resetting with process uptime. The
-//!    TTL (default 300s) must dwarf any in-flight commit window (ms), which is
-//!    what makes the prepare-to-decision race in (3) unreachable in practice;
-//!    a transaction whose *coordinator lives on another node* is invisible to
-//!    (2), so the TTL must also exceed the longest legitimate transaction.
+//! 4. YOUNG: younger intents remain in the young classification. Durable write
+//!    stamps keep age meaningful after restart; age is observability, not proof.
+//! 5. UNCERTAIN: expired, locally unknown intents remain protected. A remote
+//!    transaction may still be live, preparing, or publishing its decision.
 //!
-//! Aborts are replicated (`ShardCommand::AbortTxn` through the group's Raft),
-//! never local-only, so every replica releases the intent identically; and
-//! they run only for groups this node currently leads, so replicas don't
-//! duplicate the sweep.
+//! Counts cover only led groups. Explicit transaction rollback and durable
+//! decided-commit recovery retain their normal replicated resolution paths.
 
 use anyhow::Result;
-use nodus_raftstore::ShardCommand;
 use nodus_raftstore::upgrade::{self, Phase};
 use nodus_storage_api::{NamespacedKvEngine, Timestamp, TxnId};
 use std::collections::{BTreeMap, HashSet};
@@ -50,8 +42,8 @@ pub(crate) enum IntentVerdict {
     TwoPcCoordinated,
     /// Younger than the TTL; may still be finalized by its owner.
     Young,
-    /// None of the above: the owner is definitively dead; abort.
-    Abandoned,
+    /// Old and locally unknown; no authoritative proof permits automatic abort.
+    UncertainOwner,
 }
 
 /// Classifies one pending intent set. `now`/`oldest_ts` are HLC-scale
@@ -75,7 +67,7 @@ pub(crate) fn classify_intent(
     if age < ttl {
         IntentVerdict::Young
     } else {
-        IntentVerdict::Abandoned
+        IntentVerdict::UncertainOwner
     }
 }
 
@@ -87,9 +79,11 @@ pub struct SweepReport {
     pub live: usize,
     pub coordinated: usize,
     pub young: usize,
-    /// Aborts submitted and applied.
+    /// Old transaction/group sets retained because ownership is uncertain.
+    pub uncertain: usize,
+    /// Kept for report compatibility; inspection-only sweeps submit no aborts.
     pub aborted: usize,
-    /// Aborts that failed to replicate (retried next sweep).
+    /// Kept for report compatibility; inspection-only sweeps attempt no aborts.
     pub failed: usize,
 }
 
@@ -144,10 +138,9 @@ impl RaftKvEngine {
         live
     }
 
-    /// One janitor pass over the groups this node leads. Aborts every pending
-    /// intent older than `ttl` whose transaction is definitively dead (see the
-    /// module docs for the safety rules). `now` is an HLC-scale timestamp; in
-    /// production `wallclock_micros()`, parameterized for tests.
+    /// Classifies pending transaction/group sets led here, retaining uncertain
+    /// owners. This inspection-only pass does not mutate intents. `ttl` is an
+    /// observation threshold, not abort authority; `now` is an HLC-scale stamp.
     pub async fn sweep_abandoned_intents(
         &self,
         ttl: Duration,
@@ -155,9 +148,7 @@ impl RaftKvEngine {
     ) -> Result<SweepReport> {
         let mut report = SweepReport::default();
 
-        // Upgrade gate: a mixed-version cluster must not replicate janitor
-        // aborts (see module docs, rule 1). Fail closed on an unreadable
-        // authority.
+        // Retain the upgrade pause; fail closed on an unreadable authority.
         let phase = upgrade::read(self.local.as_ref())?.phase;
         if matches!(phase, Phase::RollingNodes | Phase::ReadyToFinalize) {
             tracing::debug!(?phase, "intent janitor paused during rolling upgrade");
@@ -171,8 +162,7 @@ impl RaftKvEngine {
         // Attribute each recorded intent to its owning group. Data-group keys
         // carry the `{group}\0` namespace prefix; anything else is the meta
         // group — except a `shard-*` prefix no hosted group claims, which is
-        // skipped: aborting another node's group state locally would diverge
-        // this node from that group's real replicas.
+        // skipped: another node's unhosted group is outside this sweep's scope.
         let groups: Vec<(String, Vec<u8>)> = self
             .manager
             .hosted_group_ids()
@@ -203,9 +193,8 @@ impl RaftKvEngine {
             }
         }
 
-        // Only sweep groups this node leads: a single sweeper per group, and
-        // the leader's applied view is authoritative.
-        let mut candidates = Vec::new();
+        // Count only groups led here. Leadership makes this a useful applied
+        // view, but does not establish the death of a transaction's coordinator.
         for ((group, txn_id), oldest_ts) in by_txn {
             let led = match self.manager.get(&group).await {
                 Some(raft) => {
@@ -227,52 +216,10 @@ impl RaftKvEngine {
                 IntentVerdict::LiveSession => report.live += 1,
                 IntentVerdict::TwoPcCoordinated => report.coordinated += 1,
                 IntentVerdict::Young => report.young += 1,
-                IntentVerdict::Abandoned => candidates.push((group, txn_id)),
+                IntentVerdict::UncertainOwner => report.uncertain += 1,
             }
         }
 
-        if candidates.is_empty() {
-            return Ok(report);
-        }
-        // The router's submit blocks on a oneshot and must run off the reactor.
-        let router = self.router.clone();
-        let (aborted, failed) = tokio::task::spawn_blocking(move || {
-            let mut aborted = 0;
-            let mut failed = 0;
-            for (group, txn_id) in candidates {
-                let result = router.submit(
-                    &group,
-                    ShardCommand::AbortTxn {
-                        txn_id: txn_id.0.to_string(),
-                        shard_id: RaftKvEngine::shard_field(&group),
-                        recorded: true,
-                    },
-                );
-                match result {
-                    Ok(()) => {
-                        aborted += 1;
-                        tracing::info!(
-                            txn = %txn_id.0,
-                            group,
-                            "janitor aborted abandoned transaction's intents"
-                        );
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        tracing::warn!(
-                            txn = %txn_id.0,
-                            group,
-                            "janitor abort failed (retried next sweep): {e}"
-                        );
-                    }
-                }
-            }
-            (aborted, failed)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("janitor abort task panicked: {e}"))?;
-        report.aborted = aborted;
-        report.failed = failed;
         Ok(report)
     }
 }
@@ -308,15 +255,15 @@ mod tests {
             classify_intent(NOW, young, TTL, false, false),
             IntentVerdict::Young
         );
-        // An old orphan is abandoned and aborted.
+        // Age and local absence do not establish a dead owner.
         assert_eq!(
             classify_intent(NOW, old, TTL, false, false),
-            IntentVerdict::Abandoned
+            IntentVerdict::UncertainOwner
         );
-        // Exactly at the TTL boundary the intent is old enough to collect.
+        // At the threshold it is uncertain, never eligible for expiry-only abort.
         assert_eq!(
             classify_intent(NOW, NOW - 300_000_000, TTL, false, false),
-            IntentVerdict::Abandoned
+            IntentVerdict::UncertainOwner
         );
     }
 

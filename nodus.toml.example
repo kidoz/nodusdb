@@ -41,6 +41,10 @@ data_dir = "./.local/nodus/data"
 password = "nodus"
 token = "nodus-dev-token"
 
+[txn]
+# Observation threshold in seconds; expiry does not authorize automatic abort.
+abandoned_intent_ttl_secs = 300
+
 [tls]
 enabled = false
 # cert_path = "./.local/nodus/tls/server.crt"

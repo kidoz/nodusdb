@@ -1222,11 +1222,9 @@ pub async fn run_server_full(
         }
     });
 
-    // Background abandoned-intent janitor: aborts pending intents whose owning
-    // transaction is definitively dead (no live session here, no 2PC decision
-    // record, older than txn.abandoned_intent_ttl_secs) on groups this node
-    // leads, so they cannot block writers, pin MVCC GC, or stall snapshot
-    // builds forever. Safety rules: `raft_kv::janitor`.
+    // Background intent inspection: unknown ownership is retained, regardless
+    // of age. Expiry/local absence cannot prove a remote coordinator dead.
+    // Automatic orphan cleanup awaits durable fenced ownership authority.
     let janitor_kv = raft_kv.clone();
     let janitor_metrics = state.metrics.clone();
     let janitor_ttl = std::time::Duration::from_secs(config.txn.abandoned_intent_ttl_secs);
@@ -1247,20 +1245,16 @@ pub async fn run_server_full(
                     match janitor_kv.sweep_abandoned_intents(janitor_ttl, now).await {
                         Ok(report) => {
                             janitor_metrics.pending_intents.set(report.pending as i64);
-                            if report.aborted > 0 {
-                                janitor_metrics.janitor_aborts_total.inc_by(report.aborted as u64);
-                                tracing::info!(
-                                    aborted = report.aborted,
-                                    pending = report.pending,
-                                    "intent janitor sweep aborted abandoned intents"
-                                );
-                            }
-                            if report.failed > 0 {
+                            janitor_metrics.janitor_uncertain_transactions.set(report.uncertain as i64);
+                            if report.uncertain > 0 {
                                 tracing::warn!(
-                                    failed = report.failed,
-                                    "intent janitor sweep had abort failures"
+                                    uncertain = report.uncertain,
+                                    pending = report.pending,
+                                    "old intents retained: transaction ownership is uncertain; automatic abort is disabled"
                                 );
                             }
+                            // The historical abort counter remains exported;
+                            // inspection-only sweeps never increment it.
                         }
                         Err(e) => tracing::warn!("intent janitor sweep failed: {e}"),
                     }

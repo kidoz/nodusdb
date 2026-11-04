@@ -1,5 +1,7 @@
 mod epochs;
 mod janitor;
+#[cfg(test)]
+mod janitor_tests;
 mod routing;
 #[cfg(test)]
 mod routing_tests;
@@ -140,10 +142,9 @@ impl RaftKvEngine {
     /// The transaction's groups, without deregistering it: the entry must
     /// stay in `txn_groups` until the commit/abort has fully run, so the
     /// intent janitor still sees the transaction as live while its 2PC is in
-    /// flight (between prepare and the recorded decision, age is the only
-    /// other guard). Callers remove the entry with [`Self::finalize_targets`]
-    /// once finalization has completed — on success OR failure, so a leaked
-    /// entry cannot exempt abandoned intents from the janitor forever.
+    /// flight. Remote participants may not see this entry and must retain
+    /// uncertain intents instead of inferring death from age. Callers remove
+    /// the entry with [`Self::finalize_targets`] once finalization completes.
     fn finalize_targets_peek(&self, txn_id: TxnId) -> BTreeMap<String, TxnParticipant> {
         self.txn_groups
             .lock()
@@ -164,10 +165,9 @@ impl RaftKvEngine {
     /// Prepare participants, persist the meta decision, then drive commits.
     /// Recovery retains the decision's recorded epochs. An uncertain window —
     /// prepares acknowledged but no decision record, coordinator dead — is
-    /// resolved by the intent janitor's replicated abort once the TTL passes
-    /// (the TTL dwarfs any commit window, so expiry plus a missing decision
-    /// record means the transaction never decided); until then, migration
-    /// quiescence keeps the affected participants' epochs from advancing.
+    /// retained until authoritative owner/decision resolution is available.
+    /// Local absence and expiry do not prove that a coordinator cannot commit;
+    /// migration quiescence keeps these participants' epochs from advancing.
     fn commit_cross_shard(
         &self,
         txn_id: TxnId,
@@ -1209,11 +1209,10 @@ mod tests {
         );
     }
 
-    /// An intent whose owner vanished (written straight into the group's slice
-    /// of the shared store, exactly as crash replay leaves it) is aborted by
-    /// the janitor once older than the TTL, and the abort unblocks writers.
+    /// Replayed-looking intents with no local owner remain uncertain past the
+    /// age threshold. Conflicting writes stay blocked until owner resolution.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn janitor_aborts_abandoned_intents_and_unblocks_writers() {
+    async fn janitor_retains_uncertain_intents_and_conflicting_writes_remain_blocked() {
         let fx = setup_two_shards().await;
         let engine = fx.engine.clone();
         let base = engine.local.clone();
@@ -1260,27 +1259,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            report.aborted, 1,
-            "the orphan should be aborted: {report:?}"
+            report.aborted, 0,
+            "uncertain ownership must never authorize abort: {report:?}"
         );
+        assert_eq!(report.uncertain, 1);
         assert_eq!(report.failed, 0);
-        assert!(!base.has_pending_intents(b"").unwrap());
+        assert!(base.has_pending_intents(b"").unwrap());
 
-        // The writer is unblocked through the real raft write path.
+        // Expiry did not unlock the row for a competing Raft write.
         let e = engine.clone();
         let rt = row_t.clone();
-        tokio::task::spawn_blocking(move || {
-            let t = TxnId::new();
-            e.write_intent(t, Bytes::from(rt.into_bytes()), Bytes::from_static(b"new"))
-                .unwrap();
-            e.commit(t, 10).unwrap();
+        let still_blocked = tokio::task::spawn_blocking(move || {
+            e.write_intent(
+                TxnId::new(),
+                Bytes::from(rt.into_bytes()),
+                Bytes::from_static(b"new"),
+            )
         })
         .await
         .unwrap();
-        assert_eq!(
-            engine.get(row_t.as_bytes(), 100).unwrap(),
-            Some(Bytes::from_static(b"new"))
-        );
+        assert!(still_blocked.is_err());
+        assert_eq!(engine.get(row_t.as_bytes(), 100).unwrap(), None);
         fx.engine.manager.shutdown_all().await;
     }
 
@@ -1324,11 +1323,12 @@ mod tests {
         assert_eq!(report.live, 1, "the live txn is skipped: {report:?}");
         assert_eq!(report.young, 1, "the young orphan is skipped: {report:?}");
 
-        // Far in the future: the live txn is STILL protected; the orphan
-        // (ownerless) is collected.
+        // Far in the future: the local owner stays live; the unknown owner is
+        // uncertain, never inferred dead from an expired age threshold.
         let future = nodus_storage_api::wallclock_micros() + 600_000_000;
         let report = engine.sweep_abandoned_intents(ttl, future).await.unwrap();
-        assert_eq!(report.aborted, 1, "only the orphan aborts: {report:?}");
+        assert_eq!(report.aborted, 0, "no expiry-only aborts: {report:?}");
+        assert_eq!(report.uncertain, 1);
         assert_eq!(report.live, 1);
         assert!(
             engine
@@ -1336,8 +1336,8 @@ mod tests {
                 .pending_intents(b"")
                 .unwrap()
                 .iter()
-                .all(|p| p.txn_id != orphan),
-            "the orphan's intents are gone"
+                .any(|p| p.txn_id == orphan),
+            "uncertain intents remain protected"
         );
 
         // Cleanup: the live transaction still aborts cleanly.

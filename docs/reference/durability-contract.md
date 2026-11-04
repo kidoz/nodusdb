@@ -13,6 +13,7 @@ These hold when a persistent data directory is configured (`[storage] data_dir`)
 | Commit durability | A transaction whose `COMMIT` has been acknowledged to the client survives process crash and restart. Its writes reach the write-ahead log, and the log is `fsync`ed, before the acknowledgement is sent. |
 | Batch commit recovery | A persistent `CommitTxnBatchV1` is one atomic WAL record followed by one sync. Recovery either replays every transaction in that record or none of them; live publication begins only after the sync succeeds. |
 | Abort invisibility | An aborted or never-committed transaction is never visible, before or after a crash. Its intents are invisible to readers and discarded on abort. Batched put/delete intents remain invisible until their transaction commits. |
+| Uncertain ownership is protected | The intent janitor does not infer death from age, local-session absence, or an absent visible 2PC decision. It retains uncertain intents instead of automatically aborting a possibly live remote transaction. |
 | No torn reads after crash | Recovery never mistakes a torn or partial file for a complete one. A crash part-way through a flush, compaction, WAL append, or manifest write leaves the store recoverable to its last consistent state, with no acknowledged write lost. |
 | Version retention | MVCC versions are reclaimed only at or below the garbage-collection watermark — the oldest timestamp any in-flight reader could still observe — so a live read never loses a version it is entitled to see. |
 
@@ -47,6 +48,9 @@ is what the commit-acknowledgement ordering rests on.
 | One commit batch syncs once and recovers every transaction, including after intent flushes | `nodus_storage_lsm`: `powercut_tests::commit_batch_syncs_once_and_recovers_every_transaction`, `commit_batch_recovers_all_transactions_after_intent_flushes` |
 | Reserved keys, write conflicts, and invalid sizes reject a write batch without partial intents | `nodus_raftstore`: `migration::tests::write_batch_rejects_any_reserved_key_before_writing`, `migration::tests::write_batch_conflict_is_rejected_without_partial_intents`, `migration::tests::invalid_batch_sizes_are_rejected_at_apply` |
 | Batched commits publish all transactions and replay idempotently | `nodus_raftstore`: `migration::tests::commit_batch_publishes_all_transactions_and_replays_idempotently` |
+| An old remote transaction still commits all acknowledged writes; a remote sweep after prepare but before the commit decision cannot tear a successful commit | `nodus_server`: `raft_kv::janitor_tests::old_remote_transaction_survives_sweep_and_commits_every_write`, `remote_sweep_between_prepare_and_decision_cannot_tear_a_commit` (two persistent in-process nodes, real TCP Raft forwarding, parameterized age, bounded pause at the production meta-decision write) |
+| Unknown-owned intents remain uncommitted and block conflicting writes and fencing until authoritative resolution | `nodus_server`: `raft_kv::tests::janitor_retains_uncertain_intents_and_conflicting_writes_remain_blocked`, `janitor_skips_live_sessions_and_young_orphans`, `migration_tests::coordinator::uncertain_intent_keeps_fencing_blocked_until_owner_resolution` |
+| Decided 2PC commits remain recoverable and uncertain-backlog metrics are exported | `nodus_server`: `raft_kv::tests::janitor_never_aborts_decided_2pc_participants`; `nodus_monitoring`: `registered_metrics_appear_in_output` |
 | Unknown valid-frame WAL and Raft log records fail recovery rather than being skipped | `nodus_storage_wal`: `recover_rejects_a_newer_record_version`, `recover_rejects_undecodable_supported_version_payloads`; `nodus_raftstore`: `store_construction_fails_closed_on_unknown_log_envelope`, `store_construction_fails_closed_on_malformed_log_entry_json` |
 | Incorrect or missing WAL encryption keys, short encrypted payloads, and undecodable legacy records reject recovery without changing the segment | `nodus_storage_wal`: `incorrect_encryption_configuration_preserves_wal_bytes`, `authentication_failure_after_valid_prefix_preserves_entire_wal`, `complete_frames_with_short_encrypted_payloads_are_not_truncated`, `undecodable_legacy_frames_are_not_skipped_or_truncated` |
 | Wrong/missing-key LSM startup and predecessor authentication failure preserve intact files; retries recover acknowledged commits across rotation and exclude aborts | `nodus_storage_lsm`, integration test `wal_recovery`: `failed_encrypted_startup_preserves_files_and_correct_key_recovers_commits`, `authentication_failure_in_predecessor_segment_rejects_startup_without_truncation` |
@@ -128,6 +132,48 @@ executor batch. Outside an explicit transaction, that batch is one autocommit
 transaction: a late decoding, planning, or constraint failure rolls back rows
 from every chunk. Inside an existing user transaction, COPY joins that
 transaction and leaves commit or rollback ownership with the user.
+
+## Uncertain transaction intents
+
+An intent's age and a node-local transaction map cannot establish that its
+coordinator is dead or no longer permitted to commit. A remote transaction may
+remain live beyond the configured threshold, and a successful prepare can
+precede publication or local observation of its durable commit decision.
+
+The janitor therefore performs inspection only. It classifies pending
+transaction/group sets led by this node as locally live, visibly coordinated,
+young, or old with uncertain ownership. It submits no abort commands. An
+unreadable upgrade authority or undecodable 2PC record fails the sweep closed;
+the existing rolling-upgrade pause remains. Explicit owner-driven rollback and
+durable decided-commit recovery retain their replicated resolution paths.
+All nodes that may lead a group must run this behavior: a patched coordinator
+alone cannot protect its intents from an older remote janitor.
+
+`txn.abandoned_intent_ttl_secs` keeps its existing name, default of 300 seconds,
+positive-value validation, and environment override. It now sets the age at
+which an unknown-owned intent is reported as uncertain, and continues to set
+the inspection cadence (half the threshold, clamped to 1–30 seconds). Expiry
+does not authorize abort. No new durable record or protocol version is added.
+
+The latest successful sweep updates these Prometheus samples:
+
+| Sample | Meaning |
+| --- | --- |
+| `nodus_pending_intents` | Observed pending transaction/group sets on groups led here; this counts sets, not individual keys. |
+| `nodus_janitor_uncertain_transactions` | Old sets retained because no authoritative owner/decision resolution is available. |
+| `nodus_janitor_aborts_total_total` | Existing historical abort counter, retained under its published sample name; inspection-only sweeps do not increase it. |
+
+Sweeps log a summary when old uncertain sets remain. Metrics are observations,
+not death proofs, and locally visible decisions can lag a remote coordinator.
+True orphan cleanup is deferred: uncertain intents may indefinitely block
+writers, migration fencing, MVCC retention progress, or legacy snapshot builds
+and log reclamation. Fencing must remain blocked until resolution is known;
+shortening the threshold is not a safe cleanup mechanism. Automatic cleanup
+requires a durable cluster-wide ownership/abort-decision authority that fences
+late commits. That protocol and bounded orphan reclamation remain follow-up
+work. The two-node tests prove the targeted safety regressions, not general
+distributed isolation, process-crash recovery of undecided transactions, or
+power-loss behavior.
 
 ## Required WAL chain
 
