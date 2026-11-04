@@ -48,6 +48,9 @@ is what the commit-acknowledgement ordering rests on.
 | Reserved keys, write conflicts, and invalid sizes reject a write batch without partial intents | `nodus_raftstore`: `migration::tests::write_batch_rejects_any_reserved_key_before_writing`, `migration::tests::write_batch_conflict_is_rejected_without_partial_intents`, `migration::tests::invalid_batch_sizes_are_rejected_at_apply` |
 | Batched commits publish all transactions and replay idempotently | `nodus_raftstore`: `migration::tests::commit_batch_publishes_all_transactions_and_replays_idempotently` |
 | Unknown valid-frame WAL and Raft log records fail recovery rather than being skipped | `nodus_storage_wal`: `recover_rejects_a_newer_record_version`, `recover_rejects_undecodable_supported_version_payloads`; `nodus_raftstore`: `store_construction_fails_closed_on_unknown_log_envelope`, `store_construction_fails_closed_on_malformed_log_entry_json` |
+| Incorrect or missing WAL encryption keys, short encrypted payloads, and undecodable legacy records reject recovery without changing the segment | `nodus_storage_wal`: `incorrect_encryption_configuration_preserves_wal_bytes`, `authentication_failure_after_valid_prefix_preserves_entire_wal`, `complete_frames_with_short_encrypted_payloads_are_not_truncated`, `undecodable_legacy_frames_are_not_skipped_or_truncated` |
+| Wrong/missing-key LSM startup and predecessor authentication failure preserve intact files; retries recover acknowledged commits across rotation and exclude aborts | `nodus_storage_lsm`, integration test `wal_recovery`: `failed_encrypted_startup_preserves_files_and_correct_key_recovers_commits`, `authentication_failure_in_predecessor_segment_rejects_startup_without_truncation` |
+| Incomplete encrypted tails are repaired at every byte boundary, and later appends survive reopen | `nodus_storage_wal`: `encrypted_incomplete_tail_is_repaired_before_later_appends` |
 | WAL segment power cut keeps exactly the fsynced prefix; garbled or flipped tails are rejected | `nodus_storage_wal`: `power_cut_preserves_exactly_the_synced_prefix`, `power_cut_with_garbled_tail_recovers_the_synced_prefix` |
 | Power cut on either side of the flush's manifest rename (old or new manifest, orphan files present or lost, never a hybrid) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_flush_publishes_old_or_new_manifest` |
 | SSTable creation, WAL rotation, or manifest publication fails; acknowledged versions and tombstones remain readable through orphan cleanup, retry, WAL reclamation, and restart | `nodus_storage_lsm`: `flush_tests::failed_sstable_flush_preserves_rows_through_retry_and_restart`, `failed_wal_rotation_preserves_rows_through_retry_and_restart`, `failed_manifest_flush_preserves_rows_through_retry_and_restart` |
@@ -94,6 +97,22 @@ unit. Unknown record versions and undecodable supported-version payloads in
 complete, valid WAL frames fail recovery; unknown or malformed persisted Raft
 log entries likewise fail store construction. This is distinct from a torn or
 partial trailing frame, which recovery truncates at the last valid boundary.
+
+WAL authentication failures and undecodable legacy records in complete,
+CRC-valid frames also fail recovery without truncating or skipping bytes. This
+includes opening an encrypted WAL with the wrong key or without a key, and
+opening a plaintext WAL with encryption enabled. Errors identify the segment
+path and frame byte offset. Verify the configured key and file integrity before
+retrying; do not delete or truncate the log to bypass the error. After a failed
+key check, reopening with the original key can replay the intact records.
+
+This hardening changes no WAL bytes or record versions: supported versioned and
+legacy records retain their readers, including the previous AES-GCM codec.
+Recovery must run before concurrent appenders are admitted. Incomplete trailing
+headers or payloads still truncate to the last valid record, and the existing
+CRC-mismatch tail-repair policy remains unchanged. A CRC mismatch alone cannot
+distinguish a torn unsynced append from damage to previously synced bytes; this
+change does not add a durable synced-length watermark.
 
 `COPY FROM STDIN` accumulates all wire chunks and executes their rows in one
 executor batch. Outside an explicit transaction, that batch is one autocommit

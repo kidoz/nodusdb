@@ -84,6 +84,9 @@ fn crc32(data: &[u8]) -> u32 {
 pub trait WalEngine: Send + Sync {
     fn append(&self, record: WalRecord) -> anyhow::Result<u64>; // returns LSN
     fn sync(&self) -> anyhow::Result<()>;
+    /// Replays supported records. File-backed recovery may repair a torn tail,
+    /// but authentication and record-decoding errors must preserve the file.
+    /// Run recovery before admitting concurrent appenders.
     fn recover(&self) -> anyhow::Result<Vec<WalRecord>>;
 }
 
@@ -161,80 +164,89 @@ impl WalEngine for FileWalEngine {
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let mut records = Vec::new();
-        // Offset just past the last fully-valid frame: the point recovery
-        // truncates back to when the tail is torn.
+        // Offset just past the last fully-valid record. Only a torn frame may
+        // reach tail repair; complete-frame authentication/decode errors return
+        // without altering the file (a wrong key is not crash residue).
         let mut valid_end: u64 = 0;
 
-        loop {
-            // A clean end of log: nothing more to read.
-            let len = match reader.read_u32::<LittleEndian>() {
-                Ok(len) => len,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+        while valid_end < file_len {
+            let frame_error = |message: String| {
+                anyhow::anyhow!(
+                    "WAL {} at byte offset {valid_end}: {message}",
+                    self.path.display()
+                )
             };
-
-            // From here on, any short read or checksum mismatch means the tail
-            // record was torn/corrupted by a crash mid-append. Stop replaying at
-            // that point instead of erroring out — every record before it is
-            // valid and durable, so the engine still recovers and starts.
-            let crc = match reader.read_u32::<LittleEndian>() {
-                Ok(crc) => crc,
-                Err(_) => break,
-            };
-            let mut buf = vec![0u8; len as usize];
-            if reader.read_exact(&mut buf).is_err() {
+            // A short header/payload is an incomplete trailing append. Check
+            // available bytes before allocating from an untrusted length.
+            if file_len - valid_end < 8 {
                 break;
             }
+            let len = reader
+                .read_u32::<LittleEndian>()
+                .map_err(|e| frame_error(format!("failed to read frame length: {e}")))?;
+            let crc = reader
+                .read_u32::<LittleEndian>()
+                .map_err(|e| frame_error(format!("failed to read frame checksum: {e}")))?;
+            if u64::from(len) > file_len - valid_end - 8 {
+                break;
+            }
+            let mut buf = vec![0u8; len as usize];
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| frame_error(format!("failed to read frame payload: {e}")))?;
+            // Retain the existing checksum-based torn-write repair policy.
             if crc32(&buf) != crc {
                 break;
             }
 
             let data = if let Some(cipher) = &self.cipher {
-                if buf.len() < 12 {
-                    break;
+                // AES-GCM requires a 12-byte nonce and a 16-byte tag even for
+                // empty plaintext. A complete CRC-valid frame shorter than that
+                // is invalid, not evidence of an incomplete append.
+                if buf.len() < 28 {
+                    return Err(frame_error(
+                        "invalid encrypted WAL payload: expected a nonce and authentication tag; check WAL encryption configuration".into(),
+                    ));
                 }
                 let nonce = <&Nonce<_>>::try_from(&buf[..12])
-                    .map_err(|e| anyhow::anyhow!("invalid WAL nonce: {e}"))?;
-                match cipher.decrypt(nonce, &buf[12..]) {
-                    Ok(data) => data,
-                    Err(_) => break,
-                }
+                    .map_err(|e| frame_error(format!("invalid WAL nonce: {e}")))?;
+                cipher.decrypt(nonce, &buf[12..]).map_err(|_| {
+                    frame_error(
+                        "WAL authentication failed: check the encryption key/configuration and file integrity".into(),
+                    )
+                })?
             } else {
                 buf
             };
-            // The frame is complete and authentic: everything up to here is
-            // replayable, whatever happens to the record decode below.
-            valid_end += 8 + len as u64;
 
             // Dispatch on the record envelope: parse a supported version or
             // legacy (pre-envelope) bytes; refuse a record from a newer WAL
             // format rather than silently misreplaying it.
             use nodus_common::versioned::{Envelope, decode};
-            match decode(&data) {
+            let record = match decode(&data) {
                 Envelope::Versioned { version, payload } if version == WAL_RECORD_VERSION => {
-                    let record = serde_json::from_slice(payload).map_err(|error| {
-                        anyhow::anyhow!("failed to decode WAL record version {version}: {error}")
-                    })?;
-                    records.push(record);
+                    serde_json::from_slice(payload).map_err(|error| {
+                        frame_error(format!("failed to decode WAL record version {version}: {error}"))
+                    })?
                 }
                 Envelope::Versioned { version, .. } => {
-                    anyhow::bail!(
+                    return Err(frame_error(format!(
                         "unsupported WAL record version {version}; this binary supports {WAL_RECORD_VERSION}"
-                    );
+                    )));
                 }
-                Envelope::Legacy(legacy) => {
-                    if let Ok(record) = serde_json::from_slice(legacy) {
-                        records.push(record);
-                    }
-                }
-            }
+                Envelope::Legacy(legacy) => serde_json::from_slice(legacy).map_err(|error| {
+                    frame_error(format!(
+                        "failed to decode legacy WAL record: {error}; check WAL encryption configuration and file integrity"
+                    ))
+                })?,
+            };
+            records.push(record);
+            valid_end += 8 + u64::from(len);
         }
 
-        // A tail past the last valid frame is crash residue: bytes that were
-        // never fsynced (or a torn final write) and were therefore never
-        // acknowledged. Truncate them away — otherwise new appends would land
-        // behind undecodable bytes and every later recovery would stop at the
-        // same tear, silently dropping records written after this one.
+        // Only incomplete or checksum-failing frames reach this repair path.
+        // Truncate the torn tail so later appends remain replayable. Errors in
+        // complete CRC-valid frames above leave every byte intact.
         if valid_end < file_len {
             let file = OpenOptions::new().write(true).open(&self.path)?;
             file.set_len(valid_end)?;
@@ -297,6 +309,111 @@ mod tests {
             recovered[0],
             WalRecord::V1(WalRecordV1::Checkpoint { ts: 99 })
         ));
+    }
+
+    #[test]
+    fn incorrect_encryption_configuration_preserves_wal_bytes() {
+        for (written_key, recovery_key) in [
+            (Some([42; 32]), Some([7; 32])),
+            (Some([42; 32]), None),
+            (None, Some([42; 32])),
+        ] {
+            let file = NamedTempFile::new().unwrap();
+            {
+                let writer = FileWalEngine::with_encryption(file.path(), written_key).unwrap();
+                writer.append(checkpoint(1)).unwrap();
+                writer.append(checkpoint(2)).unwrap();
+                writer.sync().unwrap();
+            }
+            let original = std::fs::read(file.path()).unwrap();
+            let wrong = FileWalEngine::with_encryption(file.path(), recovery_key).unwrap();
+            let result = wrong.recover();
+            assert_eq!(std::fs::read(file.path()).unwrap(), original);
+            let error = result.expect_err("incorrect encryption configuration must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&file.path().display().to_string())
+            );
+            assert!(error.to_string().contains("byte offset 0"));
+            drop(wrong);
+
+            let correct = FileWalEngine::with_encryption(file.path(), written_key).unwrap();
+            assert_eq!(checkpoint_ts(&correct.recover().unwrap()), vec![1, 2]);
+            correct.append(checkpoint(3)).unwrap();
+            correct.sync().unwrap();
+            assert_eq!(checkpoint_ts(&correct.recover().unwrap()), vec![1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn authentication_failure_after_valid_prefix_preserves_entire_wal() {
+        let file = NamedTempFile::new().unwrap();
+        let engine = FileWalEngine::with_encryption(file.path(), Some([42; 32])).unwrap();
+        engine.append(checkpoint(1)).unwrap();
+        engine.sync().unwrap();
+        let offset = std::fs::metadata(file.path()).unwrap().len();
+        let other = FileWalEngine::with_encryption(file.path(), Some([7; 32])).unwrap();
+        other.append(checkpoint(2)).unwrap();
+        other.sync().unwrap();
+        engine.append(checkpoint(3)).unwrap();
+        engine.sync().unwrap();
+        let original = std::fs::read(file.path()).unwrap();
+
+        let result = engine.recover();
+        assert_eq!(std::fs::read(file.path()).unwrap(), original);
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("authentication failed"), "{message}");
+        assert!(
+            message.contains(&format!("byte offset {offset}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn complete_frames_with_short_encrypted_payloads_are_not_truncated() {
+        for len in [0, 11, 12, 27] {
+            let file = NamedTempFile::new().unwrap();
+            write_legacy_frame(file.path(), &vec![0; len]);
+            let original = std::fs::read(file.path()).unwrap();
+            let engine = FileWalEngine::with_encryption(file.path(), Some([42; 32])).unwrap();
+            let result = engine.recover();
+            assert_eq!(std::fs::read(file.path()).unwrap(), original);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("encrypted WAL payload")
+            );
+        }
+    }
+
+    #[test]
+    fn undecodable_legacy_frames_are_not_skipped_or_truncated() {
+        for payload in [
+            b"{}".as_slice(),
+            b"not JSON",
+            br#"{"V1":{"UnknownRecord":{}}}"#,
+            b"NDBv\x01",
+        ] {
+            let file = NamedTempFile::new().unwrap();
+            let engine = FileWalEngine::new(file.path()).unwrap();
+            engine.append(checkpoint(1)).unwrap();
+            engine.sync().unwrap();
+            write_legacy_frame(file.path(), payload);
+            engine.append(checkpoint(2)).unwrap();
+            engine.sync().unwrap();
+            let original = std::fs::read(file.path()).unwrap();
+
+            let result = engine.recover();
+            assert_eq!(std::fs::read(file.path()).unwrap(), original);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("failed to decode legacy WAL record")
+            );
+        }
     }
 
     /// Writes one frame (`[len][crc][payload]`) of raw bytes, as a pre-envelope
@@ -376,7 +493,9 @@ mod tests {
             engine.append(checkpoint(2)).unwrap();
             engine.sync().unwrap();
 
+            let original = std::fs::read(&path).unwrap();
             let error = engine.recover().unwrap_err();
+            assert_eq!(std::fs::read(&path).unwrap(), original);
             assert!(
                 error
                     .to_string()
@@ -522,5 +641,32 @@ mod tests {
         drop(engine);
         let recovered = FileWalEngine::new(&path).unwrap().recover().unwrap();
         assert_eq!(checkpoint_ts(&recovered), vec![1, 2]);
+    }
+
+    #[test]
+    fn encrypted_incomplete_tail_is_repaired_before_later_appends() {
+        let file = NamedTempFile::new().unwrap();
+        let key = Some([42; 32]);
+        let synced_len;
+        let image;
+        {
+            let engine = FileWalEngine::with_encryption(file.path(), key).unwrap();
+            engine.append(checkpoint(1)).unwrap();
+            engine.sync().unwrap();
+            synced_len = std::fs::metadata(file.path()).unwrap().len() as usize;
+            engine.append(checkpoint(2)).unwrap();
+            image = std::fs::read(file.path()).unwrap();
+        }
+        for keep in synced_len..image.len() {
+            apply_power_cut(file.path(), &image, keep, 0);
+            let engine = FileWalEngine::with_encryption(file.path(), key).unwrap();
+            assert_eq!(checkpoint_ts(&engine.recover().unwrap()), vec![1]);
+            assert_eq!(std::fs::read(file.path()).unwrap(), image[..synced_len]);
+            engine.append(checkpoint(3)).unwrap();
+            engine.sync().unwrap();
+            drop(engine);
+            let reopened = FileWalEngine::with_encryption(file.path(), key).unwrap();
+            assert_eq!(checkpoint_ts(&reopened.recover().unwrap()), vec![1, 3]);
+        }
     }
 }
