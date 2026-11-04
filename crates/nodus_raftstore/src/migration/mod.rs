@@ -134,6 +134,7 @@ pub(crate) fn is_control_key(key: &[u8]) -> bool {
     key.starts_with(PREFIX)
         || key.starts_with(coordinator::JOURNAL_PREFIX)
         || key.starts_with(coordinator::v3::JOURNAL_PREFIX)
+        || key.starts_with(crate::txn_authority::PREFIX)
 }
 
 /// The table id of any migration journal that could still drive routing
@@ -191,7 +192,9 @@ pub(crate) fn validate_snapshot_record(
     if !is_control_key(key) {
         return Ok(());
     }
-    if key == FENCE_KEY {
+    if key.starts_with(crate::txn_authority::PREFIX) {
+        crate::txn_authority::validate_snapshot_record(kv, key, value)?;
+    } else if key == FENCE_KEY {
         let incoming: ParticipantFence = decode_record(value)?;
         if let Some(current) = read_fence(kv)? {
             anyhow::ensure!(

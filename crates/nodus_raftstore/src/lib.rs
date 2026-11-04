@@ -3,6 +3,7 @@
 // directly, so boxing it here would only move the cost to each trait boundary.
 #![allow(clippy::result_large_err)]
 
+pub mod txn_authority;
 pub mod upgrade;
 
 use std::collections::BTreeMap;
@@ -304,6 +305,10 @@ pub enum ShardCommand {
         epoch: u64,
         commits: Vec<migration::EpochCommitV1>,
     },
+    /// Dormant transaction authority foundation. No production producer;
+    /// forwarded ingress rejects it until participant fencing and a new
+    /// finalized cluster level exist. Appended to preserve legacy ordinals.
+    TxnAuthorityV1(txn_authority::CommandV1),
 }
 
 impl ShardCommand {
@@ -1391,6 +1396,30 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     tracing::debug!(command = cmd.metrics_kind(), "Raft applying command");
+                    if let ShardCommand::TxnAuthorityV1(command) = cmd {
+                        let response = if self.snapshot_group != "shard-meta" {
+                            ShardResponse {
+                                success: false,
+                                error: Some("transaction authority belongs to shard-meta".into()),
+                            }
+                        } else {
+                            let kv = sm.kv.as_ref().ok_or_else(|| {
+                                StorageIOError::write_state_machine(AnyError::error(
+                                    "transaction authority requires storage",
+                                ))
+                            })?;
+                            txn_authority::apply(kv.as_ref(), command, entry.log_id.index).map_err(
+                                |e| {
+                                    StorageIOError::write_state_machine(AnyError::error(format!(
+                                        "transaction authority apply: {e}"
+                                    )))
+                                },
+                            )?
+                        };
+                        sm.last_applied_log = Some(entry.log_id);
+                        res.push(response);
+                        continue;
+                    }
                     if cmd.is_upgrade_command() {
                         let response = if let ShardCommand::UpgradeControlV1(command) = cmd {
                             let kv = sm.kv.as_ref().ok_or_else(|| {

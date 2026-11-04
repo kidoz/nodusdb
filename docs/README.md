@@ -63,6 +63,7 @@ in their opening lines.
 - [Backup architecture](explanation/backup-architecture.md)
 - [PostgreSQL dump import](explanation/postgres-dump-import.md)
 - [Shard migration protocol](explanation/shard-migration-protocol.md)
+- [Transaction ownership and decisions](explanation/transaction-authority.md)
 - [Engineering approach](explanation/engineering-approach.md)
 
 ## Conventions used here

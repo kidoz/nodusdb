@@ -288,6 +288,15 @@ async fn write(
     headers: HeaderMap,
     Json(cmd): Json<ShardCommand>,
 ) -> impl axum::response::IntoResponse {
+    // Level 4 does not authorize this format. Keep even peer-authenticated
+    // forwarding closed until participant enforcement and a new upgrade target.
+    if matches!(cmd, ShardCommand::TxnAuthorityV1(_)) {
+        return (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "transaction authority activation is unavailable",
+        )
+            .into_response();
+    }
     if cmd.is_upgrade_command() {
         return (
             axum::http::StatusCode::FORBIDDEN,
@@ -494,6 +503,67 @@ mod tests {
             epoch: 1,
             txn_id: uuid::Uuid::new_v4(),
             expect_intents: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_authority_ingress_stays_closed_for_every_existing_level() {
+        let cmd = ShardCommand::TxnAuthorityV1(crate::txn_authority::CommandV1 {
+            txn_id: uuid::Uuid::new_v4(),
+            expected: None,
+            operation: crate::txn_authority::OperationV1::Begin {
+                owner: crate::txn_authority::OwnerV1 {
+                    node_id: 1,
+                    incarnation: uuid::Uuid::new_v4(),
+                },
+            },
+        });
+        for level in 1..=crate::upgrade::MAX_CLUSTER_VERSION {
+            for peer in [false, true] {
+                let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
+                if level > 1 {
+                    store_finalized_level3(kv.as_ref());
+                    let mut record = crate::upgrade::read(kv.as_ref()).unwrap();
+                    record.cluster_version = level;
+                    let txn = nodus_storage_api::TxnId::new();
+                    use nodus_storage_api::KvEngine;
+                    kv.write_intent(
+                        txn,
+                        bytes::Bytes::from_static(crate::upgrade::KEY),
+                        bytes::Bytes::from(serde_json::to_vec(&record).unwrap()),
+                    )
+                    .unwrap();
+                    kv.commit(txn, 2).unwrap();
+                }
+                let state = RaftState::new();
+                state.set_capability_storage(kv.clone());
+                let auth = if peer {
+                    RaftRouteAuth::TransportAuthenticated
+                } else {
+                    RaftRouteAuth::AdminToken {
+                        token: Some("t0ken".into()),
+                        allow_insecure: false,
+                    }
+                };
+                let addr = serve(auth, state).await;
+                assert_eq!(
+                    post_write(addr, &cmd, Some("t0ken")).await,
+                    reqwest::StatusCode::NOT_IMPLEMENTED
+                );
+                use nodus_storage_api::KvEngine;
+                assert!(
+                    kv.scan(
+                        nodus_storage_api::KeyRange {
+                            start: bytes::Bytes::from_static(crate::txn_authority::PREFIX),
+                            end: bytes::Bytes::from_static(b"\x01txn-authority0"),
+                        },
+                        u64::MAX
+                    )
+                    .unwrap()
+                    .next()
+                    .is_none()
+                );
+            }
         }
     }
 
