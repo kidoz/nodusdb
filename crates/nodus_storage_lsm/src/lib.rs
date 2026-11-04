@@ -324,16 +324,43 @@ impl LsmKvEngine {
         self.emit_telemetry(LsmTelemetryEvent::Sstables { count });
     }
 
+    /// Opens a persistent store, recovering its published files and WAL.
+    ///
+    /// An existing manifest must be readable and decodable before any WAL is
+    /// opened or repaired. Only an absent manifest enables fresh-directory or
+    /// historical pre-manifest discovery (SSTable N, active WAL N+1). Do not
+    /// delete an unreadable manifest to force that compatibility path.
     pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
         let path = data_dir.as_ref();
         std::fs::create_dir_all(path)?;
 
-        // Prefer the manifest (authoritative file set). Fall back to a directory
-        // scan when it is absent (pre-manifest / fresh dirs) OR unreadable/corrupt
-        // — a torn manifest must not make the engine unstartable.
-        let manifest: Option<Manifest> = std::fs::read(path.join(MANIFEST_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        // The manifest is authoritative. Its read/parse errors must never
+        // become directory discovery: that could adopt unpublished SSTables
+        // and select a WAL unrelated to the committed lineage. Inspect the
+        // directory entry itself so a dangling symlink is an error too.
+        let manifest_path = path.join(MANIFEST_FILE);
+        let manifest: Option<Manifest> = match std::fs::symlink_metadata(&manifest_path) {
+            Ok(_) => {
+                let bytes = std::fs::read(&manifest_path).with_context(|| {
+                    format!(
+                        "failed to read LSM manifest {}; verify access or restore a known-good manifest/backup before retrying",
+                        manifest_path.display()
+                    )
+                })?;
+                Some(serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "failed to decode LSM manifest {}; restore a known-good manifest/backup before retrying",
+                        manifest_path.display()
+                    )
+                })?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect LSM manifest {}", manifest_path.display())
+                });
+            }
+        };
         let (mut sst_ids, active_wal_id, min_replay_wal): (Vec<u64>, u64, u64) = match manifest {
             Some(m) => (m.sstables, m.active_wal, m.min_replay_wal),
             None => {
@@ -341,8 +368,9 @@ impl LsmKvEngine {
                 let mut max_id = 0;
                 for entry in std::fs::read_dir(path)? {
                     let p = entry?.path();
-                    // Only complete `*.sst` (atomic rename guarantees this);
-                    // partial `*.sst.tmp` and orphans are ignored.
+                    // Historical discovery considers numeric `*.sst` files;
+                    // partial `*.sst.tmp` files are ignored. There is no
+                    // authoritative orphan distinction without a manifest.
                     if p.extension().and_then(|s| s.to_str()) == Some("sst")
                         && let Some(name) = p.file_stem().and_then(|n| n.to_str())
                         && let Ok(id) = name.parse::<u64>()
@@ -351,7 +379,8 @@ impl LsmKvEngine {
                         ids.push(id);
                     }
                 }
-                // No manifest ⇒ replay whatever WAL lineage is on disk (floor 0).
+                // Pre-manifest naming used active WAL max_sst_id + 1.
+                // Replay its available lineage without a persisted floor.
                 (ids, max_id + 1, 0)
             }
         };
@@ -2246,7 +2275,7 @@ mod sst_tests {
     }
 
     #[test]
-    fn corrupt_manifest_recovers_via_directory_scan() {
+    fn corrupt_manifest_rejects_startup_without_replacing_manifest() {
         let dir = TempDir::new().unwrap();
         {
             let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
@@ -2257,15 +2286,23 @@ mod sst_tests {
             engine.commit(txn, 10).unwrap();
             engine.flush().unwrap();
         }
-        // A torn manifest must not make the engine unstartable: recovery falls
-        // back to scanning the SSTable files on disk.
-        std::fs::write(dir.path().join("MANIFEST"), b"{ this is not valid json").unwrap();
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let original = std::fs::read(&manifest_path).unwrap();
+        let corrupt = b"{ this is not valid json";
+        std::fs::write(&manifest_path, corrupt).unwrap();
+        let error = LsmKvEngine::with_wal(dir.path(), None)
+            .err()
+            .expect("a corrupt manifest must reject startup");
+        assert!(error.chain().any(|cause| cause.is::<serde_json::Error>()));
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), corrupt);
 
+        // A known-good authoritative manifest recovers the original files.
+        std::fs::write(&manifest_path, original).unwrap();
         let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
         assert_eq!(
             engine.get(b"survivor", 100).unwrap().unwrap(),
             Bytes::from("v"),
-            "recovered despite a corrupt manifest"
+            "recovered after restoring the authoritative manifest"
         );
     }
 

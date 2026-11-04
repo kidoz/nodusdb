@@ -70,10 +70,17 @@ That single indirection is what makes flush and compaction crash-safe:
 - A crash *before* the manifest swap orphans the new file. Recovery ignores it.
 - A crash *after* the swap orphans the old files. Recovery ignores those too.
 
-There is no in-between state, because the swap is atomic. If the manifest itself
-is missing or corrupt, recovery falls back to scanning the SSTable files on
-disk — a slower path that trades the manifest's precision for the ability to
-start at all.
+There is no in-between state, because the swap is atomic. An existing manifest
+that cannot be read or decoded stops startup before any WAL recovery or file
+publication. Scanning the directory instead would discard the commit point:
+an unpublished SSTable could become live, or a guessed WAL id could omit
+committed rows. Restoring the correct manifest preserves that distinction.
+
+Directory discovery remains only for an absent manifest, supporting empty
+stores and the historical pre-manifest naming scheme. It cannot distinguish
+that historical layout from a modern store with its manifest removed. Deleting
+a damaged manifest therefore does not provide safe repair; see the
+[manifest recovery contract](../reference/durability-contract.md#manifest-recovery).
 
 ## Compaction
 
@@ -102,14 +109,16 @@ sizes.
 
 ## Recovery
 
-On startup the engine reopens the SSTables named by the manifest — or found by a
-directory scan, if the manifest is unusable — and replays the active WAL segment
-into the memtable. The catalog then loads its state from the store, like any
-other reader.
+On startup the engine reads the authoritative manifest and reopens its SSTables.
+It follows the active WAL's predecessor chain back to the manifest's replay
+floor, then replays those segments from oldest to newest. This keeps an intent
+written before rotation paired with its later commit. The catalog then loads
+its state from the store, like any other reader. Only fresh and historical
+pre-manifest directories use directory discovery.
 
-Older WAL segments are deliberately retained on disk for the backup WAL archiver
-and point-in-time recovery. Reclaiming them is not yet automatic, which is the
-price of not deleting something a restore might still need.
+Older WAL segments remain available for backup archiving and point-in-time
+recovery. Local reclamation requires both backup retention and the published
+replay floor to permit deletion; retained intents can keep older segments live.
 
 ## What this does not cover
 

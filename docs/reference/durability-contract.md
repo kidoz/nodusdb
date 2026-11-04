@@ -57,7 +57,9 @@ is what the commit-acknowledgement ordering rests on.
 | Power cut on either side of the checkpoint's manifest rename (old or new snapshot in full) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_checkpoint_publishes_old_or_new_snapshot` |
 | Partial SSTable (`*.sst.tmp`) from a crash mid-build | `nodus_storage_lsm`: `partial_sstable_tmp_is_ignored_on_recovery` |
 | Orphan SSTable absent from the manifest (crash before swap) | `nodus_storage_lsm`: `orphan_sstable_not_in_manifest_is_ignored` |
-| Corrupt or torn manifest | `nodus_storage_lsm`: `corrupt_manifest_recovers_via_directory_scan` |
+| Corrupt or torn existing manifest rejects startup without replacing it | `nodus_storage_lsm`: `corrupt_manifest_rejects_startup_without_replacing_manifest` |
+| Manifest decoding/read failures preserve every file, reject orphan adoption, and recover WAL-only commits after repair | `nodus_storage_lsm`, integration test `manifest_recovery`: `corrupt_manifest_rejects_orphans_and_preserves_wal_only_commits`, `unreadable_manifest_rejects_startup_before_creating_files`, `dangling_manifest_symlink_is_not_a_missing_legacy_manifest` (Unix) |
+| Fresh stores, pre-manifest SSTable/WAL layouts, and older manifests without a replay floor remain readable | `nodus_storage_lsm`, integration test `manifest_recovery`: `absent_manifest_initializes_empty_and_new_directories`, `pre_manifest_layout_recovers_and_publishes_authoritative_manifest`, `legacy_manifest_without_replay_floor_recovers_cross_segment_commits` |
 | Flush mid-transaction strands an intent | `nodus_storage_lsm`: `flush_retains_uncommitted_intents` |
 | Archive cleanup while a commit spans WAL segments | `nodus_storage_lsm`: `archived_wal_reclamation_preserves_cross_segment_commits` |
 | Cleanup after an unpublished or corrupt manifest | `nodus_storage_lsm`: `wal_reclamation_uses_published_manifest_and_fails_closed` |
@@ -119,6 +121,30 @@ executor batch. Outside an explicit transaction, that batch is one autocommit
 transaction: a late decoding, planning, or constraint failure rolls back rows
 from every chunk. Inside an existing user transaction, COPY joins that
 transaction and leaves commit or rollback ownership with the user.
+
+## Manifest recovery
+
+An existing `MANIFEST` is authoritative. Startup must read and decode it before
+opening or replaying any WAL. A read or decoding failure rejects startup with
+the manifest path and an error cause, preserving the manifest, SSTables, and WAL
+files. This includes an empty/truncated manifest, invalid JSON, missing required
+fields, and a dangling manifest symlink. Recovery does not adopt an orphan
+SSTable, guess a different active WAL, or overwrite the failed manifest.
+
+Repair access to the manifest or restore a known-good manifest matching these
+data files; otherwise restore a consistent backup. Do not delete `MANIFEST` to
+bypass the error. With the correct manifest restored, recovery uses its file set
+and replays the required WAL lineage, including commits not yet flushed into an
+SSTable. This change introduces no new manifest fields or durable format.
+
+Only an absent manifest enables fresh-directory initialization or historical
+pre-manifest discovery: numeric `*.sst` files are loaded, `*.sst.tmp` files are
+ignored, and the active WAL is `max_sst_id + 1` (or `1.log` without SSTables).
+A manifest is published after successful recovery. Older manifests lacking
+`min_replay_wal` still default to replay floor zero. The compatibility discovery
+path cannot distinguish a genuine pre-manifest layout from a modern store whose
+manifest was removed; safe automatic reconstruction of a lost manifest is not
+provided.
 
 ## Local WAL archive cleanup
 
