@@ -25,6 +25,9 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         plan: LogicalPlan,
     ) -> Result<QueryOutput> {
+        if let Some(output) = self.collect_iceberg(ctx, &plan)? {
+            return Ok(output);
+        }
         match plan {
             LogicalPlan::CreateSchema {
                 schema_name,

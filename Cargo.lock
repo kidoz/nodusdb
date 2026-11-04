@@ -3094,19 +3094,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-cast",
  "arrow-ipc",
+ "arrow-schema",
  "axum",
  "clap",
  "iceberg",
+ "nodus_common",
  "nodus_config",
  "nodus_iceberg",
  "nodus_monitoring",
  "nodus_testkit",
  "parquet",
  "reqwest 0.13.5",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -3114,6 +3119,7 @@ name = "nodus_common"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3147,6 +3153,7 @@ name = "nodus_config"
 version = "0.1.0"
 dependencies = [
  "figment",
+ "nodus_common",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -3190,6 +3197,7 @@ dependencies = [
  "nodus_audit",
  "nodus_authz",
  "nodus_catalog",
+ "nodus_common",
  "nodus_meta",
  "nodus_security",
  "nodus_sharding",

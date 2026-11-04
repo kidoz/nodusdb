@@ -2,8 +2,8 @@
 
 The optional `iceberg` CLI feature inspects an external Iceberg REST catalog and
 reads a selected table snapshot to an Arrow IPC stream file. This is an
-experimental client-side integration. It does not register tables in NodusDB SQL
-or require a running NodusDB server.
+experimental integration. CLI inspection and export do not require a running
+NodusDB server. The optional native SQL registration is described below.
 
 ## Build the client
 
@@ -116,7 +116,8 @@ Use `--storage local` only with a trusted development catalog whose absolute
 filesystem paths or `file://` URLs are accessible on the client host. S3 mode
 cannot open local paths. The storage adapter rejects all write and delete
 operations. Catalog and storage permissions authorize these external reads;
-no NodusDB admin API, RBAC resource, or audit sink participates.
+the standalone CLI does not use NodusDB RBAC or audit. SQL registration below
+adds central authorization and audit.
 
 ## Supported subset and limits
 
@@ -138,8 +139,8 @@ no NodusDB admin API, RBAC resource, or audit sink participates.
 - Metadata and data objects must remain immutable and retained during the scan.
   The reader does not acquire a retention lease. Deleted or unreadable objects
   fail the operation; they do not become an empty result.
-- This is not native SQL federation, Iceberg export, CDC, or a cross-system
-  transaction. No NodusDB durable records or upgrade gates are changed.
+- The CLI slice is separate from SQL registration below. Iceberg export, CDC,
+  and cross-system transactions are not implemented.
 
 ## Verification
 
@@ -167,3 +168,118 @@ TLS, Polaris, real AWS, and large-table performance remain unverified.
 See the [official Rust implementation](https://github.com/apache/iceberg-rust)
 and [Iceberg REST specification](https://iceberg.apache.org/rest-catalog-spec/)
 for the underlying protocol and table model.
+
+## Register a read-only SQL view
+
+The experimental native SQL slice runs the feature-enabled CLI as an isolated
+worker. The server build keeps Arrow/Parquet outside its allocator. This slice
+requires Linux or macOS and S3 storage; it does not expose local-file access.
+
+Install the feature-enabled binary on every serving node. Configure the node
+with absolute paths (the following paths are illustrative):
+
+```toml
+[iceberg]
+enabled = true
+worker_executable = "/opt/nodus/bin/nodusctl"
+profiles_file = "/etc/nodus/iceberg-profiles.json"
+timeout_seconds = 60
+worker_memory_mib = 512
+worker_address_space_mib = 2048
+max_result_bytes = 16777216
+max_rows = 100000
+max_concurrent_scans = 2
+```
+
+Create a regular, private profiles file, readable by the server account, with
+mode `0600`. Symlinks and group/other permissions are rejected. The file is at
+most 1 MiB and is loaded at startup; restart nodes to rotate profiles. Each
+profile's storage properties follow the supported `s3.*` keys above. For example:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "lake": {
+      "uri": "https://catalog.example/catalog",
+      "warehouse": "analytics",
+      "bearer_token": "REPLACE_WITH_CATALOG_TOKEN",
+      "storage_properties": {}
+    }
+  }
+}
+```
+
+Use `null` for `bearer_token` with an unauthenticated development catalog.
+Vended S3 credentials remain supported. The worker clears its inherited
+environment and disables ambient AWS credentials and instance metadata. Tokens
+and storage properties travel through a private stdin pipe, never arguments,
+SQL text, persisted descriptors, or worker diagnostics.
+
+As a principal with `MANAGE_CLUSTER` on the system and `CREATE` on the schema,
+register one namespace component and the remote table name:
+
+```sql
+CREATE VIEW lake_events AS
+SELECT * FROM nodus_iceberg('lake', 'analytics', 'events');
+
+SELECT name AS label, id FROM lake_events LIMIT 100;
+```
+
+Registration inspects the source completely before one replicated catalog
+publication. It cannot run inside a transaction/batch, use `OR REPLACE`, or
+create a temporary view. Ordinary readers need `SELECT` on the registered view;
+authorization and audit run before worker/source access. `LIMIT 0` and driver
+Describe use the registered schema locally, after authorization.
+
+A scan loads metadata once and pins the current snapshot. The descriptor stores
+its version, profile alias, table UUID, field IDs, names, types and nullability.
+The selected fields must still match; table replacement or selected-field drift
+fails. Unselected new or changed fields do not alter the registered columns.
+Drop and register the view again to adopt schema changes. Registration supports
+1–256 primitive columns: boolean, int/long, float/double, string, binary, date,
+microsecond timestamp/timestamptz, and decimal128. SQL exposes decimals as
+`NUMERIC`; the descriptor retains source precision/scale for drift checks.
+Column names must be ASCII identifiers (`[A-Za-z_][A-Za-z0-9_]*`) of at most
+128 bytes; this avoids ambiguous quoted/qualified identifiers in persisted plans.
+Nested values, time, UUID, and other types fail registration explicitly.
+
+Direct reads support column projection, aliases, duplicates, and `LIMIT`.
+Predicates, joins, ordering, aggregation, DISTINCT, and OFFSET on the external
+scan fail explicitly. There is no SQL time travel, predicate pushdown, DML,
+external schema alteration, or cross-system transaction. Each statement reads
+its own external snapshot, independent of NodusDB's MVCC transaction snapshot.
+
+The query deadline is the smaller of `statement_timeout` and
+`iceberg.timeout_seconds`. PostgreSQL CancelRequest and client disconnect abort
+consumption. An independent supervisor kills and reaps workers even under
+socket backpressure. It samples worker RSS approximately every 10 ms; the RSS
+threshold can overshoot between samples. Linux additionally imposes a hard
+address-space limit before source access/decoding, including decoder buffers.
+macOS uses RSS supervision and process isolation; it has no equivalent hard
+address-space guarantee in this slice. Configure host/container limits when a
+strict aggregate process memory ceiling is required.
+
+Rows are limited to 16 KiB of accounted values and protocol frames to 64 KiB.
+Total accounted result memory/output is bounded by `max_result_bytes`, including
+streamed results. The worker decodes 64-row batches, but Parquet pages and
+metadata can require more memory and are covered by worker supervision. At most
+`max_concurrent_scans` workers run on a node; excess requests fail immediately.
+A missing LIMIT reads at most `max_rows + 1` and fails on overflow. An explicit
+LIMIT above `max_rows` fails. No resource limit silently truncates a result.
+Streaming can deliver rows before a terminal read error; clients must check
+command completion before accepting the result.
+
+External views use the existing durable view/TableFunction codec. Older binaries
+can decode it and fail closed on the unknown function; they cannot read the
+external source. Keep the feature disabled during rollout until every serving
+node has the worker and profiles. Nodes without configuration reject scans.
+`DROP VIEW lake_events` removes registration without changing external data and
+is the rollback path before reverting binaries. No new irreversible catalog
+record or feature level is introduced.
+
+Run `just test-iceberg-sql-live` to compare SQL values against an independent
+PyIceberg scan and verify typed extended queries, cancellation before the first
+row, deadlines, failed-publication atomicity, durable registration across
+restart, and real wide-Parquet decoder termination at a 64 MiB RSS threshold
+with continued SQL server availability.

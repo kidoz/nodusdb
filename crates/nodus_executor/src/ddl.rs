@@ -1612,6 +1612,9 @@ impl MemExecutor {
         query: Box<LogicalPlan>,
         or_replace: bool,
     ) -> Result<QueryOutput> {
+        if let Some(output) = self.register_iceberg(ctx, &name, &query, or_replace)? {
+            return Ok(output);
+        }
         let (db_name, schema_name, view_only) = parse_object_name(&name)?;
         // A temporary relation's schema is made for the session on first use.
         let temp = crate::search_path::is_temp_schema(schema_name);
@@ -1941,6 +1944,7 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        Self::reject_iceberg_mutation(&tbl)?;
         let name = if name.is_empty() {
             self.unused_relation_name(&format!("{table_only}_{}_idx", columns.join("_")))?
         } else {

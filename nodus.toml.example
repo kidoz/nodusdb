@@ -61,3 +61,17 @@ metrics_enabled = true
 log_level = "info"
 log_redaction = true
 # otlp_endpoint = "http://127.0.0.1:4318"
+
+# Optional read-only Iceberg SQL views; install a feature-enabled nodusctl worker.
+[iceberg]
+enabled = false
+# worker_executable = "/opt/nodus/bin/nodusctl"
+# profiles_file = "/etc/nodus/iceberg-profiles.json" # regular file, chmod 600
+worker_executable = ""
+profiles_file = ""
+timeout_seconds = 60
+worker_memory_mib = 512
+worker_address_space_mib = 2048
+max_result_bytes = 16777216
+max_rows = 100000
+max_concurrent_scans = 2

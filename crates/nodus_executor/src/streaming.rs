@@ -40,6 +40,15 @@ impl MemExecutor {
     ) -> Result<String> {
         let _env = crate::session_env::install(self.session_env(ctx));
         crate::eval_error::reset();
+        {
+            let _restore = self.restore_gate.read();
+            if self.restoring.load(std::sync::atomic::Ordering::Acquire) {
+                anyhow::bail!("restore in progress");
+            }
+            if let Some(tag) = self.stream_iceberg(ctx, &plan, sink)? {
+                return Ok(tag);
+            }
+        }
         if let LogicalPlan::Select {
             ctes,
             table_name,

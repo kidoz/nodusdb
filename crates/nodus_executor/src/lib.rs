@@ -37,6 +37,8 @@ mod explain;
 pub(crate) mod filter_eval;
 mod functions;
 mod geometric;
+mod iceberg;
+pub use iceberg::IcebergRuntime;
 mod index_keys;
 mod information_schema;
 mod inheritance;
@@ -145,6 +147,8 @@ impl QueryOutput {
 /// — e.g. when the downstream consumer (the client socket) has gone away — so the
 /// producer stops promptly instead of scanning the rest of the table.
 pub trait RowSink {
+    /// Sets a deadline for interrupting a blocked downstream consumer.
+    fn set_deadline(&mut self, _deadline: std::time::Instant) {}
     fn schema(&mut self, columns: Vec<String>, types: Vec<String>);
     fn row(&mut self, row: Row) -> Result<()>;
 }
@@ -177,6 +181,8 @@ pub enum PhysicalPlan {
 
 #[derive(Clone, Default)]
 pub struct ExecutionContext {
+    /// Cooperative cancellation, checked throughout isolated external scans.
+    pub cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub session_id: String,
     /// Authenticated principal making the request; used for authorization.
     pub principal_id: PrincipalId,
@@ -417,6 +423,7 @@ impl nodus_catalog::CatalogStore for KvCatalogStore {
 // MVP implementation mapping to required interfaces
 #[allow(dead_code)]
 pub struct MemExecutor {
+    iceberg: parking_lot::RwLock<Option<Arc<iceberg::Provider>>>,
     /// The catalog without the relations that hold user types.
     pub(crate) catalog_reader: Arc<dyn CatalogReader>,
     /// The whole catalog, for user types. See [`crate::user_types`].
@@ -525,6 +532,7 @@ impl MemExecutor {
         let catalog_reader: Arc<dyn CatalogReader> =
             Arc::new(user_types::RelationCatalog(types_catalog.clone()));
         Self {
+            iceberg: Default::default(),
             catalog_reader,
             types_catalog,
             catalog_writer,

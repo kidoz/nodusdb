@@ -172,3 +172,35 @@ impl Drop for NodusQueryHandler {
         }
     }
 }
+
+impl NodusQueryHandler {
+    fn execution_context<C: pgwire::api::ClientInfo>(
+        &self,
+        client: &C,
+        session_id: String,
+        principal_id: nodus_catalog::PrincipalId,
+    ) -> nodus_executor::ExecutionContext {
+        let mut ctx = client_meta::execution_context(client, session_id.clone(), principal_id);
+        let registry = self.registry.clone();
+        ctx.cancellation = Some(Arc::new(move || {
+            registry.is_cancelled(&session_id) || registry.is_query_cancelled(&session_id)
+        }));
+        ctx
+    }
+}
+
+impl extended_query::NodusExtendedQueryHandler {
+    fn execution_context<C: pgwire::api::ClientInfo>(
+        &self,
+        client: &C,
+        session_id: String,
+        principal_id: nodus_catalog::PrincipalId,
+    ) -> nodus_executor::ExecutionContext {
+        let mut ctx = client_meta::execution_context(client, session_id.clone(), principal_id);
+        let registry = self.registry.clone();
+        ctx.cancellation = Some(Arc::new(move || {
+            registry.is_cancelled(&session_id) || registry.is_query_cancelled(&session_id)
+        }));
+        ctx
+    }
+}

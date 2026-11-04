@@ -71,6 +71,8 @@ jobs:
         run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py
       - name: Verify catalog OIDC and table permissions through Keycloak and OpenFGA
         run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py --authenticated
+      - name: Verify native SQL Iceberg reads
+        run: uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/sql.py
       - name: Upload interoperability evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -9,9 +9,10 @@ publish = false
 
 [features]
 default = []
-iceberg = ["dep:nodus_iceberg", "dep:arrow-ipc", "dep:tempfile"]
+iceberg = ["dep:nodus_iceberg", "dep:arrow-ipc", "dep:tempfile", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast", "dep:rustix"]
 
 [dependencies]
+nodus_common = { path = "../nodus_common" }
 clap.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
@@ -19,10 +20,17 @@ anyhow.workspace = true
 serde_json.workspace = true
 nodus_monitoring = { path = "../nodus_monitoring" }
 nodus_iceberg = { path = "../nodus_iceberg", optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-cast = { version = "=58.4.1", optional = true }
 arrow-ipc = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.6", features = ["process"], optional = true }
+
 [dev-dependencies]
+tokio-postgres.workspace = true
 nodus_testkit = { path = "../nodus_testkit" }
 nodus_config = { path = "../nodus_config" }
 iceberg.workspace = true

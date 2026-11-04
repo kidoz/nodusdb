@@ -129,7 +129,7 @@ impl NodusExtendedQueryHandler {
     {
         let session_id = session_id_from_client(client);
         let principal_id = principal_id_from_client(client);
-        let ctx = execution_context(client, session_id, principal_id);
+        let ctx = self.execution_context(client, session_id, principal_id);
 
         let Ok(mut stmts) = nodus_sql::parse_sql(query_str) else {
             return Vec::new();
@@ -228,7 +228,7 @@ impl NodusExtendedQueryHandler {
         };
 
         let principal_id = principal_id_from_client(client);
-        let ctx = execution_context(client, session_id.clone(), principal_id);
+        let ctx = self.execution_context(client, session_id.clone(), principal_id);
 
         let count = self
             .stream_execute(
@@ -336,7 +336,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 .iter()
                 .any(|ty| ty.is_none() || *ty == Some(Type::UNKNOWN))
         {
-            let ctx = execution_context(
+            let ctx = self.execution_context(
                 client,
                 session_id_from_client(client),
                 principal_id_from_client(client),
@@ -840,7 +840,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
 
         let principal_id = principal_id_from_client(client);
 
-        let ctx = execution_context(client, session_id.clone(), principal_id);
+        let ctx = self.execution_context(client, session_id.clone(), principal_id);
 
         // Extract parameters from the portal natively into Vec<nodus_executor::Value>
         let len = portal.parameter_len();
@@ -1155,7 +1155,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             .and_then(|s| Uuid::parse_str(s).ok())
             .map(PrincipalId)
             .unwrap_or_default();
-        let ctx = execution_context(client, session_id, principal_id);
+        let ctx = self.execution_context(client, session_id, principal_id);
 
         let query_str = stmt.statement.as_str();
         let fields = self.describe_output_fields(query_str, &ctx).await;
@@ -1186,7 +1186,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             .and_then(|s| Uuid::parse_str(s).ok())
             .map(PrincipalId)
             .unwrap_or_default();
-        let ctx = execution_context(client, session_id, principal_id);
+        let ctx = self.execution_context(client, session_id, principal_id);
 
         let fields = self.describe_output_fields(query_str, &ctx).await;
         Ok(DescribePortalResponse::new(fields))

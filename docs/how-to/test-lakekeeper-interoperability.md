@@ -146,3 +146,12 @@ The authentication setup follows Lakekeeper's pinned
 [Keycloak overlay](https://github.com/lakekeeper/lakekeeper/blob/v0.14.2/docker-compose/keycloak-overlay.yaml)
 and [OpenFGA overlay](https://github.com/lakekeeper/lakekeeper/blob/v0.14.2/docker-compose/openfga-overlay.yaml),
 with realm secrets supplied through [Keycloak placeholders](https://www.keycloak.org/server/importExport#_using_environment_variables_within_the_realm_configuration_files).
+
+## Native SQL gate
+
+Run `just test-iceberg-sql-live` for protected-profile registration, exact SQL
+values compared with PyIceberg, typed extended projections, LIMIT, read-only
+rejections, CancelRequest before rows, statement deadlines, atomic failed
+registration, and restart recovery. The gate owns a fresh stack, private profiles,
+and a stalled HTTP endpoint; it removes services and credentials on exit.
+Evidence is written to `target/iceberg-live/sql-report.json`.

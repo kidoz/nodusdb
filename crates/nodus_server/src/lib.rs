@@ -562,6 +562,7 @@ pub async fn run_server_full(
     config: NodusConfig,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<ServerHandle> {
+    let iceberg = nodus_executor::IcebergRuntime::load(config.iceberg.clone())?;
     let pgwire_addr = pgwire_listener.local_addr()?;
     let http_addr = http_listener.local_addr()?;
     // Sessions report the server's own port and connection limit.
@@ -892,6 +893,7 @@ pub async fn run_server_full(
         txn,
     ));
 
+    executor.install_iceberg(iceberg);
     tracing::debug!("Executor created");
 
     let _executor_clone = executor.clone();

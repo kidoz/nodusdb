@@ -1667,3 +1667,7 @@ fn lsm_deleted_rows_stay_deleted_for_constraint_probes() {
     drop(exec);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(unix)]
+#[path = "iceberg_tests.rs"]
+mod iceberg_tests;

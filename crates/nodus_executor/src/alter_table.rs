@@ -40,6 +40,7 @@ impl MemExecutor {
             Err(_) => anyhow::bail!("relation \"{table_only}\" does not exist"),
         };
         self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        Self::reject_iceberg_mutation(&tbl)?;
         // An inherited table's columns pass to its descendants, unless ONLY.
         let descendants = if only {
             Vec::new()

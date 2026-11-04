@@ -37,6 +37,8 @@ static STREAM_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_STREAMS
 /// A [`RowSink`] that encodes each row on the blocking executor thread and sends
 /// it to the socket-writing task through a bounded channel.
 struct ChannelSink {
+    cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    deadline: Option<std::time::Instant>,
     schema_tx: Option<oneshot::Sender<Arc<Vec<FieldInfo>>>>,
     row_tx: mpsc::Sender<DataRow>,
     /// The client's requested result-column format (text/binary), honored when
@@ -46,6 +48,9 @@ struct ChannelSink {
 }
 
 impl RowSink for ChannelSink {
+    fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.deadline = Some(deadline);
+    }
     fn schema(&mut self, columns: Vec<String>, types: Vec<String>) {
         let field_info = field_info_for_output(&columns, &types, |i, _| self.format.format_for(i));
         self.field_info = Some(field_info.clone());
@@ -61,10 +66,46 @@ impl RowSink for ChannelSink {
             .field_info
             .clone()
             .ok_or_else(|| anyhow::anyhow!("row produced before schema"))?;
-        let data_row = encode_row(&row.values, field_info)?;
-        self.row_tx
-            .blocking_send(data_row)
-            .map_err(|_| anyhow::anyhow!("client went away"))?;
+        let mut data_row = encode_row(&row.values, field_info)?;
+        loop {
+            if self.cancellation.as_ref().is_some_and(|f| f()) {
+                anyhow::bail!("canceling statement due to user request");
+            }
+            if self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                anyhow::bail!("canceling statement due to statement timeout");
+            }
+            match self.row_tx.try_send(data_row) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!("client went away"),
+                Err(mpsc::error::TrySendError::Full(row)) => {
+                    data_row = row;
+                    // Wait for channel readiness with a bounded cancellation
+                    // interval. Polling/sleeping on every full channel would
+                    // throttle ordinary fast streams to one batch per sleep.
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        match runtime.block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(10),
+                                self.row_tx.reserve(),
+                            )
+                            .await
+                        }) {
+                            Ok(Ok(permit)) => {
+                                permit.send(data_row);
+                                break;
+                            }
+                            Ok(Err(_)) => anyhow::bail!("client went away"),
+                            Err(_) => {}
+                        }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(250));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -100,7 +141,18 @@ pub(crate) async fn start_row_stream(
         // Held for the scan's duration; the slot frees when the producer ends
         // (completion, error, or the consumer dropping the receiver).
         let _permit = permit;
+        let mut ctx = ctx;
+        let prior_cancellation = ctx.cancellation.take();
+        let downstream = row_tx.clone();
+        ctx.cancellation = Some(Arc::new(move || {
+            downstream.is_closed()
+                || prior_cancellation
+                    .as_ref()
+                    .is_some_and(|cancelled| cancelled())
+        }));
         let mut sink = ChannelSink {
+            cancellation: ctx.cancellation.clone(),
+            deadline: None,
             schema_tx: Some(schema_tx),
             row_tx,
             format,
@@ -123,4 +175,47 @@ pub(crate) async fn join_producer(
     handle
         .await
         .map_err(|e| user_error("ERROR", "XX000", format!("execution task failed: {e}")))
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_interrupts_full_row_channel() {
+        let (tx, _rx) = mpsc::channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let mut sink = ChannelSink {
+            schema_tx: None,
+            row_tx: tx,
+            format: Format::UnifiedText,
+            field_info: None,
+            deadline: None,
+            cancellation: Some(Arc::new(move || flag.load(Ordering::Acquire))),
+        };
+        sink.schema(vec!["id".into()], vec!["BIGINT".into()]);
+        sink.row(ExecRow {
+            values: vec![nodus_executor::Value::Int(1)],
+        })
+        .unwrap();
+        let task = tokio::task::spawn_blocking(move || {
+            sink.row(ExecRow {
+                values: vec![nodus_executor::Value::Int(2)],
+            })
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let start = Instant::now();
+        cancelled.store(true, Ordering::Release);
+        assert!(
+            task.await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("user request")
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 }

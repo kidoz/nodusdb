@@ -190,3 +190,7 @@ Match the suite to the risk of the change:
 - Touching SQL semantics → prefer a golden case in the sqllogictest suite over
   Rust test scaffolding.
 - Touching the wire protocol or a client-visible type → add `just test-compat`.
+
+`just test-iceberg-sql-live` verifies native SQL external views against the owned
+Lakekeeper/MinIO stack and independent PyIceberg rows, including cancellation and
+durable registration across restart.

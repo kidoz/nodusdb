@@ -2549,6 +2549,7 @@ async fn import_dump(
         }
     };
     let ctx = nodus_executor::ExecutionContext {
+        cancellation: None,
         session_id: format!("admin-import-{}", Uuid::new_v4()),
         principal_id,
         active_roles: vec![],
@@ -2618,6 +2619,7 @@ mod import_tests {
 
         let executor: Arc<dyn nodus_executor::Executor> = executor;
         let ctx = nodus_executor::ExecutionContext {
+            cancellation: None,
             session_id: "test-import".into(),
             principal_id: admin.id,
             active_roles: vec![],

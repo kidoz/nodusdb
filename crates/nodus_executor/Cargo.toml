@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+nodus_common = { path = "../nodus_common" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

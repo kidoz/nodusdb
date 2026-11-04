@@ -23,6 +23,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct NodusConfig {
+    pub iceberg: nodus_common::iceberg::Settings,
     pub cluster: ClusterConfig,
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -262,6 +263,7 @@ pub struct ObservabilityConfig {
 impl Default for NodusConfig {
     fn default() -> Self {
         Self {
+            iceberg: Default::default(),
             cluster: ClusterConfig::default(),
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
@@ -342,6 +344,9 @@ impl NodusConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.iceberg
+            .validate()
+            .map_err(|s| ConfigError::Invalid(s.into()))?;
         if self.server.pgwire_addr.is_empty() {
             return Err(ConfigError::Invalid("server.pgwire_addr is empty".into()));
         }

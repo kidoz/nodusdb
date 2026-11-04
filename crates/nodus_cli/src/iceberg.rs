@@ -1,3 +1,4 @@
+mod worker;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,6 +10,8 @@ use nodus_iceberg::{CatalogOptions, ReadOptions, SnapshotReader, StorageBackend}
 
 #[derive(Subcommand)]
 pub(crate) enum IcebergCommand {
+    #[command(hide = true)]
+    Worker,
     /// Print versioned JSON describing a table and the selected snapshot
     Inspect(Connection),
     /// Read a snapshot into a new Arrow IPC stream file (never overwrites a file)
@@ -64,6 +67,9 @@ pub(crate) struct Connection {
 }
 
 pub(crate) async fn run(command: &IcebergCommand) -> anyhow::Result<()> {
+    if matches!(command, IcebergCommand::Worker) {
+        return worker::run().await;
+    }
     tokio::select! {
         result = run_inner(command) => result,
         signal = tokio::signal::ctrl_c() => {
@@ -75,6 +81,7 @@ pub(crate) async fn run(command: &IcebergCommand) -> anyhow::Result<()> {
 
 async fn run_inner(command: &IcebergCommand) -> anyhow::Result<()> {
     let (connection, batch_size, limit) = match command {
+        IcebergCommand::Worker => unreachable!("worker dispatched before CLI reads"),
         IcebergCommand::Inspect(connection) => (connection, 1024, None),
         IcebergCommand::Scan {
             connection,
@@ -131,6 +138,7 @@ async fn run_inner(command: &IcebergCommand) -> anyhow::Result<()> {
     )
     .await?;
     match command {
+        IcebergCommand::Worker => unreachable!("worker dispatched before CLI reads"),
         IcebergCommand::Inspect(_) => {
             println!("{}", serde_json::to_string_pretty(reader.summary())?)
         }

@@ -43,6 +43,7 @@ pub(crate) fn execution_context<C: ClientInfo>(
     principal_id: PrincipalId,
 ) -> nodus_executor::ExecutionContext {
     nodus_executor::ExecutionContext {
+        cancellation: None,
         session_id,
         principal_id,
         active_roles: vec![],

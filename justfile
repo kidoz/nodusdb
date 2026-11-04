@@ -50,6 +50,11 @@ test-iceberg-auth-live:
     UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B -m unittest discover -s tools/testing/iceberg -p 'test_*.py' -v
     UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/run.py --authenticated
 
+# Compare native SQL Iceberg reads with an independent PyIceberg writer
+test-iceberg-sql-live:
+    cargo build -p nodus_cli --features iceberg --locked
+    UV_PROJECT_ENVIRONMENT="{{justfile_directory()}}/target/iceberg-venv" uv run --locked --project tools/testing/iceberg --python 3.12 python -B tools/testing/iceberg/sql.py
+
 # Run crash and fault-injection tests
 test-fault:
     cargo test -p nodus_fault_tests
