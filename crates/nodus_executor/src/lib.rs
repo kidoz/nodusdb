@@ -5,7 +5,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
 use nodus_audit::{AuditEvent, AuditSink};
-use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzRequest};
+use nodus_authz::{Action, AuthzContext, AuthzDecision, AuthzEngine, AuthzRequest};
 use nodus_catalog::{
     AuditEventId, CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest,
     DescriptorState, IndexId, MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
@@ -2077,13 +2077,12 @@ impl MemExecutor {
         self.delete_row(session, key)
     }
 
-    /// Deny-by-default authorization gate for a single action on a resource.
-    pub(crate) fn authorize(
+    fn authorization_request(
         &self,
         ctx: &ExecutionContext,
         action: Action,
         resource: ResourceRef,
-    ) -> Result<()> {
+    ) -> AuthzRequest {
         // A session's `SET ROLE` replaces the principal privileges are
         // checked as; its memberships come from the catalog.
         let session_role = self.session_role(&ctx.session_id);
@@ -2095,16 +2094,47 @@ impl MemExecutor {
         } else {
             ctx.active_roles.clone()
         };
-        let decision = self.authz.authorize(AuthzRequest {
+        AuthzRequest {
             principal_id,
             active_roles,
-            action: action.clone(),
-            resource: resource.clone(),
+            action,
+            resource,
             context: AuthzContext {
                 database_id: ctx.database_id,
             },
-        })?;
+        }
+    }
 
+    /// Deny-by-default authorization gate for a single action on a resource.
+    pub(crate) fn authorize(
+        &self,
+        ctx: &ExecutionContext,
+        action: Action,
+        resource: ResourceRef,
+    ) -> Result<()> {
+        let request = self.authorization_request(ctx, action.clone(), resource.clone());
+        let decision = self.authz.authorize(request)?;
+        self.enforce_authorization(ctx, action, resource, decision)
+    }
+
+    pub(crate) fn authorize_grant(
+        &self,
+        ctx: &ExecutionContext,
+        resource: ResourceRef,
+        privileges: &[String],
+    ) -> Result<()> {
+        let request = self.authorization_request(ctx, Action::ManageGrants, resource.clone());
+        let decision = self.authz.authorize_grant(request, privileges)?;
+        self.enforce_authorization(ctx, Action::ManageGrants, resource, decision)
+    }
+
+    fn enforce_authorization(
+        &self,
+        ctx: &ExecutionContext,
+        action: Action,
+        resource: ResourceRef,
+        decision: AuthzDecision,
+    ) -> Result<()> {
         // Record every authorization decision to the audit trail.
         let _ = self.audit.record_event(AuditEvent {
             id: AuditEventId::new(),
@@ -2131,7 +2161,9 @@ impl MemExecutor {
         });
 
         if !decision.allowed {
-            anyhow::bail!("permission denied");
+            return Err(crate::error_fields::DbError::new("permission denied")
+                .code("42501")
+                .into());
         }
         Ok(())
     }

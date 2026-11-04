@@ -69,10 +69,12 @@ impl Action {
     }
 }
 
+#[derive(Clone)]
 pub struct AuthzContext {
     pub database_id: Option<DatabaseId>,
 }
 
+#[derive(Clone)]
 pub struct AuthzRequest {
     pub principal_id: PrincipalId,
     pub active_roles: Vec<RoleId>,
@@ -89,6 +91,7 @@ pub enum AuthzReason {
     GrantedToPrincipal(GrantId),
     Superuser,
     Owner,
+    GrantedWithGrantOption,
 }
 
 pub struct AuthzDecision {
@@ -107,6 +110,15 @@ pub struct AuthzExplanation {
 
 pub trait AuthzEngine: Send + Sync {
     fn authorize(&self, request: AuthzRequest) -> Result<AuthzDecision>;
+    /// Authorizes delegation of every validated, expanded privilege on one
+    /// resource. Engines without grant-option support require grant management.
+    fn authorize_grant(
+        &self,
+        request: AuthzRequest,
+        _privileges: &[String],
+    ) -> Result<AuthzDecision> {
+        self.authorize(request)
+    }
     fn explain(&self, request: AuthzRequest) -> Result<AuthzExplanation>;
 }
 
@@ -146,10 +158,13 @@ impl DefaultAuthzEngine {
             .catalog
             .get_grants_for_resource(request.resource.clone())?;
 
+        // Object ALL is ordinary access; System ALL is handled by the separate
+        // superuser check. Delegation requires explicit authority or options.
         let matched = grants.into_iter().find(|g| {
             effective.contains(&g.principal_id)
                 && (g.privilege.eq_ignore_ascii_case(wanted)
-                    || g.privilege.eq_ignore_ascii_case("ALL"))
+                    || (g.privilege.eq_ignore_ascii_case("ALL")
+                        && request.action != Action::ManageGrants))
         });
         Ok((matched, effective, catalog_version))
     }
@@ -266,6 +281,83 @@ impl AuthzEngine for DefaultAuthzEngine {
                 catalog_version,
             }),
         }
+    }
+
+    fn authorize_grant(
+        &self,
+        request: AuthzRequest,
+        privileges: &[String],
+    ) -> Result<AuthzDecision> {
+        anyhow::ensure!(
+            request.action == Action::ManageGrants,
+            "grant authorization requires the ManageGrants action"
+        );
+        let mut decision = self.authorize(request.clone())?;
+        if decision.allowed {
+            return Ok(decision);
+        }
+        // A global grant administrator may delegate on any object without
+        // becoming its owner or holding the underlying data privileges.
+        let global_management = self.authorize(AuthzRequest {
+            resource: ResourceRef::System,
+            context: AuthzContext { database_id: None },
+            ..request.clone()
+        })?;
+        if global_management.allowed {
+            return Ok(global_management);
+        }
+        let (_, mut effective, catalog_version) = self.find_matching_grant(&request)?;
+        // SQL SUPERUSER is an explicit grant administrator too. Apply the same
+        // database scope as grants; role attributes are not inherited.
+        if effective.contains(&request.principal_id)
+            && self
+                .catalog
+                .get_principal_by_id(request.principal_id)?
+                .attributes
+                .superuser
+        {
+            decision.allowed = true;
+            decision.reason = AuthzReason::Superuser;
+            return Ok(decision);
+        }
+        // PUBLIC grants confer ordinary access, never delegation authority.
+        effective.retain(|id| {
+            self.catalog
+                .get_principal_by_id(*id)
+                .is_ok_and(|principal| {
+                    principal.principal_type != nodus_catalog::PrincipalType::Public
+                        && !principal
+                            .name
+                            .eq_ignore_ascii_case(nodus_catalog::PUBLIC_ROLE)
+                })
+        });
+        let grants = self.catalog.get_grants_for_resource(request.resource)?;
+        let mut matched = Vec::new();
+        let temporary = |privilege: &str| {
+            privilege.eq_ignore_ascii_case("TEMP") || privilege.eq_ignore_ascii_case("TEMPORARY")
+        };
+        for privilege in privileges {
+            let grant = grants.iter().find(|grant| {
+                effective.contains(&grant.principal_id)
+                    && grant.grantable
+                    && (grant.privilege.eq_ignore_ascii_case(privilege)
+                        || grant.privilege.eq_ignore_ascii_case("ALL")
+                        || (temporary(privilege) && temporary(&grant.privilege)))
+            });
+            let Some(grant) = grant else {
+                return Ok(decision);
+            };
+            if !matched.contains(&grant.id) {
+                matched.push(grant.id);
+            }
+        }
+        if !privileges.is_empty() {
+            decision.allowed = true;
+            decision.reason = AuthzReason::GrantedWithGrantOption;
+            decision.matched_grants = matched;
+            decision.catalog_version = catalog_version;
+        }
+        Ok(decision)
     }
 
     fn explain(&self, request: AuthzRequest) -> Result<AuthzExplanation> {
@@ -407,6 +499,191 @@ mod tests {
             .authorize(request(PrincipalId::new(), vec![], Action::Select, table))
             .unwrap();
         assert!(!decision.allowed);
+        assert!(
+            !engine
+                .authorize_grant(
+                    request(
+                        PrincipalId::new(),
+                        vec![],
+                        Action::ManageGrants,
+                        ResourceRef::Table(TableId::new())
+                    ),
+                    &["SELECT".into()],
+                )
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn object_all_is_access_not_grant_management() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let user = principal(&catalog, "alice", PrincipalType::User, None);
+        let public = principal(&catalog, "public", PrincipalType::Public, None);
+        let table = ResourceRef::Table(TableId::new());
+        grant(&catalog, user.id, table.clone(), "ALL");
+        let engine = DefaultAuthzEngine::new(catalog.clone());
+        assert!(
+            engine
+                .authorize(request(user.id, vec![], Action::Select, table.clone()))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .authorize(request(
+                    user.id,
+                    vec![],
+                    Action::ManageGrants,
+                    table.clone()
+                ))
+                .unwrap()
+                .allowed
+        );
+        let delegation = || request(user.id, vec![], Action::ManageGrants, table.clone());
+        assert!(
+            !engine
+                .authorize_grant(delegation(), &["SELECT".into()])
+                .unwrap()
+                .allowed
+        );
+
+        catalog
+            .grant_privilege(GrantPrivilegeRequest {
+                id: GrantId::new(),
+                principal_id: public.id,
+                resource: table.clone(),
+                privilege: "SELECT".into(),
+                grantable: true,
+                grantor: None,
+            })
+            .unwrap();
+        assert!(
+            !engine
+                .authorize_grant(delegation(), &["SELECT".into()])
+                .unwrap()
+                .allowed
+        );
+
+        // Explicit grant administration remains distinct from ordinary ALL.
+        grant(&catalog, user.id, table.clone(), "GRANT");
+        assert!(
+            engine
+                .authorize_grant(delegation(), &["SELECT".into(), "UPDATE".into()])
+                .unwrap()
+                .allowed
+        );
+        grant(&catalog, user.id, ResourceRef::System, "GRANT");
+        assert!(
+            engine
+                .authorize_grant(
+                    request(
+                        user.id,
+                        vec![],
+                        Action::ManageGrants,
+                        ResourceRef::Table(TableId::new())
+                    ),
+                    &["SELECT".into(), "UPDATE".into()],
+                )
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn grant_options_respect_database_scope_and_require_every_privilege() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let first = database(&catalog, "first");
+        let second = database(&catalog, "second");
+        let user = principal(&catalog, "alice", PrincipalType::User, None);
+        let role = principal(&catalog, "first_reader", PrincipalType::Role, Some(first));
+        catalog
+            .add_role_member(AddRoleMemberRequest {
+                role_principal_id: role.id,
+                member_id: user.id,
+                admin_option: false,
+                grantor: None,
+            })
+            .unwrap();
+        let table = ResourceRef::Table(TableId::new());
+        let id = GrantId::new();
+        catalog
+            .grant_privilege(GrantPrivilegeRequest {
+                id,
+                principal_id: role.id,
+                resource: table.clone(),
+                privilege: "SELECT".into(),
+                grantable: true,
+                grantor: None,
+            })
+            .unwrap();
+        let engine = DefaultAuthzEngine::new(catalog.clone());
+        let allowed = engine
+            .authorize_grant(
+                request_in_db(user.id, Action::ManageGrants, table.clone(), Some(first)),
+                &["SELECT".into()],
+            )
+            .unwrap();
+        assert!(allowed.allowed);
+        assert_eq!(allowed.matched_grants, vec![id]);
+        assert!(matches!(
+            allowed.reason,
+            AuthzReason::GrantedWithGrantOption
+        ));
+        for (db, privileges) in [
+            (second, vec!["SELECT".into()]),
+            (first, vec!["SELECT".into(), "UPDATE".into()]),
+        ] {
+            let denied = engine
+                .authorize_grant(
+                    request_in_db(user.id, Action::ManageGrants, table.clone(), Some(db)),
+                    &privileges,
+                )
+                .unwrap();
+            assert!(!denied.allowed);
+            assert!(denied.matched_grants.is_empty());
+        }
+        // A database-scoped management grant is not global authority to
+        // delegate privileges on another database.
+        grant(&catalog, role.id, ResourceRef::System, "GRANT");
+        assert!(
+            !engine
+                .authorize_grant(
+                    request_in_db(
+                        user.id,
+                        Action::ManageGrants,
+                        ResourceRef::Database(second),
+                        Some(first)
+                    ),
+                    &["CONNECT".into()],
+                )
+                .unwrap()
+                .allowed
+        );
+        catalog
+            .grant_privilege(GrantPrivilegeRequest {
+                id: GrantId::new(),
+                principal_id: role.id,
+                resource: ResourceRef::Database(first),
+                privilege: "TEMP".into(),
+                grantable: true,
+                grantor: None,
+            })
+            .unwrap();
+        assert!(
+            engine
+                .authorize_grant(
+                    request_in_db(
+                        user.id,
+                        Action::ManageGrants,
+                        ResourceRef::Database(first),
+                        Some(first)
+                    ),
+                    &["TEMPORARY".into()],
+                )
+                .unwrap()
+                .allowed
+        );
     }
 
     #[test]

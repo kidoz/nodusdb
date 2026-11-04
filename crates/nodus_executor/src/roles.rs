@@ -147,32 +147,6 @@ impl MemExecutor {
             .is_ok_and(|decision| decision.allowed)
     }
 
-    /// Whether the effective principal holds `privilege` with the grant
-    /// option on `resource` (so it may grant it onward).
-    fn holds_with_grant_option(
-        &self,
-        ctx: &ExecutionContext,
-        privilege: &str,
-        resource: &ResourceRef,
-    ) -> bool {
-        let Ok(grants) = self
-            .catalog_reader
-            .get_grants_for_resource(resource.clone())
-        else {
-            return false;
-        };
-        let effective = self
-            .catalog_reader
-            .get_effective_principals(self.effective_principal(ctx))
-            .unwrap_or_default();
-        grants.iter().any(|grant| {
-            effective.contains(&grant.principal_id)
-                && grant.grantable
-                && (grant.privilege.eq_ignore_ascii_case(privilege)
-                    || grant.privilege.eq_ignore_ascii_case("ALL"))
-        })
-    }
-
     /// `CREATE ROLE name [WITH options]`.
     pub(crate) fn exec_create_role(
         &self,
@@ -438,21 +412,40 @@ impl MemExecutor {
         grantees: Vec<String>,
         with_grant_option: bool,
     ) -> Result<crate::QueryOutput> {
-        let roles = self.resolve_grantees(ctx, &grantees)?;
         let targets = self.grant_targets(&objects)?;
-        for target in &targets {
-            if !self.is_superuser(ctx)
-                && !self
-                    .authorize(ctx, Action::ManageGrants, target.resource.clone())
-                    .is_ok()
-                && !privileges
-                    .iter()
-                    .any(|privilege| self.holds_with_grant_option(ctx, privilege, &target.resource))
-            {
-                self.authorize(ctx, Action::ManageGrants, target.resource.clone())?;
-            }
+        let mut planned = Vec::with_capacity(targets.len());
+        // Complete validation and authorization for the whole statement before
+        // publishing any grants (or lazily creating the PUBLIC principal).
+        for target in targets {
             for privilege in &privileges {
                 self.check_privilege(privilege, target.kind)?;
+            }
+            let required = privileges
+                .iter()
+                .flat_map(|privilege| {
+                    if privilege.eq_ignore_ascii_case("ALL") {
+                        // TEMP is an alias for TEMPORARY, not an extra capability.
+                        target
+                            .kind
+                            .privileges()
+                            .iter()
+                            .filter(|p| **p != "TEMP")
+                            .map(|p| (*p).to_string())
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![privilege.clone()]
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.authorize_grant(ctx, target.resource.clone(), &required)?;
+            planned.push((target, required));
+        }
+        let roles = self.resolve_grantees(ctx, &grantees)?;
+        for (target, required) in planned {
+            // Publish the same explicit privileges that passed preflight.
+            // A wildcard ALL record could otherwise confer authority beyond
+            // this object's supported privilege set (for example table DDL).
+            for privilege in &required {
                 for role in &roles {
                     self.grant_one(role, &target.resource, privilege, with_grant_option, ctx)?;
                 }
@@ -696,6 +689,7 @@ impl MemExecutor {
         grantees: &[String],
     ) -> Result<Vec<PrincipalDescriptor>> {
         let mut roles = Vec::new();
+        let mut needs_public = false;
         for grantee in grantees {
             if grantee.eq_ignore_ascii_case(nodus_catalog::PUBLIC_ROLE) {
                 match self
@@ -703,19 +697,23 @@ impl MemExecutor {
                     .get_principal_by_name(nodus_catalog::PUBLIC_ROLE)
                 {
                     Ok(role) => roles.push(role),
-                    Err(_) => roles.push(self.catalog_writer.create_role(
-                        nodus_catalog::CreateRoleRequest {
-                            id: PrincipalId::new(),
-                            name: nodus_catalog::PUBLIC_ROLE.to_string(),
-                            principal_type: PrincipalType::Public,
-                            database_id: None,
-                            attributes: Default::default(),
-                        },
-                    )?),
+                    Err(_) => needs_public = true,
                 }
                 continue;
             }
             roles.push(self.resolve_grantee_name(ctx, grantee)?);
+        }
+        if needs_public {
+            roles.push(
+                self.catalog_writer
+                    .create_role(nodus_catalog::CreateRoleRequest {
+                        id: PrincipalId::new(),
+                        name: nodus_catalog::PUBLIC_ROLE.to_string(),
+                        principal_type: PrincipalType::Public,
+                        database_id: None,
+                        attributes: Default::default(),
+                    })?,
+            );
         }
         Ok(roles)
     }

@@ -159,6 +159,78 @@ fn create_role_and_grant_require_grant_management() {
 }
 
 #[test]
+fn grant_option_authorization_audits_the_final_allow_or_deny_decision() {
+    fn sql(exec: &MemExecutor, ctx: &ExecutionContext, sql: &str) -> Result<()> {
+        for statement in nodus_sql::parse_sql(sql)? {
+            exec.execute_logical(ctx, plan_statement(&statement, &[])?)?;
+        }
+        Ok(())
+    }
+
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (exec, catalog) = MemExecutor::shared(audit.clone());
+    let admin = catalog
+        .create_role(CreateRoleRequest {
+            id: PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+            attributes: Default::default(),
+        })
+        .unwrap();
+    catalog
+        .grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+            grantable: false,
+            grantor: None,
+        })
+        .unwrap();
+    sql(
+        &exec,
+        &ctx_for(admin.id),
+        "CREATE ROLE delegator; CREATE ROLE recipient;
+         CREATE TABLE grant_a (id INT);
+         GRANT SELECT ON grant_a TO delegator WITH GRANT OPTION;",
+    )
+    .unwrap();
+    let delegator = catalog.get_principal_by_name("delegator").unwrap();
+    let recipient = catalog.get_principal_by_name("recipient").unwrap();
+    let ctx = ctx_for(delegator.id);
+    sql(&exec, &ctx, "GRANT SELECT ON grant_a TO recipient").unwrap();
+    assert!(sql(&exec, &ctx, "GRANT SELECT, UPDATE ON grant_a TO recipient").is_err());
+    let grants = catalog.get_grants_for_principal(recipient.id).unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].privilege, "SELECT");
+
+    let events = audit
+        .query(&AuditQuery {
+            actor: Some(delegator.id),
+            action: Some("GRANT".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "record the final authorization, not a failed admin probe"
+    );
+    assert_eq!(events[0].result, "Success");
+    assert_eq!(events[0].reason.as_deref(), Some("GrantedWithGrantOption"));
+    assert!(events[0].error.is_none());
+    assert_eq!(events[1].result, "Denied");
+    assert!(events[1].error.is_some());
+    let table = catalog.get_table("default", "public", "grant_a").unwrap();
+    assert!(events.iter().all(|event| {
+        event.actor == delegator.id
+            && event.resource == Some(ResourceRef::Table(table.id))
+            && event.authz_catalog_version.is_some()
+    }));
+}
+
+#[test]
 fn create_table_denied_then_allowed_by_grant() {
     let audit = Arc::new(MemoryAuditSink::new());
     let (exec, cat) = MemExecutor::shared(audit.clone());

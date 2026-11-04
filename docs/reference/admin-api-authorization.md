@@ -80,6 +80,34 @@ and `PUBLIC` grants remain applicable in every database. An existing session
 keeps its original principal and database identity; reconnect to pick up a
 replacement identity or a different database.
 
+## SQL privilege delegation
+
+SQL `GRANT` validates every requested privilege, target, and grantee before
+publishing grants. The caller must own the target, hold explicit authority to
+manage grants on the target or globally, be a superuser, or hold the grant option
+for every requested privilege. Ordinary object `ALL` privileges do not include grant
+management. Delegating `ALL` requires grant options for all privileges supported
+by that object kind, and publishes those explicit privileges instead of a
+wildcard grant. New table `ALL` grants confer neither ownership nor destructive
+DDL authority. `TEMP` and `TEMPORARY` name the same database privilege.
+
+Existing object wildcard grants remain readable and are not rewritten
+automatically. An owner or grant administrator can replace a legacy wildcard by
+revoking it and regranting the intended object privileges.
+
+An unauthorized request fails with SQLSTATE `42501` and publishes no grants,
+including on earlier authorized targets or to earlier grantees. An invalid
+privilege or grantee also fails before grants are published. NodusDB rejects the
+whole request when any requested privilege cannot be delegated. These guarantees
+cover preflight failures; they do not make catalog publication transactional
+across storage failures.
+
+Grant options inherited through roles apply only in those roles' database scope.
+`PUBLIC` grants confer access without delegation authority. Prepared execution
+checks current authorization, so revoking a grant option prevents later
+delegation through an already prepared statement. Audit events record the final
+allow or deny decision, including authorization through grant options.
+
 ## Route privileges
 
 | Route prefix | Required action |
