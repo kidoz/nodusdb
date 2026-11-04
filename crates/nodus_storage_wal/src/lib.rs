@@ -1,5 +1,6 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::Context;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use nodus_storage_api::{Timestamp, TxnId};
 use rand::Rng;
@@ -96,7 +97,63 @@ pub struct FileWalEngine {
     cipher: Option<Aes256Gcm>,
 }
 
+/// A read-only scan's replayable prefix and pending tail repair. No durable
+/// format is represented by this type. Exclude writers and filesystem changes
+/// between scanning, validating the containing chain, and repairing its tails.
+pub struct WalRecoveryScan {
+    path: PathBuf,
+    records: Vec<WalRecord>,
+    valid_end: u64,
+    file_len: u64,
+}
+
+impl WalRecoveryScan {
+    /// Complete, authenticated and decoded records preceding any torn tail.
+    pub fn records(&self) -> &[WalRecord] {
+        &self.records
+    }
+
+    /// Whether incomplete or checksum-failing trailing bytes were found.
+    pub fn needs_repair(&self) -> bool {
+        self.valid_end < self.file_len
+    }
+
+    /// Truncates only the tail identified by this scan, after the caller has
+    /// validated every required segment. Refuses a changed file length and
+    /// never creates a missing file. This is not an inter-process lock.
+    pub fn repair_tail(&self) -> anyhow::Result<()> {
+        if self.needs_repair() {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .with_context(|| format!("opening WAL {} for tail repair", self.path.display()))?;
+            anyhow::ensure!(
+                file.metadata()?.len() == self.file_len,
+                "WAL {} changed length after scanning; refusing tail repair",
+                self.path.display()
+            );
+            file.set_len(self.valid_end)?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Consumes the scan and returns its replayable records.
+    pub fn into_records(self) -> Vec<WalRecord> {
+        self.records
+    }
+}
+
 impl FileWalEngine {
+    /// Scans without creating or repairing a WAL. Unlike [`Self::inspect`], a
+    /// torn tail returns a plan for later repair, allowing an entire required
+    /// chain to be validated before any file changes. Authentication, decoding,
+    /// and I/O failures are errors rather than repairable tails.
+    pub fn scan<P: AsRef<Path>>(path: P, key: Option<[u8; 32]>) -> anyhow::Result<WalRecoveryScan> {
+        let cipher = key.map(|k| Aes256Gcm::new(&Key::<Aes256Gcm>::from(k)));
+        read_records(path.as_ref(), cipher.as_ref())
+    }
+
     /// Reads a complete WAL without creating, repairing, or truncating it.
     /// Incomplete and checksum-failing tails are errors. Intended for offline
     /// validation before legacy migration; the caller must exclude writers.
@@ -104,8 +161,14 @@ impl FileWalEngine {
         path: P,
         key: Option<[u8; 32]>,
     ) -> anyhow::Result<Vec<WalRecord>> {
-        let cipher = key.map(|k| Aes256Gcm::new(&Key::<Aes256Gcm>::from(k)));
-        read_records(path.as_ref(), cipher.as_ref(), false)
+        let scan = Self::scan(path, key)?;
+        anyhow::ensure!(
+            !scan.needs_repair(),
+            "WAL {} at byte offset {}: incomplete or checksum-failing frame; read-only inspection does not repair tails",
+            scan.path.display(),
+            scan.valid_end
+        );
+        Ok(scan.into_records())
     }
 
     pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
@@ -113,17 +176,33 @@ impl FileWalEngine {
     }
 
     pub fn with_encryption<P: AsRef<Path>>(path: P, key: Option<[u8; 32]>) -> anyhow::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        Self::open_file(path.as_ref(), key, OpenOptions::new().create(true))
+    }
+
+    /// Creates a new WAL exclusively; refuses any existing directory entry so
+    /// rotation cannot append a new header to an unpublished orphan segment.
+    pub fn create_new<P: AsRef<Path>>(path: P, key: Option<[u8; 32]>) -> anyhow::Result<Self> {
+        Self::open_file(path.as_ref(), key, OpenOptions::new().create_new(true))
+    }
+
+    /// Opens an existing WAL for append/recovery without creating a missing
+    /// segment. Use when a published manifest already names the file.
+    pub fn open_existing<P: AsRef<Path>>(path: P, key: Option<[u8; 32]>) -> anyhow::Result<Self> {
+        Self::open_file(path.as_ref(), key, &mut OpenOptions::new())
+    }
+
+    fn open_file(
+        path: &Path,
+        key: Option<[u8; 32]>,
+        options: &mut OpenOptions,
+    ) -> anyhow::Result<Self> {
+        let file = options.append(true).read(true).open(path)?;
 
         let cipher = key.map(|k| Aes256Gcm::new(&Key::<Aes256Gcm>::from(k)));
 
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
             cipher,
         })
     }
@@ -171,16 +250,14 @@ impl WalEngine for FileWalEngine {
     }
 
     fn recover(&self) -> anyhow::Result<Vec<WalRecord>> {
-        read_records(&self.path, self.cipher.as_ref(), true)
+        let scan = read_records(&self.path, self.cipher.as_ref())?;
+        scan.repair_tail()?;
+        Ok(scan.into_records())
     }
 }
 
-fn read_records(
-    path: &Path,
-    cipher: Option<&Aes256Gcm>,
-    repair_tail: bool,
-) -> anyhow::Result<Vec<WalRecord>> {
-    let file = File::open(path)?;
+fn read_records(path: &Path, cipher: Option<&Aes256Gcm>) -> anyhow::Result<WalRecoveryScan> {
+    let file = File::open(path).with_context(|| format!("reading WAL {}", path.display()))?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut records = Vec::new();
@@ -264,21 +341,14 @@ fn read_records(
         valid_end += 8 + u64::from(len);
     }
 
-    // Only incomplete or checksum-failing frames reach this repair path.
-    // Truncate the torn tail so later appends remain replayable. Errors in
-    // complete CRC-valid frames above leave every byte intact.
-    if valid_end < file_len {
-        anyhow::ensure!(
-            repair_tail,
-            "WAL {} at byte offset {valid_end}: incomplete or checksum-failing frame; read-only inspection does not repair tails",
-            path.display()
-        );
-        let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(valid_end)?;
-        file.sync_data()?;
-    }
-
-    Ok(records)
+    // Scanning never repairs. Standalone recovery repairs this plan immediately;
+    // LSM first validates every segment and link in its required chain.
+    Ok(WalRecoveryScan {
+        path: path.to_path_buf(),
+        records,
+        valid_end,
+        file_len,
+    })
 }
 
 #[cfg(test)]
@@ -726,5 +796,82 @@ mod tests {
         let path = dir.path().join("missing.log");
         assert!(FileWalEngine::inspect(&path, None).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn scan_defers_tail_repair_until_explicitly_requested() {
+        let file = NamedTempFile::new().unwrap();
+        let engine = FileWalEngine::new(file.path()).unwrap();
+        engine.append(checkpoint(1)).unwrap();
+        engine.sync().unwrap();
+        let valid = std::fs::read(file.path()).unwrap();
+        let mut torn = valid.clone();
+        torn.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(file.path(), &torn).unwrap();
+
+        let scan = FileWalEngine::scan(file.path(), None).unwrap();
+        assert!(scan.needs_repair());
+        assert_eq!(checkpoint_ts(scan.records()), vec![1]);
+        assert_eq!(std::fs::read(file.path()).unwrap(), torn);
+        scan.repair_tail().unwrap();
+        assert_eq!(std::fs::read(file.path()).unwrap(), valid);
+        engine.append(checkpoint(2)).unwrap();
+        engine.sync().unwrap();
+        assert_eq!(checkpoint_ts(&engine.recover().unwrap()), vec![1, 2]);
+    }
+
+    #[test]
+    fn deferred_tail_repair_refuses_a_changed_file_length() {
+        let file = NamedTempFile::new().unwrap();
+        let engine = FileWalEngine::new(file.path()).unwrap();
+        engine.append(checkpoint(1)).unwrap();
+        engine.sync().unwrap();
+        let mut torn = std::fs::read(file.path()).unwrap();
+        torn.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(file.path(), torn).unwrap();
+        let scan = FileWalEngine::scan(file.path(), None).unwrap();
+        // Simulate a caller violating recovery's exclusive-access requirement.
+        engine.append(checkpoint(2)).unwrap();
+        engine.sync().unwrap();
+        let changed = std::fs::read(file.path()).unwrap();
+        assert!(
+            scan.repair_tail()
+                .unwrap_err()
+                .to_string()
+                .contains("changed length")
+        );
+        assert_eq!(std::fs::read(file.path()).unwrap(), changed);
+    }
+
+    #[test]
+    fn open_existing_never_creates_a_missing_wal_and_preserves_append_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("required.log");
+        let key = Some([42; 32]);
+        assert!(FileWalEngine::open_existing(&path, key).is_err());
+        assert!(!path.exists());
+        {
+            let writer = FileWalEngine::with_encryption(&path, key).unwrap();
+            writer.append(checkpoint(1)).unwrap();
+            writer.sync().unwrap();
+        }
+        let writer = FileWalEngine::open_existing(&path, key).unwrap();
+        assert_eq!(checkpoint_ts(&writer.recover().unwrap()), vec![1]);
+        writer.append(checkpoint(2)).unwrap();
+        writer.sync().unwrap();
+        assert_eq!(checkpoint_ts(&writer.recover().unwrap()), vec![1, 2]);
+    }
+
+    #[test]
+    fn exclusive_creation_never_appends_to_an_existing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.log");
+        let writer = FileWalEngine::create_new(&path, None).unwrap();
+        writer.append(checkpoint(1)).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        let original = std::fs::read(&path).unwrap();
+        assert!(FileWalEngine::create_new(&path, None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 }
