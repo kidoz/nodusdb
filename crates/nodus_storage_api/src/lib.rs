@@ -212,7 +212,7 @@ pub trait KvEngine: Send + Sync {
     }
     fn abort(&self, txn_id: TxnId) -> KvResult<()>;
 
-    /// Keys on which `txn_id` currently holds uncommitted intents in this engine
+    /// Logical keys on which `txn_id` currently holds uncommitted intents in this engine
     /// (empty once it commits, aborts, or if it never wrote here). Cross-shard
     /// 2PC prepare uses this to vote: a participant asked to prepare a
     /// transaction whose intents have vanished cannot commit it, so it must vote
@@ -514,8 +514,18 @@ impl KvEngine for NamespacedKvEngine {
 
     fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
         // The namespaced txn id isolates this group's intents in the shared
-        // inner store, so this is precise per group with no key filtering.
-        self.inner.pending_intent_keys(self.namespaced_txn(txn_id))
+        // inner store. Return the same logical keys that writes and scans use,
+        // including through nested namespace adapters.
+        self.inner
+            .pending_intent_keys(self.namespaced_txn(txn_id))
+            .into_iter()
+            // Keep an unexpected foreign key intact so exact-set validation
+            // fails closed instead of silently dropping it or panicking.
+            .map(|key| {
+                key.strip_prefix(self.prefix.as_ref())
+                    .map_or_else(|| key.clone(), Bytes::copy_from_slice)
+            })
+            .collect()
     }
 
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {

@@ -687,6 +687,7 @@ mod tests {
                     }],
                 )
                 .unwrap();
+            assert_eq!(engine.pending_intent_keys(txn), vec![Bytes::from("key")]);
         }
 
         left.commit_batch(vec![(txn, 10)]).unwrap();
@@ -694,5 +695,39 @@ mod tests {
         assert_eq!(right.get(b"key", 10).unwrap(), None);
         right.commit_batch(vec![(txn, 20)]).unwrap();
         assert_eq!(right.get(b"key", 20).unwrap(), Some(Bytes::from("value")));
+    }
+
+    #[test]
+    fn nested_namespace_pending_keys_stay_logical_and_isolated() {
+        let raw = std::sync::Arc::new(MemKvEngine::new());
+        let outer = std::sync::Arc::new(nodus_storage_api::NamespacedKvEngine::new(
+            raw.clone(),
+            "outer",
+        ));
+        let inner = nodus_storage_api::NamespacedKvEngine::new(outer, "inner");
+        let txn = TxnId::new();
+        raw.write_intent(
+            txn,
+            Bytes::from_static(b"unrelated"),
+            Bytes::from_static(b"raw"),
+        )
+        .unwrap();
+        inner
+            .write_intent(
+                txn,
+                Bytes::from_static(b"key"),
+                Bytes::from_static(b"nested"),
+            )
+            .unwrap();
+        assert_eq!(
+            inner.pending_intent_keys(txn),
+            vec![Bytes::from_static(b"key")]
+        );
+        inner.commit(txn, 10).unwrap();
+        assert!(inner.pending_intent_keys(txn).is_empty());
+        assert_eq!(
+            raw.pending_intent_keys(txn),
+            vec![Bytes::from_static(b"unrelated")]
+        );
     }
 }
