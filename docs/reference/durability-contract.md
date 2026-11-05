@@ -301,6 +301,18 @@ and subprocess exit before/after the second batch's commit without running
 destructors. It inspects persisted records before constructor reconciliation.
 These subprocess tests demonstrate process-exit recovery, not power-loss behavior.
 
+Before a group restarts Raft, construction validates its committed log, vote,
+applied state and snapshot descriptor, then discards unfinished local metadata
+transactions confined to `\0raft\0`. A transaction containing both metadata and
+user keys fails recovery without being discarded. This prevents an interrupted
+metadata write from locking the next applied-state update. It requires exclusive
+ownership of the group's storage with old Raft workers stopped, and supported,
+successful pending-intent inspection. It never infers death from age or aborts
+user, transaction-authority or participant-control intents. Persistent tests in
+`nodus_raftstore::control_recovery::tests` cover raw and namespaced stores, mixed-key
+rejection, and preservation of user intents; the tracked-transaction process-exit
+tests exercise this during live Raft replication.
+
 Constructor reconciliation (`reconcile_torn_recovery`) handles a crash that
 durably keeps the applied-state pointer but loses log entries it refers to: the
 applied prefix is reported as purged and stale entries are dropped so openraft

@@ -173,6 +173,15 @@ struct CheckpointExit {
     boundary: String,
 }
 impl KvEngine for CheckpointExit {
+    fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        self.inner.has_pending_intents(prefix)
+    }
+    fn pending_intents(&self, prefix: &[u8]) -> Result<Vec<nodus_storage_api::PendingIntents>> {
+        self.inner.pending_intents(prefix)
+    }
+    fn abort_physical(&self, txn: TxnId) -> KvResult<()> {
+        self.inner.abort_physical(txn)
+    }
     fn replace_intent(
         &self,
         txn: TxnId,

@@ -56,6 +56,18 @@ impl ProbeKv {
 }
 
 impl KvEngine for ProbeKv {
+    fn has_pending_intents(&self, prefix: &[u8]) -> anyhow::Result<bool> {
+        self.inner.has_pending_intents(prefix)
+    }
+    fn pending_intents(
+        &self,
+        prefix: &[u8],
+    ) -> anyhow::Result<Vec<nodus_storage_api::PendingIntents>> {
+        self.inner.pending_intents(prefix)
+    }
+    fn abort_physical(&self, txn: TxnId) -> KvResult<()> {
+        self.inner.abort_physical(txn)
+    }
     fn get(&self, key: &[u8], ts: u64) -> anyhow::Result<Option<Bytes>> {
         self.inner.get(key, ts)
     }

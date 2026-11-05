@@ -30,6 +30,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 pub mod backup;
+mod control_recovery;
 pub mod migration;
 pub mod network;
 mod purge;
@@ -886,6 +887,10 @@ impl NodusRaftStore {
         let mut log = meta.load_log()?;
         let vote = meta.load_vote()?;
         let mut applied = meta.load_applied()?;
+        let persisted_snapshot_meta = meta.load_snapshot_meta()?;
+        // All committed metadata has decoded successfully. Only now discard
+        // unfinished local metadata writes, before any consensus worker starts.
+        control_recovery::discard_unpublished(kv.as_ref())?;
         let tracked_participants = kv
             .scan(
                 KeyRange {
@@ -911,9 +916,8 @@ impl NodusRaftStore {
         // Recover the snapshot metadata so a restarted node can resume from the
         // on-disk snapshot (and the purged log below it) rather than replaying
         // the whole log. Only honor it if the snapshot file is actually present.
-        let snapshot_meta = meta
-            .load_snapshot_meta()?
-            .filter(|_| snapshot_dir.join(CURRENT_SNAPSHOT_FILE).exists());
+        let snapshot_meta =
+            persisted_snapshot_meta.filter(|_| snapshot_dir.join(CURRENT_SNAPSHOT_FILE).exists());
         // A torn recovery can leave the purge watermark above the durable
         // snapshot: `reconcile_torn_recovery` raises the watermark to the
         // applied pointer when the applied log prefix is lost, and that pointer
@@ -985,6 +989,9 @@ impl NodusRaftStore {
     /// files under `snapshot_dir`. Catalog/RBAC and upgrade commands are no-ops
     /// on a data group — those are owned by the meta group. Fails closed on a
     /// durable read error during recovery.
+    /// The caller must exclusively own this group's storage, with previous
+    /// Raft workers stopped. The engine must support pending-intent inspection
+    /// so unpublished local consensus writes can be recovered safely.
     pub fn with_kv_at(
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         snapshot_dir: PathBuf,
@@ -2009,6 +2016,15 @@ mod tests {
     }
 
     impl KvEngine for FailingKv {
+        fn has_pending_intents(&self, prefix: &[u8]) -> anyhow::Result<bool> {
+            self.inner.has_pending_intents(prefix)
+        }
+        fn pending_intents(
+            &self,
+            prefix: &[u8],
+        ) -> anyhow::Result<Vec<nodus_storage_api::PendingIntents>> {
+            self.inner.pending_intents(prefix)
+        }
         fn get(&self, key: &[u8], ts: u64) -> anyhow::Result<Option<Bytes>> {
             if self.fail_gets.load(Ordering::SeqCst) {
                 return Err(Self::injected().into());
