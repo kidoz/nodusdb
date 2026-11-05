@@ -135,6 +135,7 @@ pub(crate) fn is_control_key(key: &[u8]) -> bool {
         || key.starts_with(coordinator::JOURNAL_PREFIX)
         || key.starts_with(coordinator::v3::JOURNAL_PREFIX)
         || key.starts_with(crate::txn_authority::PREFIX)
+        || key.starts_with(crate::txn_participant::PREFIX)
 }
 
 /// The table id of any migration journal that could still drive routing
@@ -192,7 +193,9 @@ pub(crate) fn validate_snapshot_record(
     if !is_control_key(key) {
         return Ok(());
     }
-    if key.starts_with(crate::txn_authority::PREFIX) {
+    if key.starts_with(crate::txn_participant::PREFIX) {
+        crate::txn_participant::validate_snapshot(kv, key, value)?;
+    } else if key.starts_with(crate::txn_authority::PREFIX) {
         crate::txn_authority::validate_snapshot_record(kv, key, value)?;
     } else if key == FENCE_KEY {
         let incoming: ParticipantFence = decode_record(value)?;
@@ -327,7 +330,7 @@ fn valid_plan(plan: &MigrationPlan) -> bool {
 /// before fencing: a participant with no remaining intents may still need an
 /// idempotent commit acknowledgement at its original epoch.
 fn quiescent(kv: &dyn KvEngine, is_meta: bool) -> Result<bool> {
-    if kv.has_pending_intents(b"")? {
+    if kv.has_pending_intents(b"")? || crate::txn_participant::has_unresolved(kv)? {
         return Ok(false);
     }
     if is_meta {
@@ -495,7 +498,7 @@ fn epoch_is_open(kv: &dyn KvEngine, epoch: u64) -> Result<bool> {
     Ok(fence.as_ref().map_or(0, |f| f.epoch) == epoch && !fence.is_some_and(|f| f.closed))
 }
 
-fn invalid_write_batch(operations: &[EpochIntentOperationV1]) -> Option<&'static str> {
+pub(crate) fn invalid_write_batch(operations: &[EpochIntentOperationV1]) -> Option<&'static str> {
     if operations.is_empty() {
         return Some("write batch must not be empty");
     }

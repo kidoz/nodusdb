@@ -59,7 +59,7 @@ pub struct RecordV1 {
 }
 
 impl RecordV1 {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.txn_id.is_nil(), "nil transaction ID");
         self.token.owner.validate()?;
         ensure!(

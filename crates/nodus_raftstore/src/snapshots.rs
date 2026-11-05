@@ -316,6 +316,11 @@ impl NodusRaftStore {
                 "snapshot keys are duplicated or out of order"
             );
             last = Some(row.key.clone());
+            if row.key.starts_with(txn_participant::PREFIX) {
+                // Publish conservatively before replacing storage. Snapshots
+                // cannot omit an existing fence, so this flag never clears.
+                self.tracked_participants.store(true, Ordering::Release);
+            }
             if let Some(kv) = &sm.kv {
                 validate_control(kv.as_ref(), &row)?;
             }

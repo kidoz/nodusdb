@@ -4,6 +4,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod txn_authority;
+pub mod txn_participant;
 pub mod upgrade;
 
 use std::collections::BTreeMap;
@@ -12,7 +13,7 @@ use std::io::SeekFrom;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::RwLock;
@@ -166,13 +167,10 @@ pub enum ShardCommand {
         txn_id: String,
         #[serde(default)]
         shard_id: Option<String>,
-        /// `true` when `txn_id` is the id as RECORDED in this group's store
-        /// (legacy recorded-id cleanup aborts — the only id recoverable from
-        /// a raw store scan after a restart), bypassing the namespace id
-        /// mapping a session's abort applies. Defaults to `false`, so older
-        /// binaries parse the command unchanged (they apply it as a session
-        /// abort, a benign no-op for recorded ids, and the janitor refrains
-        /// from submitting these while a rolling upgrade is in flight).
+        /// Historical recorded-ID cleanup aborts. Retained for decoding old
+        /// logs, but current apply rejects them: neither a physical ID nor age
+        /// proves ownership or an abort decision. Explicit owner rollback uses
+        /// `false`, the default, and the session's logical transaction ID.
         #[serde(default)]
         recorded: bool,
     },
@@ -309,12 +307,21 @@ pub enum ShardCommand {
     /// forwarded ingress rejects it until participant fencing and a new
     /// finalized cluster level exist. Appended to preserve legacy ordinals.
     TxnAuthorityV1(txn_authority::CommandV1),
+    /// Dormant participant fencing; activated only with the complete authority protocol.
+    TxnParticipantV1(txn_participant::CommandV1),
 }
 
 impl ShardCommand {
+    /// Dormant transaction protocol; neither router nor HTTP ingress has a
+    /// production activation path at the existing compatibility levels.
+    pub fn requires_txn_authority_protocol(&self) -> bool {
+        matches!(self, Self::TxnAuthorityV1(_) | Self::TxnParticipantV1(_))
+    }
     /// Fixed, low-cardinality command kinds for metrics and tracing.
     pub fn metrics_kind(&self) -> &'static str {
         match self {
+            Self::TxnAuthorityV1(_) => "txn_authority",
+            Self::TxnParticipantV1(_) => "txn_participant",
             Self::EpochWriteBatchV1 { .. } => "intent_batch",
             Self::EpochCommitBatchV1 { .. } => "commit_batch",
             Self::EpochWriteV1 { mutation, .. } => match mutation {
@@ -783,6 +790,10 @@ pub struct StateMachine {
 
 #[derive(Clone)]
 pub struct NodusRaftStore {
+    /// Monotonic guard: set before participant apply or snapshot validation;
+    /// recovered from storage at startup. Untouched groups avoid a KV lookup
+    /// for every legacy write while the new protocol is dormant.
+    tracked_participants: Arc<AtomicBool>,
     snapshot_group: String,
     snapshot_compatibility: Option<Arc<dyn SnapshotCompatibility>>,
     /// Snapshot-build deferral streak, so the next build within
@@ -832,6 +843,7 @@ impl NodusRaftStore {
     /// In-memory store (no durability) — for tests and ephemeral groups.
     pub fn new() -> Self {
         Self {
+            tracked_participants: Arc::new(AtomicBool::new(false)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
             vote: Arc::new(RwLock::new(None)),
             state_machine: Arc::new(RwLock::new(StateMachine {
@@ -874,6 +886,17 @@ impl NodusRaftStore {
         let mut log = meta.load_log()?;
         let vote = meta.load_vote()?;
         let mut applied = meta.load_applied()?;
+        let tracked_participants = kv
+            .scan(
+                KeyRange {
+                    start: Bytes::from_static(txn_participant::PREFIX),
+                    end: Bytes::from_static(b"\x01txn-participant0"),
+                },
+                u64::MAX,
+            )?
+            .next()
+            .transpose()?
+            .is_some();
         if reconcile_torn_recovery(&mut log, &mut applied) {
             // Persist the repaired watermark so the consistent view is stable
             // across a subsequent restart, even if no apply/purge runs first.
@@ -915,6 +938,7 @@ impl NodusRaftStore {
             other => other,
         };
         Ok(Self {
+            tracked_participants: Arc::new(AtomicBool::new(tracked_participants)),
             log: Arc::new(RwLock::new(log)),
             vote: Arc::new(RwLock::new(vote)),
             state_machine: Arc::new(RwLock::new(StateMachine {
@@ -1396,6 +1420,30 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     tracing::debug!(command = cmd.metrics_kind(), "Raft applying command");
+                    if let ShardCommand::TxnParticipantV1(command) = cmd {
+                        // Set before any publication, including partial apply
+                        // followed by a crash. False positives only cost reads.
+                        self.tracked_participants.store(true, Ordering::Release);
+                        let kv = sm.kv.as_ref().ok_or_else(|| {
+                            StorageIOError::write_state_machine(AnyError::error(
+                                "participant protocol requires storage",
+                            ))
+                        })?;
+                        let response = txn_participant::apply(
+                            kv.as_ref(),
+                            &self.snapshot_group,
+                            command,
+                            entry.log_id.index,
+                        )
+                        .map_err(|e| {
+                            StorageIOError::write_state_machine(AnyError::error(format!(
+                                "participant protocol apply: {e}"
+                            )))
+                        })?;
+                        sm.last_applied_log = Some(entry.log_id);
+                        res.push(response);
+                        continue;
+                    }
                     if let ShardCommand::TxnAuthorityV1(command) = cmd {
                         let response = if self.snapshot_group != "shard-meta" {
                             ShardResponse {
@@ -1471,6 +1519,20 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                         continue;
                     }
                     if let Some(kv) = &sm.kv {
+                        if let Some(response) = txn_participant::reject_legacy(
+                            kv.as_ref(),
+                            cmd,
+                            self.tracked_participants.load(Ordering::Acquire),
+                        )
+                        .map_err(|e| {
+                            StorageIOError::write_state_machine(AnyError::error(format!(
+                                "participant legacy guard: {e}"
+                            )))
+                        })? {
+                            sm.last_applied_log = Some(entry.log_id);
+                            res.push(response);
+                            continue;
+                        }
                         if let Some(response) = migration::apply(
                             kv.as_ref(),
                             cmd,
@@ -1536,21 +1598,12 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     )?;
                                 }
                             }
-                            ShardCommand::AbortTxn {
-                                txn_id, recorded, ..
-                            } => {
+                            ShardCommand::AbortTxn { txn_id, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    // Session aborts name the session's txn id,
-                                    // which a namespaced group engine maps to
-                                    // the recorded id. Janitor aborts
-                                    // (`recorded`) name the id as stored, so
-                                    // they bypass the mapping.
-                                    let result = if *recorded {
-                                        kv.abort_physical(TxnId(tid))
-                                    } else {
-                                        kv.abort(TxnId(tid))
-                                    };
-                                    error = apply_kv_result("AbortTxn", txn_id, result)?;
+                                    // Recorded-ID cleanup was rejected above;
+                                    // explicit owner rollback uses namespace mapping.
+                                    error =
+                                        apply_kv_result("AbortTxn", txn_id, kv.abort(TxnId(tid)))?;
                                 }
                             }
                             ShardCommand::PrepareTxn { txn_id, .. } => {

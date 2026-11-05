@@ -19,7 +19,7 @@ impl From<IntentReplacement> for ReplacementV2 {
     }
 }
 
-pub(super) fn apply_repair(
+pub(crate) fn apply_repair(
     kv: &dyn KvEngine,
     epoch: u64,
     txn: Uuid,

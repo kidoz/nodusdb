@@ -241,10 +241,10 @@ pub trait KvEngine: Send + Sync {
 
     /// Aborts the intents recorded under exactly `txn_id` in this engine,
     /// bypassing any namespace id remapping that [`Self::abort`] applies. The
-    /// legacy recorded-id abort commands use the *recorded* id (the only one
-    /// recoverable after restart), so Raft apply falls back to this when a
-    /// mapped lookup finds nothing. Inspection-only janitor sweeps emit no such
-    /// commands. Default: same as `abort`
+    /// Exclusive startup recovery uses recorded ids only after proving that a
+    /// transaction holds unpublished local consensus-metadata keys exclusively.
+    /// User-intent janitors must never infer abort authority from recorded ids;
+    /// historical recorded-id cleanup commands are rejected. Default: same as `abort`
     /// (correct for engines without id remapping).
     fn abort_physical(&self, txn_id: TxnId) -> KvResult<()> {
         self.abort(txn_id)

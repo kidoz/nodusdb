@@ -290,7 +290,7 @@ async fn write(
 ) -> impl axum::response::IntoResponse {
     // Level 4 does not authorize this format. Keep even peer-authenticated
     // forwarding closed until participant enforcement and a new upgrade target.
-    if matches!(cmd, ShardCommand::TxnAuthorityV1(_)) {
+    if cmd.requires_txn_authority_protocol() {
         return (
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "transaction authority activation is unavailable",
@@ -338,7 +338,8 @@ async fn write(
     // `PrepareTxn` changes no state and its vote reflects the *current* intents,
     // so it is never deduped — a retried prepare must re-vote, not get a stale
     // ack. All other commands keep dedup to avoid a duplicate Raft log entry.
-    let is_prepare = matches!(cmd, ShardCommand::PrepareTxn { .. });
+    let is_prepare =
+        matches!(cmd, ShardCommand::PrepareTxn { .. }) || cmd.requires_txn_authority_protocol();
 
     // A retried forward (the original's response was lost) carries the same
     // request id; if we already applied it, ack without writing a duplicate
@@ -518,6 +519,16 @@ mod tests {
                 },
             },
         });
+        let participant = ShardCommand::TxnParticipantV1(crate::txn_participant::CommandV1 {
+            txn_id: uuid::Uuid::new_v4(),
+            owner: crate::txn_authority::OwnerV1 {
+                node_id: 1,
+                incarnation: uuid::Uuid::new_v4(),
+            },
+            generation: 1,
+            epoch: 0,
+            operation: crate::txn_participant::OperationV1::Prepare { keys_hash: [0; 32] },
+        });
         for level in 1..=crate::upgrade::MAX_CLUSTER_VERSION {
             for peer in [false, true] {
                 let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
@@ -546,10 +557,12 @@ mod tests {
                     }
                 };
                 let addr = serve(auth, state).await;
-                assert_eq!(
-                    post_write(addr, &cmd, Some("t0ken")).await,
-                    reqwest::StatusCode::NOT_IMPLEMENTED
-                );
+                for command in [&cmd, &participant] {
+                    assert_eq!(
+                        post_write(addr, command, Some("t0ken")).await,
+                        reqwest::StatusCode::NOT_IMPLEMENTED
+                    );
+                }
                 use nodus_storage_api::KvEngine;
                 assert!(
                     kv.scan(
