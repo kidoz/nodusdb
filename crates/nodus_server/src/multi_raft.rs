@@ -274,6 +274,7 @@ impl MultiRaftManager {
             .kv
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("participant storage is absent"))?;
+        nodus_raftstore::txn_participant::validate_legacy_repair(kv.as_ref(), txn, &key)?;
         anyhow::ensure!(
             nodus_raftstore::migration::read_fence(kv.as_ref())?.is_none(),
             "shard routing changed: epoch required for savepoint repair"

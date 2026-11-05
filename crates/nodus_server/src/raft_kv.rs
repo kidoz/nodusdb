@@ -5,6 +5,7 @@ mod janitor_tests;
 mod routing;
 #[cfg(test)]
 mod routing_tests;
+mod tracked;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -75,6 +76,9 @@ pub struct RaftKvEngine {
 pub struct TxnParticipant {
     epoch: u64,
     intents: HashSet<Vec<u8>>,
+    /// Pin the protocol at this transaction's first write. A future activation
+    /// must not silently convert an existing legacy transaction mid-session.
+    tracked: bool,
 }
 
 /// Parses the leading `{table_id}` of a row key. Returns `None` for non-row keys
@@ -113,14 +117,28 @@ impl RaftKvEngine {
             return Ok(participant.epoch);
         }
         let epoch = self.current_epoch(group_id)?;
+        let tracked = groups
+            .values()
+            .next()
+            .map_or_else(|| self.router.txn_authority_enabled(), |p| p.tracked);
         groups.insert(
             group_id.to_string(),
             TxnParticipant {
                 epoch,
                 intents: HashSet::new(),
+                tracked,
             },
         );
         Ok(epoch)
+    }
+
+    fn tracks_authority(&self, txn: TxnId) -> bool {
+        self.txn_groups
+            .lock()
+            .unwrap()
+            .get(&txn)
+            .and_then(|g| g.values().next())
+            .map_or_else(|| self.router.txn_authority_enabled(), |p| p.tracked)
     }
 
     fn record_intent(&self, txn: TxnId, group: &str, key: &[u8], live: bool) {
@@ -466,6 +484,19 @@ impl KvEngine for RaftKvEngine {
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         let group_id = self.route(&key)?;
         let epoch = self.record_txn_group(txn_id, &group_id)?;
+        if self.tracks_authority(txn_id) {
+            self.tracked_write(
+                txn_id,
+                &group_id,
+                epoch,
+                vec![nodus_raftstore::migration::EpochIntentOperationV1::Put {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                }],
+            )?;
+            self.record_intent(txn_id, &group_id, &key, true);
+            return Ok(());
+        }
         let cmd = self.epoch_command(
             &group_id,
             epoch,
@@ -483,6 +514,18 @@ impl KvEngine for RaftKvEngine {
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         let group_id = self.route(&key)?;
         let epoch = self.record_txn_group(txn_id, &group_id)?;
+        if self.tracks_authority(txn_id) {
+            self.tracked_write(
+                txn_id,
+                &group_id,
+                epoch,
+                vec![nodus_raftstore::migration::EpochIntentOperationV1::Delete {
+                    key: key.to_vec(),
+                }],
+            )?;
+            self.record_intent(txn_id, &group_id, &key, true);
+            return Ok(());
+        }
         let cmd = self.epoch_command(
             &group_id,
             epoch,
@@ -503,7 +546,7 @@ impl KvEngine for RaftKvEngine {
     ) -> KvResult<()> {
         use nodus_storage_api::IntentOperation;
 
-        if !self.router.write_batch_enabled() {
+        if !self.router.write_batch_enabled() && !self.tracks_authority(txn_id) {
             for op in ops {
                 match op {
                     IntentOperation::Put { key, value } => self.write_intent(txn_id, key, value)?,
@@ -546,14 +589,21 @@ impl KvEngine for RaftKvEngine {
                         }
                     })
                     .collect();
-                self.router.submit(
-                    &group,
+                let cmd = if self.tracks_authority(txn_id) {
+                    self.tracked_enroll(txn_id, &group, epoch)?;
+                    self.tracked_command(
+                        txn_id,
+                        epoch,
+                        nodus_raftstore::txn_participant::OperationV1::Write { operations },
+                    )
+                } else {
                     ShardCommand::EpochWriteBatchV1 {
                         epoch,
                         txn_id: txn_id.0,
                         operations,
-                    },
-                )?;
+                    }
+                };
+                self.router.submit(&group, cmd)?;
                 for op in batch.iter() {
                     self.record_intent(txn_id, &group, op.key(), true);
                 }
@@ -602,7 +652,20 @@ impl KvEngine for RaftKvEngine {
         let group_id = self.route(&key)?;
         let epoch = self.record_txn_group(txn_id, &group_id)?;
         let live = !matches!(replacement, IntentReplacement::Clear);
-        if self.router.migration_enabled() || epoch != 0 {
+        if self.tracks_authority(txn_id) {
+            self.tracked_enroll(txn_id, &group_id, epoch)?;
+            self.router.submit(
+                &group_id,
+                self.tracked_command(
+                    txn_id,
+                    epoch,
+                    nodus_raftstore::txn_participant::OperationV1::Repair {
+                        key: key.to_vec(),
+                        replacement: replacement.into(),
+                    },
+                ),
+            )?;
+        } else if self.router.migration_enabled() || epoch != 0 {
             self.router.submit(
                 &group_id,
                 ShardCommand::EpochRepairV2 {
@@ -626,7 +689,9 @@ impl KvEngine for RaftKvEngine {
         // Peek, don't remove: the janitor must keep seeing this transaction as
         // live for the whole finalize window (see `finalize_targets_peek`).
         let targets = self.finalize_targets_peek(txn_id);
-        let write_batch = targets.len() == 1 && self.router.write_batch_enabled();
+        let write_batch = targets.len() == 1
+            && self.router.write_batch_enabled()
+            && !self.tracks_authority(txn_id);
         let mut mode = if targets.len() > 1 {
             "cross_shard"
         } else if write_batch {
@@ -635,6 +700,10 @@ impl KvEngine for RaftKvEngine {
             "single"
         };
         let result = (|| -> KvResult<()> {
+            if self.tracks_authority(txn_id) {
+                self.tracked_commit(txn_id, &targets, commit_ts)?;
+                return Ok(());
+            }
             if targets.len() <= 1 {
                 for (group, target) in &targets {
                     if write_batch {
@@ -684,6 +753,10 @@ impl KvEngine for RaftKvEngine {
         self.router.attach_metrics(&self.metrics);
         let targets = self.finalize_targets_peek(txn_id);
         let result = (|| {
+            if self.tracks_authority(txn_id) {
+                self.tracked_abort(txn_id)?;
+                return Ok(());
+            }
             for group_id in targets.keys() {
                 self.router.submit(
                     group_id,

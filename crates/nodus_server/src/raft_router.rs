@@ -30,6 +30,8 @@ use crate::multi_raft::MultiRaftManager;
 /// The applied command's response (carries the 2PC prepare vote in
 /// [`ShardResponse::success`]).
 type WriteResult = Result<ShardResponse>;
+#[cfg(test)]
+type AuthorityHook = Arc<dyn Fn(&ShardCommand) -> Result<()> + Send + Sync>;
 
 /// How long a follower waits for its state machine to catch up to the leader's
 /// read index before giving the linearizable read up (and retrying).
@@ -106,6 +108,12 @@ pub struct RaftRouter {
     migration_gate: Arc<dyn Fn() -> bool + Send + Sync>,
     write_batch_gate: Arc<dyn Fn() -> bool + Send + Sync>,
     metrics: Arc<OnceLock<nodus_monitoring::Metrics>>,
+    /// Process incarnation for tracked coordinators; clones keep one identity.
+    pub(crate) authority_owner: nodus_raftstore::txn_authority::OwnerV1,
+    #[cfg(test)]
+    authority_override: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    authority_hook: Arc<std::sync::Mutex<Option<AuthorityHook>>>,
 }
 
 impl RaftRouter {
@@ -113,6 +121,10 @@ impl RaftRouter {
     /// Groups are resolved per request through the [`MultiRaftManager`], so a
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
+        let authority_owner = nodus_raftstore::txn_authority::OwnerV1 {
+            node_id: manager.node_id(),
+            incarnation: uuid::Uuid::new_v4(),
+        };
         let (tx, mut rx) = mpsc::unbounded_channel::<RouterRequest>();
         // All peer traffic — ordinary forwarded writes, read-index requests,
         // and migration-protocol commands — rides the manager's transport: plain
@@ -198,6 +210,11 @@ impl RaftRouter {
             migration_gate: Arc::new(|| false),
             write_batch_gate: Arc::new(|| false),
             metrics,
+            authority_owner,
+            #[cfg(test)]
+            authority_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            authority_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -229,6 +246,29 @@ impl RaftRouter {
 
     pub(crate) fn write_batch_enabled(&self) -> bool {
         (self.write_batch_gate)()
+    }
+
+    /// No production activation exists yet. The complete protocol is exercised
+    /// only in isolated tests until a new finalized compatibility level exists.
+    pub(crate) fn txn_authority_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.authority_override.load(Ordering::Acquire)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_txn_authority_for_test(&self) {
+        self.authority_override.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_authority_hook_for_test(&self, hook: Option<AuthorityHook>) {
+        *self.authority_hook.lock().unwrap() = hook;
     }
 
     /// Isolated fixtures only: no config flag or production activation bypass.
@@ -368,6 +408,13 @@ impl RaftRouter {
     }
 
     fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
+        #[cfg(test)]
+        if cmd.requires_txn_authority_protocol() {
+            let hook = self.authority_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(&cmd)?;
+            }
+        }
         let started = Instant::now();
         let command = cmd.metrics_kind();
         let intent_operations = match &cmd {
@@ -375,6 +422,10 @@ impl RaftRouter {
             _ => None,
         };
         let result = (|| {
+            anyhow::ensure!(
+                !cmd.requires_txn_authority_protocol() || self.txn_authority_enabled(),
+                "transaction authority activation is unavailable"
+            );
             anyhow::ensure!(
                 !cmd.requires_migration_protocol() || self.migration_enabled(),
                 "migration protocol activation requires verified cluster-wide compatibility"
