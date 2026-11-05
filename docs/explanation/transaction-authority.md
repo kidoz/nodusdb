@@ -1,10 +1,12 @@
 # Transaction ownership and decisions
 
-This is a staged design for safe transaction recovery. The authority state
-machine is implemented as dormant Raft scaffolding; SQL transactions still use
-the existing commit-only 2PC journal. Automatic intent cleanup remains disabled.
+This is a staged design for safe transaction recovery. Authority, participant
+fencing and coordinator integration are implemented, with activation available
+only in isolated tests. Normal SQL transactions still use the existing
+commit-only 2PC journal. Automatic intent cleanup remains disabled.
 
-**Status:** foundation implemented, activation unavailable, 2026-11-04.
+**Status:** participant and coordinator integration implemented; production
+activation unavailable, 2026-11-05.
 
 ## Why a separate authority exists
 
@@ -46,21 +48,54 @@ legacy transactions.
 
 ## Acknowledgement and participant boundary
 
-The dormant command can be applied through Raft for tests; every public forwarded
-write rejects it, including authenticated peer traffic. No production caller
-emits it. A Raft success means the conditional authority transition was committed
-and applied; it does not acknowledge user data or participant resolution.
+Both dormant command families can be applied through Raft for tests; every
+public forwarded write rejects them, including authenticated peer traffic.
+The production router has no activation path. Authority success means its
+conditional transition was committed and applied; user commit success additionally
+requires resolution on every enrolled participant.
 
-Before activation, coordinator integration must enroll each participant through
-meta Raft **before acknowledging any intent there**, freeze the complete set,
-prepare all participants, durably decide commit, and resolve from that decision.
-No single-shard or batched fast path may bypass the authority. Prepare votes and
-resolution must bind the transaction generation, participant epoch and complete
-write set. Participant apply must persist a terminal fence and reject legacy or
-stale finalization for tracked IDs, including writes delayed until after abort.
+The implemented coordinator enrolls each participant through meta Raft **before
+sending its first intent**, freezes the complete set, prepares every participant,
+durably decides commit, and resolves from a fresh linearizable authority read.
+Single-shard transactions, batches, deletes and savepoint repairs use the same
+protocol. The protocol is pinned at a transaction's first write, so future
+activation cannot convert a live legacy transaction halfway through its work.
+
+Participant records bind the owner, generation and shard epoch. Prepare compares
+a canonical hash of the exact acknowledged intent-key set, then freezes all
+writes and repairs, including changes to an existing key. Values are protected
+by their original durable Raft acknowledgements. Batches retain the 256-operation
+and 1 MiB bounds; oversized tracked single writes are rejected too. Namespace
+adapters return logical intent keys, matching the coordinator's key set.
+
+For commit, the terminal participant marker is an intent in the **same storage
+transaction as the user writes**. One KV commit publishes them together. A crash
+after the marker intent but before commit leaves a prepared record and invisible
+intents; replay excludes the private marker from the key hash and retries the
+atomic commit. A durable committed marker proves that the user commit completed,
+so its retry needs no missing-intent assumption. Commit HLC timestamps must exceed
+the applying participant's Raft index, keeping the terminal marker newer than
+its earlier control versions. Abort persists a terminal fence before discarding
+intents and repeats the discard after a crash. Abort also creates a fence on an
+enrolled participant whose first write is delayed, preventing resurrection.
+
+Legacy writes, prepares, commits, aborts, batched commits and local savepoint
+repairs cannot mutate a tracked logical transaction ID. Historical recorded-ID
+cleanup aborts are rejected globally, including replay: physical IDs cannot
+prove ownership and a raw-meta abort could otherwise reach another group's
+intents. Explicit legacy owner rollback remains available. Existing untracked
+intents cannot be adopted or discarded by the new protocol. Unresolved tracked
+records block migration fencing even when a savepoint cleared every user intent.
+The apply path caches whether a group has participant records, avoiding extra
+storage lookups on legacy writes in untouched groups. That guard is recovered at
+startup and set before participant apply or snapshot installation; it never
+clears while a store is live.
+
 A local replica read or a caller-supplied record is not a decision certificate:
-the trusted resolver must establish the authoritative meta decision and submit
-the corresponding generation through authenticated peer transport.
+the trusted resolver establishes the authoritative meta decision through
+ReadIndex before constructing a resolution. Production activation must restrict
+these messages to authenticated peer transport and compatible readers; accepting
+an arbitrary JSON record is insufficient.
 
 On coordinator failure, a meta leader can read and conditionally fence-abort a
 pending record; a concurrent commit and fence-abort serialize in meta Raft.
@@ -77,26 +112,46 @@ from the retained decision. Existing untracked intents remain protected.
 | New binary, levels 1–4 | Same existing transaction formats | Existing formats plus dormant authority records |
 | Future activation | Requires a new finalized level and capability evidence from every voter and learner | Requires authority and participant enforcement on every member |
 
-This foundation adds no upgrade target, capability claim, configuration switch,
-SQL behavior or janitor writer. Level 4 is insufficient to enable it. The new
-command is appended to the enum, preserving old variant ordinals, and authority
-keys are reserved against ordinary and epoch-aware intent mutations. No new
-authority bytes are produced by normal traffic, so rollback has no new boundary
-in this stage. Test-created authority data is not a supported old-binary input.
+This stage adds no upgrade target, capability claim, configuration switch or
+janitor writer. Level 4 is insufficient to enable it. Commands are appended to
+the enum, preserving old variant ordinals, and authority and participant keys
+are reserved against ordinary and epoch-aware mutations. Normal traffic produces
+no new protocol records, so rollback has no new format boundary in this stage.
+Test-created protocol data is not a supported old-binary input. Rejection of
+historical recorded-ID cleanup can retain additional unknown intents; it never
+converts them into a commit or an authoritative abort.
 Activation will close rollback at its finalized format boundary and must update
 node admission, snapshot capability checks and the mixed-binary matrix together.
 
 ## Verification and remaining work
 
-Foundation tests cover conditional decision orderings, concurrent single-voter Raft requests,
+Authority tests cover conditional decision orderings, concurrent single-voter Raft requests,
 stale generations and revisions, invalid or future records, namespace protection,
 ingress rejection, and process-exit recovery after acknowledged Raft decisions.
-They establish the authority's durable decision boundary, not end-to-end orphan
-resolution, a network partition, deterministic simulation, or power-loss safety.
+Participant and coordinator tests use two independent LSM-backed nodes over real
+TCP, with one voter and one learner per group and different data-group leaders.
+A test-only loopback write handler allows the dormant messages; production
+ingress rejection is tested separately at every existing cluster level.
 
-The next slice is participant enforcement and coordinator integration, followed
-by the new upgrade level. Its acceptance test must pause a real coordinator,
-fence-abort through meta Raft, resolve every participant, resume the coordinator,
-and prove that no delayed write or commit becomes visible. A second schedule
-must let commit win and recover every acknowledged value after a crash. Only
-then can the janitor use the authority; legacy records remain non-destructive.
+The tests pause the actual coordinator after prepare, let recovery fence-abort
+through meta Raft, resolve all participants, resume the coordinator, and reject
+its delayed mutations. The opposite ordering lets commit win and both resolvers
+converge. SQL tests verify rows, unique indexes and rollback to savepoint across
+data and meta participants. Stopping the sole meta voter leaves data intents
+protected until the authority restarts. Process-exit tests terminate the whole
+fixture after the durable decision, after the marker's WAL intent but before
+commit, and after acknowledged user commit; reopening both stores recovers every
+committed value. Snapshot tests retain participant fences and reject omissions.
+These crash tests also exposed unfinished local applied-state writes blocking
+restart. Exclusive group startup now recovers unpublished Raft metadata writes
+as described in the [durability contract](../reference/durability-contract.md#raft-log-purge),
+while preserving all uncertain user intents.
+This is not a deterministic simulation, a multi-voter partition test, a real
+production-binary activation test, or power-loss evidence.
+
+The next slice is a new finalized upgrade level, reader capability checks on
+every voter and learner, authenticated forwarding, admission and snapshot
+compatibility, and an expanded mixed-binary matrix. Performance of the additional
+meta barriers and tracked-group legacy lookups is not qualified. Only after that
+gate may automatic recovery consider tracked pending transactions; legacy intents
+remain protected. Safe reclamation of retained decisions is separate future work.

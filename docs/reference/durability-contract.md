@@ -146,6 +146,9 @@ young, or old with uncertain ownership. It submits no abort commands. An
 unreadable upgrade authority or undecodable 2PC record fails the sweep closed;
 the existing rolling-upgrade pause remains. Explicit owner-driven rollback and
 durable decided-commit recovery retain their replicated resolution paths.
+Historical recorded-ID cleanup abort commands now fail closed, including on
+replay: a physical transaction ID does not establish an authoritative abort.
+Explicit legacy owner rollback continues to use the logical transaction ID.
 All nodes that may lead a group must run this behavior: a patched coordinator
 alone cannot protect its intents from an older remote janitor.
 
@@ -153,7 +156,10 @@ alone cannot protect its intents from an older remote janitor.
 positive-value validation, and environment override. It now sets the age at
 which an unknown-owned intent is reported as uncertain, and continues to set
 the inspection cadence (half the threshold, clamped to 1–30 seconds). Expiry
-does not authorize abort. No new durable record or protocol version is added.
+does not authorize abort. Inspection emits no transaction protocol records.
+The [dormant ownership and participant protocol](../explanation/transaction-authority.md)
+has versioned durable records and race/recovery tests, but production activation
+and automatic orphan cleanup remain unavailable at cluster levels 1–4.
 
 The latest successful sweep updates these Prometheus samples:
 
