@@ -53,6 +53,13 @@ fn sync_dir(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> {
+    if row.key.starts_with(txn_resolution::PREFIX) {
+        anyhow::ensure!(
+            !row.versions.iter().any(|v| v.is_intent),
+            "snapshot contains unfinished resolution state"
+        );
+        return Ok(());
+    }
     if migration::is_control_key(&row.key)
         || row.key.as_ref() == CATALOG_KEY
         || row.key.starts_with(b"\x01upgrade/")
@@ -184,6 +191,21 @@ impl NodusRaftStore {
             last_membership: sm.last_membership.clone(),
             snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
         };
+        if rows
+            .iter()
+            .any(|r| r.key.starts_with(txn_resolution::PREFIX))
+        {
+            let indexed: BTreeMap<Bytes, SnapshotRow> =
+                rows.into_iter().map(|r| (r.key.clone(), r)).collect();
+            if let Some(kv) = &sm.kv {
+                txn_resolution::validate_snapshot(
+                    kv.as_ref(),
+                    &indexed,
+                    meta.last_log_id.map_or(0, |l| l.index),
+                )?;
+            }
+            rows = indexed.into_values().collect();
+        }
         let tmp = self
             .snapshot_dir
             .join(format!("build-{}.tmp", uuid::Uuid::new_v4()));
@@ -336,10 +358,16 @@ impl NodusRaftStore {
             .kv
             .clone()
             .ok_or_else(|| anyhow::anyhow!("snapshot requires storage"))?;
+        txn_resolution::validate_snapshot(
+            kv.as_ref(),
+            &rows,
+            meta.last_log_id.map_or(0, |l| l.index),
+        )?;
         for row in kv.snapshot_rows(&scope)? {
             anyhow::ensure!(
                 !(migration::is_control_key(&row.key) || row.key.starts_with(b"\x01upgrade/"))
-                    || rows.contains_key(&row.key),
+                    || rows.contains_key(&row.key)
+                    || txn_resolution::can_omit(&row.key, &rows)?,
                 "snapshot missing migration or upgrade state"
             );
         }

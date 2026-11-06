@@ -115,7 +115,7 @@ fn validate_group(group: &str) -> Result<()> {
     Ok(())
 }
 
-fn key(txn: Uuid) -> Vec<u8> {
+pub(crate) fn key(txn: Uuid) -> Vec<u8> {
     [V1_PREFIX, txn.to_string().as_bytes()].concat()
 }
 
@@ -337,6 +337,9 @@ pub(crate) fn apply(kv: &dyn KvEngine, cmd: &CommandV1, index: u64) -> Result<Sh
         ));
         kv.abort(write_id)?;
         kv.write_intent(write_id, Bytes::from(record_key), Bytes::from(bytes))?;
+        if matches!(next.phase, PhaseV1::Committed { .. } | PhaseV1::Aborted) {
+            crate::txn_resolution::enqueue(kv, &next, write_id, index)?;
+        }
         kv.commit(write_id, index)?;
     }
     Ok(ShardResponse {

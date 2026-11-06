@@ -5,6 +5,7 @@
 
 pub mod txn_authority;
 pub mod txn_participant;
+pub mod txn_resolution;
 pub mod upgrade;
 
 use std::collections::BTreeMap;
@@ -304,25 +305,28 @@ pub enum ShardCommand {
         epoch: u64,
         commits: Vec<migration::EpochCommitV1>,
     },
-    /// Dormant transaction authority foundation. No production producer;
-    /// forwarded ingress rejects it until participant fencing and a new
-    /// finalized cluster level exist. Appended to preserve legacy ordinals.
+    /// Tracked ownership; finalized level 5. Appended to preserve legacy ordinals.
     TxnAuthorityV1(txn_authority::CommandV1),
-    /// Dormant participant fencing; activated only with the complete authority protocol.
+    /// Participant fencing under the finalized transaction authority protocol.
     TxnParticipantV1(txn_participant::CommandV1),
+    /// Durable terminal replay progress; meta group only, finalized level 5.
+    TxnResolutionV1(txn_resolution::CommandV1),
 }
 
 impl ShardCommand {
-    /// Dormant transaction protocol; neither router nor HTTP ingress has a
-    /// production activation path at the existing compatibility levels.
+    /// Transaction protocol requiring finalized level 5 and peer mTLS.
     pub fn requires_txn_authority_protocol(&self) -> bool {
-        matches!(self, Self::TxnAuthorityV1(_) | Self::TxnParticipantV1(_))
+        matches!(
+            self,
+            Self::TxnAuthorityV1(_) | Self::TxnParticipantV1(_) | Self::TxnResolutionV1(_)
+        )
     }
     /// Fixed, low-cardinality command kinds for metrics and tracing.
     pub fn metrics_kind(&self) -> &'static str {
         match self {
             Self::TxnAuthorityV1(_) => "txn_authority",
             Self::TxnParticipantV1(_) => "txn_participant",
+            Self::TxnResolutionV1(_) => "txn_resolution",
             Self::EpochWriteBatchV1 { .. } => "intent_batch",
             Self::EpochCommitBatchV1 { .. } => "commit_batch",
             Self::EpochWriteV1 { mutation, .. } => match mutation {
@@ -1427,6 +1431,29 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     tracing::debug!(command = cmd.metrics_kind(), "Raft applying command");
+                    if let ShardCommand::TxnResolutionV1(command) = cmd {
+                        let response = if self.snapshot_group != "shard-meta" {
+                            ShardResponse {
+                                success: false,
+                                error: Some("resolution journal belongs to shard-meta".into()),
+                            }
+                        } else {
+                            let kv = sm.kv.as_ref().ok_or_else(|| {
+                                StorageIOError::write_state_machine(AnyError::error(
+                                    "resolution journal requires storage",
+                                ))
+                            })?;
+                            txn_resolution::apply(kv.as_ref(), command, entry.log_id.index)
+                                .map_err(|e| {
+                                    StorageIOError::write_state_machine(AnyError::error(format!(
+                                        "resolution journal apply: {e}"
+                                    )))
+                                })?
+                        };
+                        sm.last_applied_log = Some(entry.log_id);
+                        res.push(response);
+                        continue;
+                    }
                     if let ShardCommand::TxnParticipantV1(command) = cmd {
                         // Set before any publication, including partial apply
                         // followed by a crash. False positives only cost reads.

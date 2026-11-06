@@ -136,6 +136,7 @@ pub(crate) fn is_control_key(key: &[u8]) -> bool {
         || key.starts_with(coordinator::v3::JOURNAL_PREFIX)
         || key.starts_with(crate::txn_authority::PREFIX)
         || key.starts_with(crate::txn_participant::PREFIX)
+        || key.starts_with(crate::txn_resolution::PREFIX)
 }
 
 /// The table id of any migration journal that could still drive routing
@@ -193,7 +194,11 @@ pub(crate) fn validate_snapshot_record(
     if !is_control_key(key) {
         return Ok(());
     }
-    if key.starts_with(crate::txn_participant::PREFIX) {
+    if key.starts_with(crate::txn_resolution::PREFIX) {
+        // Cross-record progress and deletion proofs are validated together by
+        // the atomic snapshot installer, after every row has been read.
+        return Ok(());
+    } else if key.starts_with(crate::txn_participant::PREFIX) {
         crate::txn_participant::validate_snapshot(kv, key, value)?;
     } else if key.starts_with(crate::txn_authority::PREFIX) {
         crate::txn_authority::validate_snapshot_record(kv, key, value)?;
