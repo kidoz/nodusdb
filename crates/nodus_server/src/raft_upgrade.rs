@@ -41,6 +41,8 @@ impl RaftUpgradeCoordinator {
             || record.cluster_version >= upgrade::MAX_CLUSTER_VERSION
         {
             serde_json::Value::Null
+        } else if record.cluster_version >= 4 {
+            upgrade::TXN_AUTHORITY_TARGET.into()
         } else if record.cluster_version >= 3 {
             upgrade::WRITE_BATCH_TARGET.into()
         } else if record.cluster_version >= 2 {
@@ -52,6 +54,7 @@ impl RaftUpgradeCoordinator {
             "mvcc_snapshots": record.cluster_version >= 2,
             "migration_v3": record.cluster_version >= 3,
             "write_batching": record.cluster_version >= 4,
+            "transaction_authority": record.cluster_version >= upgrade::TXN_AUTHORITY_LEVEL,
         });
         value["member_admission"] =
             serde_json::to_value(upgrade::admission::read(self.kv.as_ref())?)?;
@@ -70,6 +73,7 @@ impl RaftUpgradeCoordinator {
             1 => upgrade::TARGET,
             2 => upgrade::MIGRATION_TARGET,
             3 => upgrade::WRITE_BATCH_TARGET,
+            4 => upgrade::TXN_AUTHORITY_TARGET,
             _ => "",
         };
         ensure!(
@@ -114,12 +118,19 @@ impl RaftUpgradeCoordinator {
             "unknown upgrade node"
         );
         let old = upgrade::read(self.kv.as_ref())?;
+        ensure!(
+            !matches!(operation, OperationV1::Rollback) || old.cluster_version == 1,
+            "upgrade finalized; rollback across a finalized compatibility level is closed"
+        );
         let session = uuid::Uuid::new_v4();
         let mut reports = Vec::new();
         if !matches!(operation, OperationV1::Rollback) {
             for (id, addr) in &roster {
                 let report = if *id == self.manager.node_id() {
                     let mut report = upgrade::CapabilityV1::local(*id, session);
+                    if self.transport.scheme() != "https" {
+                        report.txn_authority_version = None;
+                    }
                     let kv = self.kv.clone();
                     report.ready_for_finalize =
                         tokio::task::spawn_blocking(move || upgrade::preflight(kv.as_ref()))
@@ -140,6 +151,8 @@ impl RaftUpgradeCoordinator {
             session,
             operation,
             reports,
+            target_level: (old.cluster_version + 1 >= upgrade::TXN_AUTHORITY_LEVEL)
+                .then_some(old.cluster_version + 1),
         };
         let result = raft
             .client_write(ShardCommand::UpgradeControlV1(cmd))

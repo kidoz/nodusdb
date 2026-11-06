@@ -1,9 +1,9 @@
-# Snapshot upgrade authority
+# Cluster upgrade authority
 
 The production server starts at compatibility level 1 and enables NSNP v2,
-shard migration, and write batching only after their explicit, verified
+shard migration, write batching, and tracked transactions only after their explicit, verified
 finalizations. The sequential targets are **`snapshot-v2`**, **`migration-v3`**,
-and **`write-batching-v4`**. Meta membership is frozen while an upgrade is in
+**`write-batching-v4`**, and **`transaction-authority-v5`**. Meta membership is frozen while an upgrade is in
 flight; after finalization, verified additive admission can introduce new
 voters. Feature finalization does not establish general rolling-binary or
 executable-downgrade compatibility.
@@ -35,7 +35,8 @@ is trusted, server hostname verification remains enabled, redirects are disabled
 and HTTP downgrade is prohibited. Reports must echo the fresh challenge and
 match the requested numeric node ID, supported authority version and snapshot
 version. Activation also requires `migration_version >= 4` for level 3 and
-`write_batch_version >= 4` for level 4. Missing, duplicate, unknown, stale or
+`write_batch_version >= 4` for level 4, and authenticated
+`txn_authority_version >= 1` for level 5. Missing, duplicate, unknown, stale or
 incompatible reports cannot enable the requested target. Start also probes every
 member, because every recipient must already read the new authority command
 before it enters the Raft log.
@@ -60,11 +61,12 @@ continues to require its separate recovery and retention prerequisites.
 Use the existing authenticated `/api/v1/upgrade` API on the meta leader:
 
 1. `GET /api/v1/upgrade` to inspect phase, revision, cluster level, membership,
-   reports, the next target, and the `mvcc_snapshots`, `migration_v3`, and
-   `write_batching` feature gates.
+   reports, the next target, and the `mvcc_snapshots`, `migration_v3`,
+   `write_batching`, and `transaction_authority` feature gates.
 2. `POST /api/v1/upgrade/start?target=snapshot-v2` to verify readers and persist
    `RollingNodes`. After level 2 is finalized, use `target=migration-v3`; after
-   level 3 is finalized, use `target=write-batching-v4`. Skipping a target or
+   level 3 is finalized, use `target=write-batching-v4`; after level 4, use
+   `target=transaction-authority-v5`. Skipping a target or
    supplying any other target string is rejected.
 3. `POST /api/v1/upgrade/node-upgraded?node=<numeric-member-id>` to refresh reports
    from **all** members and persist `ReadyToFinalize`. The name supplied by the
@@ -73,13 +75,19 @@ Use the existing authenticated `/api/v1/upgrade` API on the meta leader:
    cluster-compatibility level. Existing authorized admin middleware continues
    to enforce permission and audit.
 
-Rollback before finalization clears the session/reports, keeps a newer revision
+Rollback before the first finalization clears the session/reports, keeps a newer revision
 and returns to level 1. It is rejected once an admission ledger exists, because
 returning to the initial idle state would strand that ledger. Start is likewise
 rejected while member admission is pending. A completed admission ledger remains
 unchanged and valid as an ancestor of later finalized authority revisions.
-Finalization closes rollback. Repeated/stale commands cannot reset the phase or
-reuse an old challenge. A timed-out operation has an uncertain outcome; inspect
+Finalization closes rollback permanently, including while a later upgrade is
+in flight. Repeated/stale commands cannot reset the phase or
+reuse an old challenge. The current admin service refuses rollback across any
+finalized level before proposing a command. Version-1 apply keeps the historical
+level-2/3 rollback result so mixed readers cannot diverge; older leaders still
+have that unsafe admin path. Do not request later-upgrade rollback through an
+older coordinator. The level-5 reader fence permits replicated refusal while
+upgrading from level 4, when every member must already support the new target. A timed-out operation has an uncertain outcome; inspect
 status before retrying. Membership changes during probing invalidate the
 operation at apply. Joint membership cannot start/finalize.
 
@@ -137,6 +145,31 @@ The storage and recovery consequences, including `CommitTxnBatchV1`, PITR replay
 and COPY atomicity, are specified in the
 [durability contract](../reference/durability-contract.md#batched-writes-and-copy).
 
+## Tracked transactions (`transaction-authority-v5`)
+
+The sequential target after level 4 requires fresh `txn_authority_version >= 1`
+from every voter and learner on start, refresh and finalize. This capability is
+omitted unless peer mTLS is configured, including for a single-node cluster.
+Finalized level 5 opens the `transaction_authority` gate: new transactions use
+ownership/enrollment, exact participant prepare, terminal decisions and durable
+resolution acknowledgements. Previously selected legacy transactions can finish.
+
+The sender checks reader support before sending the first explicit level-5
+upgrade command. During the upgrade and after finalization, both sides of
+consensus traffic re-probe the declared peer at its approved address before
+append/vote/snapshot traffic. Every snapshot chunk is checked, including resumed
+streams. Admission approval and continuation require the same reader capability
+before learner catch-up or promotion. A restart at this boundary requires mTLS.
+Forwarded tracked commands also require finalized level 5, authenticated peer
+transport and canonical meta ReadIndex verification.
+
+The meta leader automatically replays terminal decisions with a bounded durable
+cursor and per-group acknowledgements. It never chooses abort for an undecided
+owner. See [transaction ownership and decisions](transaction-authority.md) for
+limits, snapshot proof requirements and backup exclusions. Finalization closes
+executable rollback to binaries without these readers; peer checks do not turn
+arbitrary executable replacement into a supported downgrade procedure.
+
 ## Adding members after finalization
 
 Deploy the admission-v1 reader to **every existing voter and learner** before
@@ -154,6 +187,7 @@ The finalized base authority stays immutable. A separate version 1 ledger at
    challenge; require snapshot v2 and admission v1 support, plus every reader
    required by the finalized cluster level. At level 4 this includes
    `write_batch_version >= 4` on every existing member and the candidate.
+   Level 5 additionally requires authenticated `txn_authority_version >= 1`.
    Replicate the reserved ID/address, candidate report, operation UUID and
    original membership.
 2. Add the candidate as a learner and wait for catch-up. Re-probe all members with
@@ -206,7 +240,9 @@ admission. The table describes admission-ledger compatibility only: migration an
 write-batching capabilities remain mandatory when their cluster levels are
 finalized. Base-authority commands and transitions clear optional capability
 fields, so old and new authority readers persist identical base records; the
-immutable base does not acquire admission-only evidence. Before the first new
+immutable base does not acquire admission-only evidence. Admission reports omit `txn_authority_version` below
+level 5 as well, so adding the capability cannot change earlier readers’
+persisted admission bytes. Before the first new
 admission command, the service probes all current members.
 The sender also probes before transmitting an admission command. Once a ledger
 exists, it requires admission-v1 support before every append RPC and every v2
@@ -271,9 +307,9 @@ used as writer or backup authority.
   [batches and offloads purge](../reference/durability-contract.md#raft-log-purge),
   but passing the matrix is not a latency guarantee.
   The thirteen-checkpoint workload does not activate migration-v3 or
-  write-batching-v4. No completed mixed-binary run is claimed for the current
-  write-batching source, and feature rollback does **not** establish arbitrary
-  executable compatibility.
+  write-batching-v4. The candidate gate now adds level-5 checks; exact-run
+  results and blockers are recorded by that harness. Feature rollback does
+  **not** establish arbitrary executable compatibility.
 - Tests cover full voter/learner reports, duplicate/unknown/stale reports, premature
   finalization, rollback, malformed records, actual mTLS/Raft leader loss and reopen,
   an unavailable member blocking finalization, abrupt subprocess exit after an

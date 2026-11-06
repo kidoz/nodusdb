@@ -273,7 +273,22 @@ fn require_protocol_readers(
             );
         }
     }
+    if authority.cluster_version >= TXN_AUTHORITY_LEVEL {
+        for report in reports.values() {
+            super::require_txn_reader(report)?;
+        }
+    }
     Ok(())
+}
+
+fn persisted_report(authority: &super::RecordV1, report: &CapabilityV1) -> CapabilityV1 {
+    let mut report = report.clone();
+    if authority.cluster_version < TXN_AUTHORITY_LEVEL {
+        // Every pre-level-5 reader discards this new optional field. Persist
+        // the same admission bytes even if the fresh probe advertises it.
+        report.txn_authority_version = None;
+    }
+    report
 }
 fn transition(
     authority: &super::RecordV1,
@@ -325,7 +340,7 @@ fn transition(
                 *node_id,
                 MemberV1 {
                     address: address.clone(),
-                    report: reports[node_id].clone(),
+                    report: persisted_report(authority, &reports[node_id]),
                 },
             );
             next.pending = Some(PlanV1 {
@@ -360,7 +375,7 @@ fn transition(
                     next.admitted
                         .get_mut(&plan.node_id)
                         .ok_or_else(|| anyhow::anyhow!("candidate absent"))?
-                        .report = reports[&plan.node_id].clone();
+                        .report = persisted_report(authority, &reports[&plan.node_id]);
                     next.pending
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("plan absent"))?

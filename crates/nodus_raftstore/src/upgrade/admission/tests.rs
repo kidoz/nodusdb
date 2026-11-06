@@ -72,6 +72,8 @@ fn authority_command(
     let session = Uuid::new_v4();
     super::super::CommandV1 {
         expected_revision: old.revision,
+        target_level: (old.cluster_version + 1 >= TXN_AUTHORITY_LEVEL)
+            .then_some(old.cluster_version + 1),
         membership: membership.clone(),
         session,
         operation,
@@ -446,7 +448,7 @@ fn sequential_finalization_preserves_admission_and_survives_reopen() {
     persist_records(kv.as_ref(), &a, &ledger);
     let sm = authority_state(current.clone());
 
-    for (level, first_index) in [(3, 15), (4, 18)] {
+    for (level, first_index) in [(3, 15), (4, 18), (5, 21)] {
         for (index, operation) in [
             (first_index, super::super::OperationV1::Start),
             (first_index + 1, super::super::OperationV1::Refresh),
@@ -496,7 +498,7 @@ fn sequential_finalization_preserves_admission_and_survives_reopen() {
     let reopened = nodus_storage_lsm::LsmKvEngine::with_wal(dir.path().join("kv"), None).unwrap();
     let authority = super::super::read(&reopened).unwrap();
     let reopened_ledger = read(&reopened).unwrap().unwrap();
-    assert_eq!(authority.cluster_version, WRITE_BATCH_LEVEL);
+    assert_eq!(authority.cluster_version, TXN_AUTHORITY_LEVEL);
     assert!(authority.revision > reopened_ledger.authority_revision);
     assert_eq!(reopened_ledger, ledger);
     assert_eq!(reopened_ledger.authority_revision, a.revision);
@@ -510,4 +512,69 @@ fn sequential_finalization_preserves_admission_and_survives_reopen() {
         reopened.get(KEY, u64::MAX).unwrap().unwrap().as_ref(),
         ledger_bytes
     );
+}
+
+#[test]
+fn level_five_admission_and_learner_promotion_require_transaction_readers() {
+    let mut a = authority();
+    a.cluster_version = TXN_AUTHORITY_LEVEL;
+    let good = approval(&a);
+    for member in 0..2 {
+        let mut bad = good.clone();
+        bad.reports[member].txn_authority_version = None;
+        assert!(transition(&a, None, &bad, &a.membership, 11).is_err());
+    }
+    let approved = transition(&a, None, &good, &a.membership, 11).unwrap();
+    assert_eq!(approved.admitted[&2].report.txn_authority_version, Some(1));
+    let learner = membership(vec![[1].into()], true);
+    let good = command(Some(&approved), OperationV1::Promote, learner.clone());
+    for member in 0..2 {
+        let mut bad = good.clone();
+        bad.reports[member].txn_authority_version = None;
+        assert!(transition(&a, Some(approved.clone()), &bad, &learner, 12).is_err());
+    }
+    assert!(transition(&a, Some(approved), &good, &learner, 12).is_ok());
+}
+
+#[test]
+fn admission_bytes_match_reader_without_transaction_capability_before_level_five() {
+    for level in 2..=4 {
+        let mut a = authority();
+        a.cluster_version = level;
+        let mut old = None;
+        for (index, operation, current) in [
+            (
+                11,
+                OperationV1::Approve {
+                    node_id: 2,
+                    address: "localhost:1002".into(),
+                },
+                a.membership.clone(),
+            ),
+            (12, OperationV1::Promote, membership(vec![[1].into()], true)),
+            (
+                13,
+                OperationV1::Complete,
+                membership(vec![[1, 2].into()], true),
+            ),
+        ] {
+            let cmd = command(old.as_ref(), operation, current.clone());
+            let mut legacy = cmd.clone();
+            for report in &mut legacy.reports {
+                report.txn_authority_version = None;
+            }
+            let new = transition(&a, old.clone(), &cmd, &current, index).unwrap();
+            let previous = transition(&a, old, &legacy, &current, index).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&new).unwrap(),
+                serde_json::to_vec(&previous).unwrap()
+            );
+            assert!(
+                !serde_json::to_string(&new)
+                    .unwrap()
+                    .contains("txn_authority_version")
+            );
+            old = Some(new);
+        }
+    }
 }

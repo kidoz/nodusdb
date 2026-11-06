@@ -300,7 +300,8 @@ async fn sequential_upgrade_lifecycle_and_feature_gates() {
         serde_json::json!({
             "mvcc_snapshots": false,
             "migration_v3": false,
-            "write_batching": false
+            "write_batching": false,
+            "transaction_authority": false
         })
     );
     service.start_upgrade(upgrade::TARGET.into()).await.unwrap();
@@ -320,6 +321,12 @@ async fn sequential_upgrade_lifecycle_and_feature_gates() {
         .start_upgrade(upgrade::MIGRATION_TARGET.into())
         .await
         .unwrap();
+    let before_rollback = upgrade::read(nodes[0].kv.as_ref()).unwrap();
+    assert!(service.rollback().await.is_err());
+    assert_eq!(
+        upgrade::read(nodes[0].kv.as_ref()).unwrap(),
+        before_rollback
+    );
     service.report_node_upgraded("1").await.unwrap();
     let record = upgrade::read(nodes[0].kv.as_ref()).unwrap();
     assert_eq!(record.cluster_version, 2);
@@ -348,6 +355,12 @@ async fn sequential_upgrade_lifecycle_and_feature_gates() {
         .start_upgrade(upgrade::WRITE_BATCH_TARGET.into())
         .await
         .unwrap();
+    let before_rollback = upgrade::read(nodes[0].kv.as_ref()).unwrap();
+    assert!(service.rollback().await.is_err());
+    assert_eq!(
+        upgrade::read(nodes[0].kv.as_ref()).unwrap(),
+        before_rollback
+    );
     service.report_node_upgraded("1").await.unwrap();
     assert_eq!(
         service.get_state().await.unwrap()["feature_gates"]["write_batching"],
@@ -360,9 +373,15 @@ async fn sequential_upgrade_lifecycle_and_feature_gates() {
         4
     );
     let state = service.get_state().await.unwrap();
-    assert_eq!(state["target_version"], serde_json::Value::Null);
+    assert_eq!(state["target_version"], upgrade::TXN_AUTHORITY_TARGET);
     assert_eq!(state["feature_gates"]["write_batching"], true);
-    // No higher target exists; rollback stays closed after finalization.
+    // Plain transport cannot qualify for the authenticated transaction target.
+    assert!(
+        service
+            .start_upgrade(upgrade::TXN_AUTHORITY_TARGET.into())
+            .await
+            .is_err()
+    );
     assert!(
         service
             .start_upgrade(upgrade::WRITE_BATCH_TARGET.into())

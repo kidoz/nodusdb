@@ -10,14 +10,22 @@ impl RaftUpgradeCoordinator {
         roster: &BTreeMap<u64, String>,
         challenge: Uuid,
     ) -> Result<Vec<upgrade::CapabilityV1>> {
+        let authority = upgrade::read(self.kv.as_ref())?;
         let mut reports = Vec::with_capacity(roster.len());
         for (id, address) in roster {
             let report = if *id == self.manager.node_id() {
-                upgrade::CapabilityV1::local(*id, challenge)
+                let mut report = upgrade::CapabilityV1::local(*id, challenge);
+                if self.transport.scheme() != "https" {
+                    report.txn_authority_version = None;
+                }
+                report
             } else {
                 self.transport.probe(*id, address, challenge, false).await?
             };
             admission::require_reader(&report)?;
+            if authority.cluster_version >= upgrade::TXN_AUTHORITY_LEVEL {
+                upgrade::require_txn_reader(&report)?;
+            }
             reports.push(report);
         }
         Ok(reports)

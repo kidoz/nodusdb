@@ -23,7 +23,10 @@ pub const MIGRATION_LEVEL: u64 = 3;
 pub const MIGRATION_VERSION: u64 = 4;
 pub const WRITE_BATCH_LEVEL: u64 = 4;
 pub const WRITE_BATCH_VERSION: u64 = 4;
-pub const MAX_CLUSTER_VERSION: u64 = WRITE_BATCH_LEVEL;
+pub const TXN_AUTHORITY_TARGET: &str = "transaction-authority-v5";
+pub const TXN_AUTHORITY_LEVEL: u64 = 5;
+pub const TXN_AUTHORITY_VERSION: u64 = 1;
+pub const MAX_CLUSTER_VERSION: u64 = TXN_AUTHORITY_LEVEL;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProbeV1 {
@@ -46,9 +49,30 @@ pub struct CapabilityV1 {
     pub migration_version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_batch_version: Option<u64>,
+    /// Reader and authenticated-peer support; omitted by older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_authority_version: Option<u64>,
 }
 fn is_zero(value: &u16) -> bool {
     *value == 0
+}
+
+/// Every peer at level 5 must enforce the authority, participants and recovery
+/// journal. Production reports suppress this claim without peer mTLS.
+pub fn require_txn_reader(report: &CapabilityV1) -> Result<()> {
+    ensure!(
+        report.txn_authority_version >= Some(TXN_AUTHORITY_VERSION),
+        "transaction-authority-v5 requires an authenticated transaction protocol version 1 reader on every voter and learner"
+    );
+    Ok(())
+}
+
+/// An in-flight level-5 upgrade already requires its verified readers for
+/// consensus traffic, without enabling new transaction writers before finalize.
+pub fn requires_txn_reader(record: &RecordV1) -> bool {
+    record.cluster_version >= TXN_AUTHORITY_LEVEL
+        || (record.cluster_version == TXN_AUTHORITY_LEVEL - 1
+            && matches!(record.phase, Phase::RollingNodes | Phase::ReadyToFinalize))
 }
 
 impl CapabilityV1 {
@@ -64,6 +88,7 @@ impl CapabilityV1 {
             admission_version: 1,
             migration_version: Some(MIGRATION_VERSION),
             write_batch_version: Some(WRITE_BATCH_VERSION),
+            txn_authority_version: Some(TXN_AUTHORITY_VERSION),
         }
     }
     pub fn validate(&self, node: u64, challenge: Uuid) -> Result<()> {
@@ -208,6 +233,10 @@ pub struct CommandV1 {
     /// Reports are collected directly by the leader over authenticated transport.
     /// Every fresh operation challenges all nodes using a new session nonce.
     pub reports: Vec<CapabilityV1>,
+    /// Explicit new target for pre-finalization peer fencing. Levels 2–4 keep
+    /// emitting the historical command representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_level: Option<u64>,
 }
 
 fn transition(
@@ -232,7 +261,12 @@ fn transition(
     ensure!(!roster.is_empty(), "upgrade requires membership");
     if matches!(cmd.operation, OperationV1::Rollback) {
         ensure!(
-            old.phase != Phase::Finalized,
+            // Keep historical level-2/3 apply semantics byte-identical while
+            // old readers may still lead. The current service refuses these
+            // unsafe later rollbacks before they enter consensus. Rolling
+            // from level 4 means target 5, whose all-reader fence authorizes
+            // the stronger apply rule on every replica.
+            old.cluster_version < WRITE_BATCH_LEVEL && old.phase != Phase::Finalized,
             "upgrade finalized; rollback is closed and membership is frozen"
         );
         return Ok(RecordV1 {
@@ -256,6 +290,14 @@ fn transition(
     // Levels activate sequentially: an in-flight upgrade keeps its base level,
     // so the level a Start/Finalize targets is always the next one.
     let target_level = old.cluster_version + 1;
+    ensure!(
+        target_level <= MAX_CLUSTER_VERSION,
+        "unsupported upgrade target"
+    );
+    ensure!(
+        cmd.target_level == (target_level >= TXN_AUTHORITY_LEVEL).then_some(target_level),
+        "upgrade command target does not match the next compatibility level"
+    );
     ensure!(
         !cmd.session.is_nil() && cmd.session != old.session,
         "stale capability challenge"
@@ -286,12 +328,16 @@ fn transition(
                 "write-batching-v4 requires a write batch version 4 report from every voter and learner"
             );
         }
+        if target_level >= TXN_AUTHORITY_LEVEL {
+            require_txn_reader(report)?;
+        }
         // R6a readers discard these optional fields. Keep the immutable base
         // authority identical across both readers; admission has its own ledger.
         let mut report = report.clone();
         report.admission_version = 0;
         report.migration_version = None;
         report.write_batch_version = None;
+        report.txn_authority_version = None;
         ensure!(
             reports.insert(report.node_id, report).is_none(),
             "duplicate capability report"

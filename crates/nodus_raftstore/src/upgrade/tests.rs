@@ -17,6 +17,8 @@ fn command(old: &RecordV1, operation: OperationV1) -> CommandV1 {
     let session = Uuid::new_v4();
     CommandV1 {
         expected_revision: old.revision,
+        target_level: (old.cluster_version + 1 >= TXN_AUTHORITY_LEVEL)
+            .then_some(old.cluster_version + 1),
         membership: roster(),
         session,
         operation,
@@ -235,9 +237,35 @@ fn sequential_lifecycle_restarts_after_finalized_and_reaches_level_four() {
     assert_eq!(four.phase, Phase::Finalized);
     assert_eq!(four.cluster_version, WRITE_BATCH_LEVEL);
     assert!(decode(&serde_json::to_vec(&four).unwrap()).is_ok());
-    // Level 4 is the highest target; rollback and further starts are closed.
+    // Earlier finalized levels never reopen rollback while a later upgrade runs.
     assert!(transition(&four, &command(&four, OperationV1::Rollback), &roster(), 11).is_err());
-    assert!(transition(&four, &command(&four, OperationV1::Start), &roster(), 11).is_err());
+    let rolling = transition(&four, &command(&four, OperationV1::Start), &roster(), 11).unwrap();
+    assert_eq!(rolling.cluster_version, 4);
+    assert!(
+        transition(
+            &rolling,
+            &command(&rolling, OperationV1::Rollback),
+            &roster(),
+            12
+        )
+        .is_err()
+    );
+    let ready = transition(
+        &rolling,
+        &command(&rolling, OperationV1::Refresh),
+        &roster(),
+        12,
+    )
+    .unwrap();
+    let five = transition(
+        &ready,
+        &command(&ready, OperationV1::Finalize),
+        &roster(),
+        13,
+    )
+    .unwrap();
+    assert_eq!(five.cluster_version, TXN_AUTHORITY_LEVEL);
+    assert!(transition(&five, &command(&five, OperationV1::Start), &roster(), 14).is_err());
 }
 
 #[test]
@@ -448,6 +476,7 @@ fn base_authority_bytes_match_reader_that_discards_admission_capability() {
             report.remove("admission_version");
             report.remove("migration_version");
             report.remove("write_batch_version");
+            report.remove("txn_authority_version");
         }
         let legacy: CommandV1 = serde_json::from_value(legacy_json).unwrap();
         let new = transition(&old, &cmd, &roster(), index).unwrap();
@@ -458,9 +487,101 @@ fn base_authority_bytes_match_reader_that_discards_admission_capability() {
         assert!(!text.contains("admission_version"));
         assert!(!text.contains("migration_version"));
         assert!(!text.contains("write_batch_version"));
+        assert!(!text.contains("txn_authority_version"));
         // A base record written by a reader that never knew the optional
         // capability fields still decodes and validates.
         assert!(decode(text.as_bytes()).is_ok());
         old = new;
+    }
+}
+
+#[test]
+fn level_five_requires_authenticated_readers_and_an_explicit_target() {
+    let mut old = RecordV1::default();
+    let mut index = 2;
+    for _ in 2..=4 {
+        for operation in [
+            OperationV1::Start,
+            OperationV1::Refresh,
+            OperationV1::Finalize,
+        ] {
+            let cmd = command(&old, operation);
+            assert!(
+                !serde_json::to_string(&cmd)
+                    .unwrap()
+                    .contains("target_level")
+            );
+            old = transition(&old, &cmd, &roster(), index).unwrap();
+            index += 1;
+        }
+    }
+    assert!(!requires_txn_reader(&old));
+    for operation in [
+        OperationV1::Start,
+        OperationV1::Refresh,
+        OperationV1::Finalize,
+    ] {
+        let good = command(&old, operation);
+        for member in 0..3 {
+            // Includes learner 3, not just quorum voters.
+            let mut missing = good.clone();
+            missing.reports[member].txn_authority_version = None;
+            assert!(transition(&old, &missing, &roster(), index).is_err());
+        }
+        let mut no_target = good.clone();
+        no_target.target_level = None;
+        assert!(transition(&old, &no_target, &roster(), index).is_err());
+        let mut stale = good.clone();
+        stale.reports[2].challenge = Uuid::new_v4();
+        assert!(transition(&old, &stale, &roster(), index).is_err());
+        old = transition(&old, &good, &roster(), index).unwrap();
+        assert!(requires_txn_reader(&old));
+        assert!(
+            transition(
+                &old,
+                &command(&old, OperationV1::Rollback),
+                &roster(),
+                index + 1
+            )
+            .is_err()
+        );
+        index += 1;
+    }
+    assert_eq!(old.cluster_version, TXN_AUTHORITY_LEVEL);
+    assert!(decode(&serde_json::to_vec(&old).unwrap()).is_ok());
+}
+
+#[test]
+fn earlier_rollback_apply_keeps_the_historical_reader_result() {
+    let mut old = RecordV1::default();
+    let mut index = 1;
+    for level in 2..=3 {
+        for action in [
+            OperationV1::Start,
+            OperationV1::Refresh,
+            OperationV1::Finalize,
+        ] {
+            index += 1;
+            old = transition(&old, &command(&old, action), &roster(), index).unwrap();
+        }
+        assert_eq!(old.cluster_version, level);
+        let rolling = transition(
+            &old,
+            &command(&old, OperationV1::Start),
+            &roster(),
+            index + 1,
+        )
+        .unwrap();
+        let rollback = command(&rolling, OperationV1::Rollback);
+        assert_eq!(rollback.target_level, None);
+        // Existing readers reset this version-1 command to Idle. Preserve that
+        // deterministic result; the current service never proposes it here.
+        assert_eq!(
+            transition(&rolling, &rollback, &roster(), index + 2).unwrap(),
+            RecordV1 {
+                revision: index + 2,
+                ..Default::default()
+            }
+        );
     }
 }
