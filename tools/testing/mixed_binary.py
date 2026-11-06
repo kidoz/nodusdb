@@ -17,6 +17,7 @@ OLD_TREE = "879a5fd893f41dd59d735cb086ba4600076e92ef"
 OLD_PATCH = ROOT / "tools/testing/fixtures/r6a-maintenance.patch"
 OLD_PATCH_SHA = "33f63b8799a704a93b914987bbb22428fd004726d69bb54805bb12727880b38b"
 NEW = "d1989d3c0d21d22f60507b681d1eb288a8f42dce"
+TXN_BASELINE = "1f458b41ee130f2c7a8df85cd4ab8ac9119d3d2e"
 
 
 def run(args, **kwargs):
@@ -120,6 +121,31 @@ def main():
     print(f"Pinned binaries and evidence: {out}", flush=True)
     new_binary = out / "nodusd-new"
     if args.candidate:
+        # The historical admission reader above supports only level 2. Keep
+        # its qualification intact and use a separately pinned level-4 reader
+        # for the transaction-authority boundary.
+        baseline = out / "nodusd-level4"
+        baseline_source = out / "source-level4"
+        baseline_identity = out / "transaction-baseline.json"
+        if not baseline.is_file():
+            baseline_source.mkdir(exist_ok=False)
+            archive = out / "level4.tar"
+            run(["git", "archive", "--format=tar", "--output", str(archive), TXN_BASELINE])
+            run(["tar", "-xf", str(archive), "-C", str(baseline_source)])
+            build_env = dict(env, CARGO_TARGET_DIR=str(ROOT / "target/mixed-binary-build" / TXN_BASELINE))
+            with (out / "build-level4.log").open("w") as log:
+                run(["cargo", "build", "--locked", "-p", "nodus_server", "--bin", "nodus_server",
+                     "--manifest-path", str(baseline_source / "Cargo.toml")],
+                    env=build_env, stdout=log, stderr=subprocess.STDOUT)
+            shutil.copy2(Path(build_env["CARGO_TARGET_DIR"]) / "debug/nodus_server", baseline)
+            baseline_identity.write_text(json.dumps({
+                "revision": TXN_BASELINE, "binary_sha256": sha(baseline),
+                "lock_sha256": sha(baseline_source / "Cargo.lock"), "rustc": manifest["rustc"],
+            }, indent=2) + "\n")
+        require(json.loads(baseline_identity.read_text()) == {
+            "revision": TXN_BASELINE, "binary_sha256": sha(baseline),
+            "lock_sha256": sha(baseline_source / "Cargo.lock"), "rustc": manifest["rustc"],
+        }, "level-4 baseline identity changed")
         # Keep historical artifacts intact. A candidate is explicitly identified
         # by HEAD, the tracked patch, untracked crate sources and binary hash.
         patch = subprocess.check_output(["git", "diff", "--binary", "HEAD", "--", "Cargo.toml", "Cargo.lock", "crates"], cwd=ROOT)
@@ -147,6 +173,11 @@ def main():
     env.update(NODUS_MIXED_OLD=str(out / "nodusd-old"),
                NODUS_MIXED_NEW=str(new_binary), NODUS_MIXED_OUTPUT=str(out))
     env["NODUS_MIXED_DIAGNOSE"] = "1" if args.diagnose else "0"
+    env.pop("NODUS_MIXED_TXN_AUTHORITY", None)
+    env.pop("NODUS_MIXED_V4", None)
+    if args.candidate:
+        env["NODUS_MIXED_TXN_AUTHORITY"] = "1"
+        env["NODUS_MIXED_V4"] = str(out / "nodusd-level4")
     (out / "results.json").unlink(missing_ok=True)
     try:
         with (out / "test.log").open("w") as log:
@@ -157,7 +188,8 @@ def main():
         raise SystemExit(f"FAIL: {error}; see {out / 'test.log'} and {out / 'results.json'}") from error
     result = json.loads((out / "results.json").read_text())
     require(result["passed"] is True and result["matrix_completed"] is True
-            and len(result["checks"]) == 18 and not result["blockers"], "incomplete or blocked matrix")
+            and len(result["checks"]) == (24 if args.candidate else 14)
+            and not result["blockers"], "incomplete or blocked matrix")
     print(f"PASS: {len(result['checks'])} checkpoints; see {out / 'results.json'}", flush=True)
 
 

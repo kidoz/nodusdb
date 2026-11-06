@@ -1,12 +1,15 @@
 //! Run via tools/testing/mixed_binary.py; ordinary tests never build old revisions.
 #[path = "mixed_binary/process.rs"]
 mod process;
+#[path = "mixed_binary/transactions.rs"]
+mod transactions;
 use process::Matrix;
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires two pinned production binaries; run just test-mixed-binary"]
 async fn pinned_binary_upgrade_matrix() {
+    let candidate = std::env::var_os("NODUS_MIXED_TXN_AUTHORITY").is_some();
     let mut m = Matrix::new();
     m.start(0, false, false);
     m.alive(0).await;
@@ -113,10 +116,11 @@ async fn pinned_binary_upgrade_matrix() {
         .await;
     assert_eq!(status, 200);
     assert!(
-        denied["error"]
-            .as_str()
-            .unwrap()
-            .contains("migration-v3 requires a migration version 4 report"),
+        denied["error"].as_str().unwrap().contains(if candidate {
+            "migration-v3 requires a migration version 4 report"
+        } else {
+            "supported target is snapshot-v2"
+        }),
         "{denied}"
     );
     let (status, denied) = m
@@ -124,10 +128,11 @@ async fn pinned_binary_upgrade_matrix() {
         .await;
     assert_eq!(status, 200);
     assert!(
-        denied["error"]
-            .as_str()
-            .unwrap()
-            .contains("supported target is migration-v3"),
+        denied["error"].as_str().unwrap().contains(if candidate {
+            "supported target is migration-v3"
+        } else {
+            "supported target is snapshot-v2"
+        }),
         "{denied}"
     );
     let (status, denied) = m
@@ -146,7 +151,7 @@ async fn pinned_binary_upgrade_matrix() {
     }
     m.record(
         "write_batching_start_and_preflight_refused_with_old_readers",
-        json!({"old_readers":2,"cluster_version":2,"migration_capability_refused":true,"legacy_sql_writes":true}),
+        json!({"old_readers":2,"cluster_version":2,"migration_capability_refused":candidate,"unsupported_future_target":!candidate,"legacy_sql_writes":true}),
     );
     m.nodes[1].kill();
     m.snapshot(2, 2).await;
@@ -304,6 +309,14 @@ async fn pinned_binary_upgrade_matrix() {
     assert!(denied["error"].is_string(), "{denied}");
     assert_eq!(m.state(leader).await, before);
     m.record("rollback_after_admission_refused",json!({"feature_rollback":"rejected","executable_downgrade":"unsupported: historical binary lacks admission reader; no startup fence claimed"}));
+
+    // The pinned historical admission reader supports level 2. The candidate
+    // profile must additionally qualify levels 3–5; do not ask the historical
+    // executable to implement upgrade targets it never advertised.
+    if !candidate {
+        m.finish();
+        return;
+    }
 
     m.phase(leader, "start?target=migration-v3", "RollingNodes")
         .await;
@@ -464,5 +477,8 @@ async fn pinned_binary_upgrade_matrix() {
         "batched_rows_and_indexes_survive_sigkill_and_leader_change",
         json!({"rows":41,"members":4,"post_failover_rows":1,"index_reads_per_member":3}),
     );
+    if candidate {
+        transactions::qualify(&mut m).await;
+    }
     m.finish();
 }

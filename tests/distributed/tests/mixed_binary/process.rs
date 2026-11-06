@@ -565,6 +565,15 @@ impl Matrix {
         fs::write(self.root.parent().unwrap().join("results.json"),serde_json::to_vec_pretty(&json!({"schema_version":1,"passed":passed,"matrix_completed":matrix_completed,"process_logs":self.root,"checks":self.checks,"blockers":self.blockers})).unwrap()).unwrap();
     }
     pub fn finish(&self) {
+        assert_eq!(
+            self.checks.len(),
+            if std::env::var_os("NODUS_MIXED_TXN_AUTHORITY").is_some() {
+                24
+            } else {
+                14
+            },
+            "incomplete compatibility profile"
+        );
         self.save(self.blockers.is_empty(), true);
         assert!(
             self.blockers.is_empty(),

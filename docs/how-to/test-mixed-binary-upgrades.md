@@ -41,14 +41,21 @@ just test-mixed-binary
 It first runs the source-pin tests, then builds and runs both servers. Cargo/Rust,
 Python 3, Git, tar and OpenSSL are required on a Unix host. The default run uses
 neither a working-tree candidate nor diagnostic restart workarounds. Acceptance
-requires `matrix_completed: true`, `passed: true`, eighteen checks and no blockers.
+requires `matrix_completed: true`, `passed: true`, fourteen historical level-2
+checks and no blockers. The pinned admission reader supports level 2; it cannot
+qualify levels 3–5.
+The current working-tree `--candidate` gate requires twenty-four checks, adding
+transaction-authority-v5 qualification with a separately pinned level-4 reader,
+`1f458b41ee130f2c7a8df85cd4ab8ac9119d3d2e`, as the incompatible executable.
+Its binary, lock and compiler hashes are retained in `transaction-baseline.json`.
 
 ## Pinned sources
 
 | Reader | Revision | Admission reader |
 | --- | --- | --- |
 | R6a maintenance | `65313a236ce54adb510dde1835e4a652ece3a0e8` | Absent; unknown commands are rejected |
-| Newer reader | `d1989d3c0d21d22f60507b681d1eb288a8f42dce` | Admission v1 |
+| Historical newer reader (level 2) | `d1989d3c0d21d22f60507b681d1eb288a8f42dce` | Admission v1 |
+| Candidate transaction baseline (level 4) | `1f458b41ee130f2c7a8df85cd4ab8ac9119d3d2e` | Admission v1; no transaction-authority reader |
 
 R6a maintenance backports commits `225a5dc` (bootstrap authentication),
 `f82094c` (local WAL retention), and `16442b1` (bounded atomic purge and recovery)
@@ -181,6 +188,19 @@ leader, writes through the replacement, restarts the killed candidate, and check
 all 41 rows and representative index lookups on every member. This exercises the
 batched Raft commands and atomic WAL commit records through real reopen.
 
+With `--candidate`, the eighteen-checkpoint level-4 matrix runs first, then
+six additional checkpoints require the separately pinned level-4 reader to
+reopen and coordinate legacy SQL before activation, reject level-5 preflight
+while it remains, then finalize level 5 with every candidate voter. They check follower
+forwarding, savepoints, abort visibility, unique indexes, forged decision refusal,
+SIGKILL and replacement leadership, snapshot catch-up carrying the transaction
+records, incompatible admission refusal, and the pinned reader's failed startup
+against finalized level-5 data followed by successful candidate restart. The
+intermediate level-4 executable acts as a SQL coordinator; its leadership
+eligibility is outside this checkpoint. The historical pinned-only run uses
+fourteen level-2 checkpoints. Missing candidate capability cannot silently skip
+these additional checks.
+
 The matrix does not exercise late-failure COPY atomicity or prove that
 cross-shard 2PC is not grouped; separate integration and command-path tests cover
 those boundaries.
@@ -204,6 +224,21 @@ Raw evidence is in `target/write-batch-qualification/mixed-binary-final/`.
 This is local clean-commit compatibility evidence, not hosted-CI or release
 qualification.
 
+The November 5 working-tree candidate at base `fa7bc6e66a2db6fe0a795efca58b70fb7273a968` passed
+all twenty-four checkpoints with `passed: true`, `matrix_completed: true`, and
+no blockers. Its source patch SHA-256 is `69f69d92fb627c58f51953f626644c4972e705dbdae246b7d5d10c9416318196`
+and binary SHA-256 is `b58acb650e238f8dc82bc8a48bdc5814e847ede3a2ea24853ad79e63c136b15e`. The candidate
+includes level-5 activation, terminal recovery, compatible admission bytes,
+forwarded SQL, SIGKILL/failover/restart and transaction snapshot proofs. Evidence
+is in `target/verification/txn-activation/final/`. This qualifies that exact local
+candidate, with retained metadata and throughput limits documented in
+[transaction ownership and decisions](../explanation/transaction-authority.md);
+it is not hosted-CI or release qualification.
+
+The same verification also passed the pinned-only fourteen-checkpoint profile
+with `passed: true`, `matrix_completed: true`, and no blockers. Its evidence is
+in `target/verification/txn-activation/historical/`.
+
 ## Rollback boundaries for this pair
 
 | Cluster state | Feature rollback to level 1 | New executable replaced by R6a maintenance |
@@ -212,6 +247,7 @@ qualification.
 | Finalized v2, before any admission | Rejected; finalization is irreversible | Exercised against the same persistent directory |
 | An admission approval has entered the log | Rejected | Unsupported; R6a cannot interpret admission commands or enforce the ledger |
 | Finalized write-batching-v4 | Rejected; finalization is irreversible | Unsupported; R6a cannot interpret the batched Raft commands or WAL commit records |
+| Finalized transaction-authority-v5 (candidate) | Rejected, including during a later upgrade | Readerless executables are unsupported; candidate peers fence their consensus traffic, and the pinned level-4 reader refuses startup |
 
 Before adding a member, replace every existing voter and learner with an
 admission-capable binary. The join coordinator rejects admission while any probed
