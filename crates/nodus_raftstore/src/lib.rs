@@ -139,6 +139,31 @@ openraft::declare_raft_types!(
         AsyncRuntime = openraft::TokioRuntime,
 );
 
+/// Total serialized JSON payload bytes in the entries currently retained by one
+/// Raft log. This is a logical payload gauge, not physical LSM or filesystem use.
+#[derive(Clone, Default)]
+pub struct RaftLogByteRetention {
+    bytes: Arc<AtomicU64>,
+}
+
+impl RaftLogByteRetention {
+    pub fn get(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn subtract(&self, bytes: u64) {
+        self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+fn serialized_entry_bytes(entry: &Entry<NodusTypeConfig>) -> Result<u64, serde_json::Error> {
+    serde_json::to_vec(entry).map(|bytes| bytes.len() as u64)
+}
+
 /// Magic + format version prefixing a streamed snapshot file, so a reader can
 /// reject an unrecognized format rather than misparsing it.
 const SNAPSHOT_MAGIC: &[u8; 4] = b"NSNP";
@@ -662,17 +687,23 @@ impl RaftMetaStore {
         result
     }
 
-    /// Persists a batch of log entries atomically (see [`Self::put_batch`]).
-    fn append_entries(&self, entries: &[Entry<NodusTypeConfig>]) -> anyhow::Result<()> {
+    /// Persists a batch of log entries atomically (see [`Self::put_batch`]) and
+    /// returns each entry's serialized JSON payload length for retention metrics.
+    fn append_entries(&self, entries: &[Entry<NodusTypeConfig>]) -> anyhow::Result<Vec<u64>> {
+        let mut serialized_bytes = Vec::with_capacity(entries.len());
         let items: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
             .map(|entry| {
                 serde_json::to_vec(entry)
-                    .map(|bytes| (log_key(entry.log_id.index), encode_raft(bytes)))
+                    .map(|bytes| {
+                        serialized_bytes.push(bytes.len() as u64);
+                        (log_key(entry.log_id.index), encode_raft(bytes))
+                    })
                     .map_err(anyhow::Error::from)
             })
             .collect::<anyhow::Result<_>>()?;
-        self.put_batch(items)
+        self.put_batch(items)?;
+        Ok(serialized_bytes)
     }
 
     fn save_vote(&self, vote: &Vote<u64>) -> anyhow::Result<()> {
@@ -808,6 +839,10 @@ pub struct NodusRaftStore {
     deferral: SnapshotDeferral,
     telemetry_observer: RaftTelemetryObserver,
     pub log: Arc<RwLock<BTreeMap<u64, Entry<NodusTypeConfig>>>>,
+    /// Serialized sizes share the log's lifetime so conflict truncation and
+    /// purge cannot leave stale bytes in the retention gauge.
+    log_serialized_sizes: Arc<std::sync::Mutex<BTreeMap<u64, u64>>>,
+    log_byte_retention: RaftLogByteRetention,
     pub vote: Arc<RwLock<Option<Vote<u64>>>>,
     pub state_machine: Arc<RwLock<StateMachine>>,
     /// Durable backing for log/vote/applied-state. `None` for the in-memory
@@ -846,11 +881,18 @@ impl NodusRaftStore {
         self.deferral.clone()
     }
 
+    /// Shared logical-byte gauge for this group's currently retained log.
+    pub fn log_byte_retention(&self) -> RaftLogByteRetention {
+        self.log_byte_retention.clone()
+    }
+
     /// In-memory store (no durability) — for tests and ephemeral groups.
     pub fn new() -> Self {
         Self {
             tracked_participants: Arc::new(AtomicBool::new(false)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
+            log_serialized_sizes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            log_byte_retention: RaftLogByteRetention::default(),
             vote: Arc::new(RwLock::new(None)),
             state_machine: Arc::new(RwLock::new(StateMachine {
                 last_applied_log: None,
@@ -946,9 +988,18 @@ impl NodusRaftStore {
             }
             other => other,
         };
+        let log_serialized_sizes: BTreeMap<u64, u64> = log
+            .iter()
+            .map(|(index, entry)| Ok((*index, serialized_entry_bytes(entry)?)))
+            .collect::<anyhow::Result<_>>()?;
+        let log_byte_retention = RaftLogByteRetention {
+            bytes: Arc::new(AtomicU64::new(log_serialized_sizes.values().sum())),
+        };
         Ok(Self {
             tracked_participants: Arc::new(AtomicBool::new(tracked_participants)),
             log: Arc::new(RwLock::new(log)),
+            log_serialized_sizes: Arc::new(std::sync::Mutex::new(log_serialized_sizes)),
+            log_byte_retention,
             vote: Arc::new(RwLock::new(vote)),
             state_machine: Arc::new(RwLock::new(StateMachine {
                 last_applied_log: applied.last_applied,
@@ -1362,13 +1413,32 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         // Persist the whole append atomically before caching and surface any
         // failure to openraft, so a crash never loses an acked entry and a
         // multi-entry append is never half durable — a leader must not ack a
-        // write it hasn't durably stored.
-        if let Some(meta) = &self.meta {
+        // write it hasn't durably stored. Durable append reuses the sizes of
+        // the JSON payloads it already serialized for storage.
+        let serialized_bytes = if let Some(meta) = &self.meta {
             meta.append_entries(&batch).map_err(|e| {
                 StorageIOError::write_logs(AnyError::error(format!("persist log append: {e:#}")))
-            })?;
-        }
-        for entry in batch {
+            })?
+        } else {
+            batch
+                .iter()
+                .map(serialized_entry_bytes)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    StorageIOError::write_logs(AnyError::error(format!(
+                        "serialize in-memory log append: {e:#}"
+                    )))
+                })?
+        };
+        let mut sizes = self
+            .log_serialized_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (entry, bytes) in batch.into_iter().zip(serialized_bytes) {
+            if let Some(previous) = sizes.insert(entry.log_id.index, bytes) {
+                self.log_byte_retention.subtract(previous);
+            }
+            self.log_byte_retention.add(bytes);
             log.insert(entry.log_id.index, entry);
         }
         tracing::debug!(
@@ -1399,6 +1469,14 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 })?;
             }
             log.remove(&key);
+            let bytes = self
+                .log_serialized_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            if let Some(bytes) = bytes {
+                self.log_byte_retention.subtract(bytes);
+            }
         }
         Ok(())
     }
@@ -2215,6 +2293,14 @@ mod tests {
             "write-intent failure must also be reported"
         );
         assert!(store.log.read().await.is_empty());
+        assert_eq!(store.log_byte_retention().get(), 0);
+        assert!(
+            store
+                .log_serialized_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     /// A failed durable vote write is returned to openraft and the cached vote

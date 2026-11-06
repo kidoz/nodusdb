@@ -1552,13 +1552,22 @@ pub async fn run_server_full(
                     metrics_state.metrics.shard_groups.set(total as i64);
                     metrics_state.metrics.shard_groups_unavailable.set(unavailable as i64);
 
-                    // Log-growth visibility: retained Raft log entries per group.
-                    for (group, retained) in metrics_manager.log_retention().await {
+                    // Log-growth visibility: retained entries and logical JSON
+                    // payload bytes per group, not physical storage usage.
+                    for (group, retained, serialized_bytes) in
+                        metrics_manager.log_retention().await
+                    {
+                        let labels = vec![("group".to_string(), group)];
                         metrics_state
                             .metrics
                             .raft_log_entries
-                            .get_or_create(&vec![("group".to_string(), group)])
+                            .get_or_create(&labels)
                             .set(retained as i64);
+                        metrics_state
+                            .metrics
+                            .raft_log_serialized_bytes
+                            .get_or_create(&labels)
+                            .set(serialized_bytes as i64);
                     }
                     // Snapshot-build deferrals: cumulative count plus the current
                     // streak's duration, and a (throttled) warning past the

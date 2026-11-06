@@ -195,6 +195,8 @@ pub struct MultiRaftManager {
     /// so the metrics loop can report deferral streaks without reaching into
     /// openraft's storage adaptor.
     deferrals: Arc<RwLock<HashMap<String, nodus_raftstore::SnapshotDeferral>>>,
+    /// Per-group logical retained-log payload byte gauges.
+    log_byte_retention: Arc<RwLock<HashMap<String, nodus_raftstore::RaftLogByteRetention>>>,
     telemetry_observer: nodus_raftstore::RaftTelemetryObserver,
     machines: tokio::sync::RwLock<
         std::collections::HashMap<String, Arc<tokio::sync::RwLock<nodus_raftstore::StateMachine>>>,
@@ -235,6 +237,7 @@ impl MultiRaftManager {
             base_kv,
             hosted: Arc::new(RwLock::new(HashSet::new())),
             deferrals: Arc::new(RwLock::new(HashMap::new())),
+            log_byte_retention: Arc::new(RwLock::new(HashMap::new())),
             telemetry_observer: Arc::new(|_| {}),
             machines: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             clock,
@@ -372,9 +375,11 @@ impl MultiRaftManager {
             .collect()
     }
 
-    /// Retained Raft log entries per hosted group (`last_log_index` minus the
-    /// purge watermark): the log-growth signal while snapshot builds defer.
-    pub async fn log_retention(&self) -> Vec<(String, u64)> {
+    /// Retained Raft log entries and serialized JSON payload bytes per hosted
+    /// group. Entry count is `last_log_index` minus the purge watermark; bytes
+    /// are logical payload sizes, not physical LSM or filesystem usage.
+    pub async fn log_retention(&self) -> Vec<(String, u64, u64)> {
+        let byte_retention = self.log_byte_retention.read().unwrap().clone();
         let rafts = self.state.rafts.read().await;
         rafts
             .iter()
@@ -383,7 +388,8 @@ impl MultiRaftManager {
                 let metrics = watch.borrow();
                 let last = metrics.last_log_index.unwrap_or(0);
                 let purged = metrics.purged.map(|id| id.index).unwrap_or(0);
-                (id.clone(), last.saturating_sub(purged))
+                let bytes = byte_retention.get(id).map_or(0, |tracker| tracker.get());
+                (id.clone(), last.saturating_sub(purged), bytes)
             })
             .collect()
     }
@@ -454,6 +460,10 @@ impl MultiRaftManager {
             .write()
             .unwrap()
             .insert(shard_id.to_string(), store.deferral());
+        self.log_byte_retention
+            .write()
+            .unwrap()
+            .insert(shard_id.to_string(), store.log_byte_retention());
         let store = store
             .with_snapshot_group(shard_id)
             .with_telemetry_observer(self.telemetry_observer.clone())
@@ -764,6 +774,7 @@ impl MultiRaftManager {
             .collect();
         self.hosted.write().unwrap().clear();
         self.deferrals.write().unwrap().clear();
+        self.log_byte_retention.write().unwrap().clear();
         self.machines.write().await.clear();
         for raft in groups {
             let _ = raft.shutdown().await;
@@ -778,6 +789,7 @@ impl MultiRaftManager {
         let raft = self.state.rafts.write().await.remove(group_id);
         self.hosted.write().unwrap().remove(group_id);
         self.deferrals.write().unwrap().remove(group_id);
+        self.log_byte_retention.write().unwrap().remove(group_id);
         self.machines.write().await.remove(group_id);
         if let Some(raft) = raft {
             let _ = raft.shutdown().await;

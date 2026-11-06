@@ -45,6 +45,8 @@ impl NodusRaftStore {
             return Ok(());
         }
         let meta = self.meta.clone();
+        let serialized_sizes = self.log_serialized_sizes.clone();
+        let byte_retention = self.log_byte_retention.clone();
         // Own the guards inside the blocking task: cancelling the async caller
         // cannot release them between durable publication and cache updates.
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize)> {
@@ -71,9 +73,15 @@ impl NodusRaftStore {
                 if let Some(meta) = &meta {
                     meta.purge_batch(entries, &applied)?;
                 }
+                let mut sizes = serialized_sizes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut purged_bytes = 0;
                 for entry in entries {
                     log.remove(&entry.index);
+                    purged_bytes += sizes.remove(&entry.index).unwrap_or(0);
                 }
+                byte_retention.subtract(purged_bytes);
                 sm.last_purged = Some(watermark);
                 deleted += entries.len();
                 batches += 1;

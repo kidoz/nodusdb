@@ -85,6 +85,9 @@ pub struct Metrics {
     /// Raft log entries retained per group (`group` label) — grows without
     /// bound while a group's snapshot build keeps deferring.
     pub raft_log_entries: Family<Vec<(String, String)>, Gauge>,
+    /// Serialized JSON payload bytes in retained entries per group. This is a
+    /// logical payload gauge, not physical LSM or filesystem usage.
+    pub raft_log_serialized_bytes: Family<Vec<(String, String)>, Gauge>,
     /// Snapshot builds deferred per group (`group` label).
     pub snapshot_deferrals_total: Family<Vec<(String, String)>, Counter>,
     /// Duration (seconds) of each group's current unbroken snapshot-deferral
@@ -145,6 +148,7 @@ impl Default for Metrics {
                 latency_histogram as fn() -> Histogram,
             ),
             raft_log_entries: Family::default(),
+            raft_log_serialized_bytes: Family::default(),
             snapshot_deferrals_total: Family::default(),
             snapshot_deferred_seconds: Family::default(),
             raft_snapshot_builds_total: Family::default(),
@@ -295,6 +299,11 @@ impl Metrics {
             "nodus_raft_log_entries",
             "Raft log entries retained per group",
             m.raft_log_entries.clone(),
+        );
+        registry.register(
+            "nodus_raft_log_serialized_bytes",
+            "Serialized JSON payload bytes in retained Raft log entries per group",
+            m.raft_log_serialized_bytes.clone(),
         );
         registry.register(
             "nodus_snapshot_deferrals_total",
@@ -698,6 +707,10 @@ mod tests {
             .get_or_create(&vec![("group".to_string(), "shard-meta".to_string())])
             .set(42);
         metrics
+            .raft_log_serialized_bytes
+            .get_or_create(&vec![("group".to_string(), "shard-meta".to_string())])
+            .set(4096);
+        metrics
             .snapshot_deferrals_total
             .get_or_create(&vec![("group".to_string(), "shard-meta".to_string())])
             .inc();
@@ -721,6 +734,7 @@ mod tests {
             buf.contains("nodus_commit_latency_seconds_count{mode=\"batch\",result=\"success\"} 1")
         );
         assert!(buf.contains("nodus_raft_log_entries{group=\"shard-meta\"} 42"));
+        assert!(buf.contains("nodus_raft_log_serialized_bytes{group=\"shard-meta\"} 4096"));
         assert!(buf.contains("nodus_snapshot_deferrals_total_total{group=\"shard-meta\"} 1"));
         assert!(buf.contains("nodus_raft_snapshot_builds_total_total{group=\"shard-meta\"} 1"));
         assert!(buf.contains("nodus_raft_snapshot_build_seconds_count{group=\"shard-meta\"} 1"));

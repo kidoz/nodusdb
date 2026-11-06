@@ -133,6 +133,23 @@ fn entry(index: u64) -> Entry<NodusTypeConfig> {
     }
 }
 
+async fn assert_byte_accounting(store: &NodusRaftStore) {
+    let log = store.log.read().await;
+    let expected: u64 = log
+        .values()
+        .map(|entry| serialized_entry_bytes(entry).unwrap())
+        .sum();
+    assert_eq!(store.log_byte_retention().get(), expected);
+    assert_eq!(
+        store
+            .log_serialized_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        log.len()
+    );
+}
+
 async fn seed(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64) -> NodusRaftStore {
     let mut store = NodusRaftStore::with_kv_at(kv, dir).unwrap();
     let mut entries: Vec<_> = (1..=count).map(entry).collect();
@@ -184,6 +201,7 @@ async fn assert_prefix(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64, purged: 
         Some(entry(count - 1).log_id)
     );
     assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
+    assert_byte_accounting(&reopened).await;
 }
 
 #[tokio::test]
@@ -192,8 +210,10 @@ async fn purge_batches_preserve_tail_and_recover_watermark() {
     let inner = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
     let kv = Arc::new(ProbeKv::new(inner));
     let mut store = seed(kv.clone(), dir.path().join("snap"), 701).await;
+    assert_byte_accounting(&store).await;
     kv.arm(0, Fault::None);
     store.purge_logs_upto(entry(600).log_id).await.unwrap();
+    assert_byte_accounting(&store).await;
     assert_eq!(
         kv.commits.load(Ordering::SeqCst),
         3,
@@ -209,6 +229,23 @@ async fn purge_batches_preserve_tail_and_recover_watermark() {
     drop(kv);
     let reopened = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
     assert_prefix(reopened, dir.path().join("snap"), 701, 600).await;
+}
+
+#[tokio::test]
+async fn conflict_truncation_and_reappend_preserve_byte_accounting() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
+    let mut store = seed(kv, dir.path().join("snap"), 3).await;
+    store
+        .delete_conflict_logs_since(entry(2).log_id)
+        .await
+        .unwrap();
+    assert_eq!(store.try_get_log_entries(..).await.unwrap().len(), 1);
+    assert_byte_accounting(&store).await;
+
+    store.append_to_log(vec![entry(2), entry(3)]).await.unwrap();
+    assert_eq!(store.try_get_log_entries(..).await.unwrap().len(), 3);
+    assert_byte_accounting(&store).await;
 }
 
 #[tokio::test]
