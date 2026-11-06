@@ -140,17 +140,21 @@ async fn snapshot_telemetry_counts_only_new_successful_builds() {
     assert_eq!(events.lock().unwrap().len(), 1);
 
     store.deferral().clear();
-    // A genuine build error (injected here) reports no progress instead of
-    // failing: openraft treats a returned error as fatal to the group, while
-    // a missing snapshot only delays log compaction. The failure is tracked
-    // as a deferral streak for log-growth visibility, and the retry rides
-    // the same throttle.
+    // A snapshot-artifact write error (injected here) reports no progress
+    // instead of failing: openraft treats a returned error as fatal to the
+    // group, while a missing snapshot only delays log compaction. The failure
+    // is tracked as a deferral streak for log-growth visibility, and the
+    // retry rides the same throttle. (Errors reading or validating durable
+    // source state still fail closed — covered by the migration fault tests.)
     store.set_fail_builds_for_test(true);
     let failed = store.build_snapshot().await.unwrap();
     assert_eq!(failed.meta.snapshot_id, original.meta.snapshot_id);
     let streak = store.deferral().current().expect("failure tracked");
     assert_eq!(streak.count, 1);
-    assert_eq!(streak.reason, "snapshot build failed (see error log)");
+    assert_eq!(
+        streak.reason,
+        "snapshot artifact write failed (see error log)"
+    );
     assert_eq!(events.lock().unwrap().len(), 1);
     store.set_fail_builds_for_test(false);
     let throttled = store.build_snapshot().await.unwrap();

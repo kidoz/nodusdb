@@ -371,10 +371,13 @@ NSNP v2 preserves retained user history, tombstones and pending intent identitie
 The production writer enables v2 only after [verified durable finalization](../explanation/upgrade-authority.md).
 Before finalization it uses v1, which cannot represent those states; such builds
 defer — report no progress and retry on a throttle — so the Raft log grows
-meanwhile. Any build failure defers the same way rather than returning an error
-to OpenRaft, which treats a returned build error as fatal to the group; a
+meanwhile. A failure to write the snapshot file or its durable descriptor (for
+example a full disk) defers the same way rather than returning an error to
+OpenRaft, which treats a returned build error as fatal to the group; a
 persistent failure stays visible through the error log and the deferral-streak
-metrics. Installation materializes a bounded checkpoint and pauses the
+metrics. A failure to read or validate the durable source state still fails
+closed: the error is returned and the group stops rather than building over
+unreadable state. Installation materializes a bounded checkpoint and pauses the
 shared engine. The same checkpoint publishes a local recovery generation and WAL
 floor. Source-bound backup operations reject cross-generation incremental ancestry
 and PITR extension until a new full backup; offline enforcement requires the

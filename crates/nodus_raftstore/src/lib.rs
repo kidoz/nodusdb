@@ -1340,28 +1340,34 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
                 Ok(snapshot)
             }
             Err(e) => {
-                // Every build failure reports no progress and retries on the
-                // deferral throttle — whether a deliberate deferral (pending
-                // intents, retained history) or a genuine error such as a
-                // transient I/O failure or an oversized state. Returning a
-                // StorageError to openraft is FATAL to the group: its core
-                // stops and writes end until a restart. A missing snapshot
-                // endangers nothing, because the log retains every entry the
-                // snapshot would have compacted; a persistent failure stays
-                // visible through the error log and the deferral-streak
-                // metrics, and a transient one (a full disk the operator then
-                // frees) recovers on its own.
-                let reason = match e.downcast_ref::<snapshots::SnapshotDeferred>() {
-                    Some(deferred) => {
-                        tracing::debug!(reason = %deferred, "snapshot deferred");
-                        deferred.0
-                    }
-                    None => {
-                        tracing::error!(group = %self.snapshot_group, error = %e, "snapshot build failed; retrying on the deferral throttle");
-                        "snapshot build failed (see error log)"
-                    }
-                };
-                self.deferral.record(reason);
+                if let Some(deferred) = e.downcast_ref::<snapshots::SnapshotDeferred>() {
+                    tracing::debug!(reason = %deferred, "snapshot deferred");
+                    self.deferral.record(deferred.0);
+                } else if e
+                    .downcast_ref::<snapshots::SnapshotArtifactError>()
+                    .is_some()
+                {
+                    // Writing the new snapshot's file or its durable
+                    // descriptor failed — environmental and possibly transient
+                    // (a full disk the operator then frees). Report no
+                    // progress and retry on the deferral throttle: returning a
+                    // StorageError to openraft is FATAL to the group (its core
+                    // stops and writes end until a restart), while a missing
+                    // snapshot endangers nothing — the log retains every entry
+                    // the snapshot would have compacted. A persistent failure
+                    // stays visible through the error log and the
+                    // deferral-streak metrics.
+                    tracing::error!(group = %self.snapshot_group, error = ?e, "snapshot artifact write failed; retrying on the deferral throttle");
+                    self.deferral
+                        .record("snapshot artifact write failed (see error log)");
+                } else {
+                    // Reading or validating the durable source state failed:
+                    // fail closed. The build never publishes over unreadable
+                    // state, and surfacing the error stops the group rather
+                    // than compounding possible corruption.
+                    tracing::error!(group = %self.snapshot_group, error = ?e, "snapshot build failed");
+                    return Err(snapshot_io_err("build snapshot", e));
+                }
                 self.unchanged_snapshot().await
             }
         }

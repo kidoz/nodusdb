@@ -32,6 +32,36 @@ impl std::fmt::Display for SnapshotDeferred {
 
 impl std::error::Error for SnapshotDeferred {}
 
+/// The new snapshot's file or its durable descriptor could not be written
+/// (create/write/sync/rename/publication). Environmental and possibly
+/// transient — a full disk the operator then frees — so `build_snapshot`
+/// defers and retries these instead of failing the group. Failures to read or
+/// validate the durable source state are never marked: they fail closed.
+#[derive(Debug)]
+pub(crate) struct SnapshotArtifactError;
+
+impl std::fmt::Display for SnapshotArtifactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("snapshot artifact write failed")
+    }
+}
+
+impl std::error::Error for SnapshotArtifactError {}
+
+/// Marks a snapshot-artifact operation's error with [`SnapshotArtifactError`]
+/// so `build_snapshot` classifies it as deferrable; `op` labels the failing
+/// operation in the error chain.
+fn artifact<T, E: Into<anyhow::Error>>(
+    result: Result<T, E>,
+    op: &'static str,
+) -> anyhow::Result<T> {
+    result.map_err(|e| {
+        Into::<anyhow::Error>::into(e)
+            .context(SnapshotArtifactError)
+            .context(op)
+    })
+}
+
 fn scope(sm: &StateMachine) -> SnapshotScope {
     SnapshotScope {
         exclude_raft: true,
@@ -123,7 +153,10 @@ impl NodusRaftStore {
             .fail_builds_for_test
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            return Err(anyhow::anyhow!("snapshot build failed by test hook"));
+            return Err(
+                anyhow::anyhow!("snapshot artifact write failed by test hook")
+                    .context(SnapshotArtifactError),
+            );
         }
         let sm = self.state_machine.read().await;
         let scope = scope(&sm);
@@ -219,7 +252,7 @@ impl NodusRaftStore {
             .snapshot_dir
             .join(format!("build-{}.tmp", uuid::Uuid::new_v4()));
         let _cleanup = StagedSnapshot(tmp.clone());
-        let file = tokio::fs::File::create(&tmp).await?;
+        let file = artifact(tokio::fs::File::create(&tmp).await, "create snapshot file")?;
         let mut writer = BufWriter::new(file);
         for row in &rows {
             if let Some(kv) = &sm.kv {
@@ -228,47 +261,57 @@ impl NodusRaftStore {
         }
         if use_v2 {
             v2::canonicalize(&mut rows)?;
-            writer
-                .write_all(&v2::encode(
-                    &self.snapshot_group,
-                    &meta,
-                    catalog.is_some(),
-                    &rows,
-                )?)
-                .await?;
+            let encoded = v2::encode(&self.snapshot_group, &meta, catalog.is_some(), &rows)?;
+            artifact(writer.write_all(&encoded).await, "write snapshot")?;
         } else {
             let catalog_bytes = catalog.map(|c| serde_json::to_vec(&c)).transpose()?;
-            write_snapshot_header(&mut writer, catalog_bytes.as_deref()).await?;
+            artifact(
+                write_snapshot_header(&mut writer, catalog_bytes.as_deref()).await,
+                "write snapshot header",
+            )?;
             for row in rows {
                 if let Some(v) = row.versions.iter().max_by_key(|v| v.version)
                     && let Some(value) = &v.value
                 {
-                    write_kv_record(&mut writer, &row.key, value, v.version).await?;
+                    artifact(
+                        write_kv_record(&mut writer, &row.key, value, v.version).await,
+                        "write snapshot record",
+                    )?;
                 }
             }
         }
-        writer.flush().await?;
-        writer.into_inner().sync_all().await?;
+        artifact(writer.flush().await, "flush snapshot")?;
+        artifact(writer.into_inner().sync_all().await, "sync snapshot file")?;
         let mut current = self.current_snapshot_meta.write().await;
         *current = None;
-        self.invalidate_snapshot_file()?;
-        std::fs::rename(&tmp, self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE))?;
-        sync_dir(&self.snapshot_dir)?;
+        artifact(
+            self.invalidate_snapshot_file(),
+            "invalidate previous snapshot",
+        )?;
+        artifact(
+            std::fs::rename(&tmp, self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE)),
+            "publish snapshot file",
+        )?;
+        artifact(sync_dir(&self.snapshot_dir), "sync snapshot dir")?;
         if let Some(store) = &self.meta {
-            store.put_checked(
-                RAFT_SNAPSHOT_META_KEY,
-                encode_raft(serde_json::to_vec(&meta)?),
+            let descriptor = encode_raft(serde_json::to_vec(&meta)?);
+            artifact(
+                store.put_checked(RAFT_SNAPSHOT_META_KEY, descriptor),
+                "persist snapshot descriptor",
             )?;
         }
         *current = Some(meta.clone());
         tracing::info!(snapshot = %meta.snapshot_id, format_version = if use_v2 { 2 } else { 1 }, "validated snapshot published");
+        let file = artifact(
+            self.open_current_snapshot().await,
+            "open published snapshot",
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!("published snapshot disappeared").context(SnapshotArtifactError)
+        })?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(
-                self.open_current_snapshot()
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("published snapshot disappeared"))?,
-            ),
+            snapshot: Box::new(file),
         })
     }
 
