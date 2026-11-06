@@ -140,13 +140,26 @@ async fn snapshot_telemetry_counts_only_new_successful_builds() {
     assert_eq!(events.lock().unwrap().len(), 1);
 
     store.deferral().clear();
-    std::fs::remove_dir_all(&store.snapshot_dir).unwrap();
-    std::fs::write(&store.snapshot_dir, b"not a directory").unwrap();
-    assert!(store.build_snapshot().await.is_err());
+    // A genuine build error (injected here) reports no progress instead of
+    // failing: openraft treats a returned error as fatal to the group, while
+    // a missing snapshot only delays log compaction. The failure is tracked
+    // as a deferral streak for log-growth visibility, and the retry rides
+    // the same throttle.
+    store.set_fail_builds_for_test(true);
+    let failed = store.build_snapshot().await.unwrap();
+    assert_eq!(failed.meta.snapshot_id, original.meta.snapshot_id);
+    let streak = store.deferral().current().expect("failure tracked");
+    assert_eq!(streak.count, 1);
+    assert_eq!(streak.reason, "snapshot build failed (see error log)");
+    assert_eq!(events.lock().unwrap().len(), 1);
+    store.set_fail_builds_for_test(false);
+    let throttled = store.build_snapshot().await.unwrap();
+    assert_eq!(throttled.meta.snapshot_id, original.meta.snapshot_id);
     assert_eq!(events.lock().unwrap().len(), 1);
 
-    std::fs::remove_file(&store.snapshot_dir).unwrap();
-    std::fs::create_dir(&store.snapshot_dir).unwrap();
+    // Once the cause is fixed and the retry interval has passed, the build
+    // recovers without a restart.
+    store.deferral().clear();
     let retried = store.build_snapshot().await.unwrap();
     assert_ne!(retried.meta.snapshot_id, original.meta.snapshot_id);
     let events = events.lock().unwrap();

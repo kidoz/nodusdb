@@ -857,6 +857,11 @@ pub struct NodusRaftStore {
     /// `{snapshot_dir}/current.snap`), served by `get_current_snapshot`. Persisted
     /// via `meta` and recovered on restart so a node resumes from the snapshot.
     current_snapshot_meta: Arc<RwLock<Option<NodusSnapshotMeta>>>,
+    /// Fault-injection hook: while set, `build_atomic_snapshot` fails before
+    /// touching storage, so tests can exercise the build-error path (which
+    /// must defer, never fail the group) without breaking the filesystem.
+    #[cfg(test)]
+    fail_builds_for_test: Arc<AtomicBool>,
 }
 
 impl Default for NodusRaftStore {
@@ -879,6 +884,13 @@ impl NodusRaftStore {
     /// captures one per group at creation for the node's metrics loop.
     pub fn deferral(&self) -> SnapshotDeferral {
         self.deferral.clone()
+    }
+
+    /// Test hook: while `fail` is set, snapshot builds fail with an injected
+    /// error before touching storage.
+    #[cfg(test)]
+    pub(crate) fn set_fail_builds_for_test(&self, fail: bool) {
+        self.fail_builds_for_test.store(fail, Ordering::Relaxed);
     }
 
     /// Shared logical-byte gauge for this group's currently retained log.
@@ -910,6 +922,8 @@ impl NodusRaftStore {
             telemetry_observer: Arc::new(|_| {}),
             snapshot_dir: temp_snapshot_dir(),
             current_snapshot_meta: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            fail_builds_for_test: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1017,6 +1031,8 @@ impl NodusRaftStore {
             telemetry_observer: Arc::new(|_| {}),
             snapshot_dir,
             current_snapshot_meta: Arc::new(RwLock::new(snapshot_meta)),
+            #[cfg(test)]
+            fail_builds_for_test: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1323,18 +1339,30 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
                 });
                 Ok(snapshot)
             }
-            Err(e) if e.downcast_ref::<snapshots::SnapshotDeferred>().is_some() => {
-                tracing::debug!(reason = %e, "snapshot deferred");
-                let reason = e
-                    .downcast_ref::<snapshots::SnapshotDeferred>()
-                    .map(|d| d.0)
-                    .unwrap_or("snapshot deferred");
+            Err(e) => {
+                // Every build failure reports no progress and retries on the
+                // deferral throttle — whether a deliberate deferral (pending
+                // intents, retained history) or a genuine error such as a
+                // transient I/O failure or an oversized state. Returning a
+                // StorageError to openraft is FATAL to the group: its core
+                // stops and writes end until a restart. A missing snapshot
+                // endangers nothing, because the log retains every entry the
+                // snapshot would have compacted; a persistent failure stays
+                // visible through the error log and the deferral-streak
+                // metrics, and a transient one (a full disk the operator then
+                // frees) recovers on its own.
+                let reason = match e.downcast_ref::<snapshots::SnapshotDeferred>() {
+                    Some(deferred) => {
+                        tracing::debug!(reason = %deferred, "snapshot deferred");
+                        deferred.0
+                    }
+                    None => {
+                        tracing::error!(group = %self.snapshot_group, error = %e, "snapshot build failed; retrying on the deferral throttle");
+                        "snapshot build failed (see error log)"
+                    }
+                };
                 self.deferral.record(reason);
                 self.unchanged_snapshot().await
-            }
-            Err(e) => {
-                tracing::error!(group = %self.snapshot_group, error = %e, "snapshot build failed");
-                Err(snapshot_io_err("build snapshot", e))
             }
         }
     }

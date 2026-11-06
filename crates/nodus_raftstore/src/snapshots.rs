@@ -116,6 +116,15 @@ impl NodusRaftStore {
     }
 
     pub(super) async fn build_atomic_snapshot(&self) -> anyhow::Result<Snapshot<NodusTypeConfig>> {
+        // Fault injection for the build-error path (must defer, never fail
+        // the group — see `build_snapshot`).
+        #[cfg(test)]
+        if self
+            .fail_builds_for_test
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(anyhow::anyhow!("snapshot build failed by test hook"));
+        }
         let sm = self.state_machine.read().await;
         let scope = scope(&sm);
         let mut rows = if let Some(kv) = &sm.kv {
