@@ -3,7 +3,9 @@ use std::time::Duration;
 
 mod crash;
 mod fixture;
+mod ingress;
 mod marker_gap;
+mod replay;
 mod sql;
 mod unavailable;
 use fixture::Cluster;
@@ -247,6 +249,7 @@ async fn activation_keeps_existing_legacy_transaction_on_its_original_protocol()
     });
     let keys = c.keys();
     let clone = e.clone();
+    let groups = c.groups.clone();
     tokio::task::spawn_blocking(move || {
         let txn = TxnId::new();
         clone
@@ -258,6 +261,17 @@ async fn activation_keeps_existing_legacy_transaction_on_its_original_protocol()
             .unwrap();
         clone.commit(txn, 1_000_000).unwrap();
         assert!(clone.authority_read(txn).unwrap().is_none());
+        assert_eq!(
+            nodus_raftstore::txn_resolution::high_water(clone.local.as_ref()).unwrap(),
+            0
+        );
+        for group in groups {
+            assert!(
+                participant::read(clone.engine_for(&group).as_ref(), txn.0)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     })
     .await
     .unwrap();

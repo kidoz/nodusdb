@@ -1,7 +1,8 @@
-//! Dormant coordinator integration. All authority reads use a ReadIndex barrier
-//! before local access. Normal traffic cannot select this protocol yet.
+//! Tracked coordinators, selected only after transaction-authority-v5 finalizes.
+//! All authority reads use a ReadIndex barrier before local access.
 
 mod finalize;
+mod replay;
 #[cfg(test)]
 mod tests;
 
@@ -129,18 +130,52 @@ impl RaftKvEngine {
         let _span = tracing::info_span!("txn.resolve_tracked", txn = %record.txn_id,
             generation = record.token.generation, participants = record.participants.len())
         .entered();
+        let progress =
+            nodus_raftstore::txn_resolution::progress(self.local.as_ref(), record.txn_id)?;
+        if progress.as_ref().is_some_and(|p| p.complete) {
+            return Ok(());
+        }
         for (group, epoch) in &record.participants {
+            if progress
+                .as_ref()
+                .is_some_and(|p| p.acknowledged.contains(group))
+            {
+                continue;
+            }
+            self.resolve_participant(record, group, *epoch, progress.is_some())?;
+        }
+        Ok(())
+    }
+
+    fn resolve_participant(
+        &self,
+        record: &authority::RecordV1,
+        group: &str,
+        epoch: u64,
+        journaled: bool,
+    ) -> Result<()> {
+        self.router.submit(
+            group,
+            ShardCommand::TxnParticipantV1(participant::CommandV1 {
+                txn_id: record.txn_id,
+                owner: record.token.owner.clone(),
+                generation: record.token.generation,
+                epoch,
+                operation: participant::OperationV1::Resolve {
+                    decision: Box::new(record.clone()),
+                },
+            }),
+        )?;
+        if journaled {
             self.router.submit(
-                group,
-                ShardCommand::TxnParticipantV1(participant::CommandV1 {
-                    txn_id: record.txn_id,
-                    owner: record.token.owner.clone(),
-                    generation: record.token.generation,
-                    epoch: *epoch,
-                    operation: participant::OperationV1::Resolve {
-                        decision: Box::new(record.clone()),
+                META_SHARD,
+                ShardCommand::TxnResolutionV1(
+                    nodus_raftstore::txn_resolution::CommandV1::Acknowledge {
+                        txn_id: record.txn_id,
+                        decision: record.token.clone(),
+                        group: group.into(),
                     },
-                }),
+                ),
             )?;
         }
         Ok(())

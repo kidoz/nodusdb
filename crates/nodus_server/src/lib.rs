@@ -712,6 +712,11 @@ pub async fn run_server_full(
         .with_admission_source(local_kv.clone())
         .with_auth_token(config.admin.token.clone());
     let authority = nodus_raftstore::upgrade::read(local_kv.as_ref())?;
+    anyhow::ensure!(
+        !nodus_raftstore::upgrade::requires_txn_reader(&authority)
+            || raft_transport.scheme() == "https",
+        "transaction-authority-v5 requires peer mTLS on restart"
+    );
     let admissions = nodus_raftstore::upgrade::admission::read(local_kv.as_ref())?;
     nodus_raftstore::upgrade::admission::approved(&authority, admissions.as_ref())?;
 
@@ -785,6 +790,8 @@ pub async fn run_server_full(
     // read error.
     let gate_kv = local_kv.clone();
     let write_batch_gate_kv = local_kv.clone();
+    let txn_gate_kv = local_kv.clone();
+    let txn_peer_ready = raft_transport.scheme() == "https";
     let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone())
         .with_migration_gate(move || {
             nodus_raftstore::upgrade::read(gate_kv.as_ref()).is_ok_and(|authority| {
@@ -795,6 +802,12 @@ pub async fn run_server_full(
             nodus_raftstore::upgrade::read(write_batch_gate_kv.as_ref()).is_ok_and(|authority| {
                 authority.cluster_version >= nodus_raftstore::upgrade::WRITE_BATCH_LEVEL
             })
+        })
+        .with_txn_authority_gate(move || {
+            txn_peer_ready
+                && nodus_raftstore::upgrade::read(txn_gate_kv.as_ref()).is_ok_and(|authority| {
+                    authority.cluster_version >= nodus_raftstore::upgrade::TXN_AUTHORITY_LEVEL
+                })
         });
 
     // Routing reads the LOCAL store (kept current by the meta group's apply

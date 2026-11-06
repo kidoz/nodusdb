@@ -10,34 +10,24 @@ pub(super) struct Cluster {
     pub catalog: Arc<nodus_catalog::MemoryCatalog>,
     pub clock: Arc<nodus_txn::MemTxnManager>,
     servers: Vec<(
-        tokio::sync::oneshot::Sender<()>,
+        axum_server::Handle<std::net::SocketAddr>,
         tokio::task::JoinHandle<()>,
     )>,
-}
-
-// Loopback-only fixture forwarding. Production /write rejects both dormant
-// command families at every existing level. Consensus, snapshots and ReadIndex
-// still use the actual TCP handlers; this bypass exists only in this test file.
-async fn fixture_write(
-    axum::extract::Path(group): axum::extract::Path<String>,
-    axum::extract::State(state): axum::extract::State<RaftState>,
-    axum::Json(cmd): axum::Json<ShardCommand>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let raft = state.rafts.read().await.get(&group).cloned().unwrap();
-    match raft.client_write(cmd).await {
-        Ok(response) => axum::Json(response.data).into_response(),
-        Err(error) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            error.to_string(),
-        )
-            .into_response(),
-    }
 }
 
 impl Cluster {
     pub async fn open(root: &Path) -> Self {
         std::fs::create_dir_all(root).unwrap();
+        let (cert, key, ca) = crate::tests::write_test_certs(root);
+        let cluster = nodus_config::ClusterConfig {
+            tls: nodus_config::ClusterTlsConfig {
+                enabled: true,
+                cert_path: Some(cert),
+                key_path: Some(key),
+                ca_path: Some(ca),
+            },
+            ..Default::default()
+        };
         let layout = root.join("addresses.json");
         let previous: Option<Vec<String>> = std::fs::read(&layout)
             .ok()
@@ -82,9 +72,9 @@ impl Cluster {
         let groups = shard_ids.map(MultiRaftManager::data_group_id);
         let config = Arc::new(
             openraft::Config {
-                heartbeat_interval: 50,
-                election_timeout_min: 150,
-                election_timeout_max: 300,
+                heartbeat_interval: 200,
+                election_timeout_min: 2000,
+                election_timeout_max: 4000,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1_000_000),
                 ..Default::default()
             }
@@ -110,6 +100,10 @@ impl Cluster {
             if index == 0 {
                 first_clock = Some(clock.clone());
             }
+            let transport = crate::build_raft_transport(&cluster)
+                .unwrap()
+                .with_snapshot_checks()
+                .with_admission_source(local.clone());
             let manager = Arc::new(MultiRaftManager::new(
                 index as u64 + 1,
                 addresses[index].clone(),
@@ -119,7 +113,7 @@ impl Cluster {
                 Some(node_dir.to_string_lossy().into_owned()),
                 clock,
                 None,
-                Default::default(),
+                transport,
             ));
             let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
             if index == 0 {
@@ -137,8 +131,12 @@ impl Cluster {
             for group in &groups {
                 manager.get_or_create_data(group).await.unwrap();
             }
-            let router = RaftRouter::spawn(manager.clone());
-            router.enable_txn_authority_for_test();
+            let gate_kv = local.clone();
+            let router = RaftRouter::spawn(manager.clone()).with_txn_authority_gate(move || {
+                nodus_raftstore::upgrade::read(gate_kv.as_ref()).is_ok_and(|r| {
+                    r.cluster_version >= nodus_raftstore::upgrade::TXN_AUTHORITY_LEVEL
+                })
+            });
             engines.push(Arc::new(RaftKvEngine {
                 local,
                 router,
@@ -147,23 +145,20 @@ impl Cluster {
                 txn_groups: Mutex::new(HashMap::new()),
                 metrics: nodus_monitoring::Metrics::default(),
             }));
-            let fallback = raft_routes(RaftRouteAuth::AdminToken {
-                token: None,
-                allow_insecure: true,
-            })
-            .with_state(state.clone());
-            let app = axum::Router::new()
-                .route("/raft/{group}/write", axum::routing::post(fixture_write))
-                .with_state(state)
-                .fallback_service(fallback);
-            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let app = raft_routes(RaftRouteAuth::TransportAuthenticated).with_state(state);
+            let (tls, _) = crate::load_raft_tls_config(&cluster.tls).unwrap().unwrap();
+            let stop = axum_server::Handle::new();
+            let shutdown = stop.clone();
             let task = tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        let _ = stopped.await;
-                    })
-                    .await
-                    .unwrap();
+                axum_server::from_tcp_rustls(
+                    listener.into_std().unwrap(),
+                    axum_server::tls_rustls::RustlsConfig::from_config(tls),
+                )
+                .unwrap()
+                .handle(shutdown)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
             });
             servers.push((stop, task));
         }
@@ -220,6 +215,45 @@ impl Cluster {
             .await
             .unwrap();
         }
+        let service = crate::raft_upgrade::RaftUpgradeCoordinator {
+            kv: engines[0].local.clone(),
+            manager: engines[0].manager.clone(),
+            transport: engines[0].manager.transport(),
+            membership_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        for target in [
+            nodus_raftstore::upgrade::TARGET,
+            nodus_raftstore::upgrade::MIGRATION_TARGET,
+            nodus_raftstore::upgrade::WRITE_BATCH_TARGET,
+            nodus_raftstore::upgrade::TXN_AUTHORITY_TARGET,
+        ] {
+            let level = nodus_raftstore::upgrade::read(engines[0].local.as_ref())
+                .unwrap()
+                .cluster_version;
+            let target_level = match target {
+                nodus_raftstore::upgrade::TARGET => 2,
+                nodus_raftstore::upgrade::MIGRATION_TARGET => 3,
+                nodus_raftstore::upgrade::WRITE_BATCH_TARGET => 4,
+                _ => 5,
+            };
+            if level < target_level {
+                settle_meta(&engines).await;
+                service.start_upgrade(target.into()).await.unwrap();
+                settle_meta(&engines).await;
+                service.report_node_upgraded("1").await.unwrap();
+                settle_meta(&engines).await;
+                service.finalize_upgrade().await.unwrap();
+            }
+        }
+        for engine in &engines {
+            let e = engine.clone();
+            tokio::task::spawn_blocking(move || e.router.read_barrier(META_SHARD))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(engine.router.txn_authority_enabled());
+        }
+        drop(service);
         Self {
             engines,
             groups,
@@ -276,7 +310,7 @@ impl Cluster {
             engine.manager.shutdown_all().await;
         }
         for (stop, mut task) in self.servers {
-            let _ = stop.send(());
+            stop.shutdown();
             if tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await
                 .is_err()
@@ -293,5 +327,15 @@ impl Cluster {
         })
         .await
         .expect("old Raft storage must quiesce before reopen");
+    }
+}
+
+async fn settle_meta(engines: &[Arc<RaftKvEngine>]) {
+    for engine in engines {
+        let e = engine.clone();
+        tokio::task::spawn_blocking(move || e.router.read_barrier(META_SHARD))
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

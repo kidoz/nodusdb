@@ -370,6 +370,10 @@ impl RaftKvEngine {
     /// (it submits through the Raft router). Returns the number repaired.
     pub fn recover_pending_txns(&self) -> Result<usize> {
         let _span = tracing::info_span!("txn.recover_pending").entered();
+        // A failed legacy decision must not starve the independently durable
+        // tracked queue. Count its completed work even if legacy replay fails.
+        let tracked = self.replay_terminal_decisions()?;
+        self.metrics.txn_recoveries_total.inc_by(tracked as u64);
         let mut end = TXN2PC_PREFIX.to_vec();
         *end.last_mut().unwrap() += 1; // prefix successor bounds the scan
         let range = KeyRange {
@@ -392,7 +396,7 @@ impl RaftKvEngine {
             repaired += 1;
         }
         self.metrics.txn_recoveries_total.inc_by(repaired as u64);
-        Ok(repaired)
+        Ok(repaired + tracked)
     }
 }
 

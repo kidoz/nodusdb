@@ -75,7 +75,7 @@ async fn coordinator_exit_after_decision_or_ack_recovers_every_participant() {
             c.assert_rows(true);
         }
         let e = c.engines[1].clone();
-        let recovered = tokio::task::spawn_blocking(move || e.recover_tracked_transaction(txn))
+        let recovered = tokio::task::spawn_blocking(move || e.recover_pending_txns())
             .await
             .unwrap();
         if let Err(error) = recovered {

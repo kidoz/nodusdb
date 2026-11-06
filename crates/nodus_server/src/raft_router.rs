@@ -104,6 +104,7 @@ pub struct RaftRouter {
     /// fail closed. Defaults to closed.
     migration_gate: Arc<dyn Fn() -> bool + Send + Sync>,
     write_batch_gate: Arc<dyn Fn() -> bool + Send + Sync>,
+    txn_authority_gate: Arc<dyn Fn() -> bool + Send + Sync>,
     metrics: Arc<OnceLock<nodus_monitoring::Metrics>>,
     /// Process incarnation for tracked coordinators; clones keep one identity.
     pub(crate) authority_owner: nodus_raftstore::txn_authority::OwnerV1,
@@ -118,6 +119,8 @@ impl RaftRouter {
     /// Groups are resolved per request through the [`MultiRaftManager`], so a
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
+        #[cfg(test)]
+        let authority_override = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let authority_owner = nodus_raftstore::txn_authority::OwnerV1 {
             node_id: manager.node_id(),
             incarnation: uuid::Uuid::new_v4(),
@@ -206,10 +209,11 @@ impl RaftRouter {
             migration_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             migration_gate: Arc::new(|| false),
             write_batch_gate: Arc::new(|| false),
+            txn_authority_gate: Arc::new(|| false),
             metrics,
             authority_owner,
             #[cfg(test)]
-            authority_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authority_override,
             #[cfg(test)]
             authority_hook: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -245,17 +249,24 @@ impl RaftRouter {
         (self.write_batch_gate)()
     }
 
-    /// No production activation exists yet. The complete protocol is exercised
-    /// only in isolated tests until a new finalized compatibility level exists.
+    /// Install the fail-closed durable level-5 activation check.
+    pub fn with_txn_authority_gate(
+        mut self,
+        gate: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.txn_authority_gate = Arc::new(gate);
+        self
+    }
+
+    /// Read the durable finalized compatibility floor; failures keep it closed.
     pub(crate) fn txn_authority_enabled(&self) -> bool {
         #[cfg(test)]
         {
-            self.authority_override.load(Ordering::Acquire)
+            if self.authority_override.load(Ordering::Acquire) {
+                return true;
+            }
         }
-        #[cfg(not(test))]
-        {
-            false
-        }
+        (self.txn_authority_gate)()
     }
 
     #[cfg(test)]

@@ -226,6 +226,7 @@ impl MultiRaftManager {
     ) -> Self {
         state.set_node_id(node_id);
         state.set_capability_storage(base_kv.clone());
+        state.set_peer_transport(transport.clone());
         Self {
             node_id,
             advertise_addr,
