@@ -155,7 +155,16 @@ async fn node(
     }
 }
 async fn wait_leader(nodes: &[Node]) -> usize {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    // Bound derivation: after a leader loss, survivors honor the dead leader's
+    // lease (election_timeout_max = 4s), then wait out a randomized election
+    // timeout (<= 4s); a failed round (e.g. split vote between voters whose
+    // timers the dead leader's last heartbeat synchronized) retries within
+    // another 4s, and a survivor behind on logs waits an additional
+    // smaller_log_timeout (2x election_timeout_max) before campaigning. The
+    // winner then replicates its blank entry and answers ReadIndex over mTLS.
+    // 30s covers that passive path with several failed rounds; the explicit
+    // campaign triggered on failover (see replace_leader) lands in ~5s.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             for (i, node) in nodes.iter().enumerate() {
                 if node.raft.metrics().borrow().current_leader

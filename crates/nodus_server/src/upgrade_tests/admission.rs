@@ -31,6 +31,25 @@ async fn wait_for(
     .unwrap_or_else(|_| panic!("timed out after {timeout:?} waiting for {description}"));
 }
 
+/// Drive the idempotent admission the way production callers do (the join
+/// endpoint answers 409 and the joining node retries): ReadIndex and the
+/// admission write can transiently miss a quorum on a loaded runner while a
+/// restarted voter catches up. Failure still panics with the last error.
+async fn admit_with_retry(service: &RaftUpgradeCoordinator, node_id: u64, address: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match service.admit_member_locked(node_id, address).await {
+            Ok(()) => return,
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("admission of node {node_id} did not converge: {error:#}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn finalize(nodes: &[Node]) -> usize {
     let leader = wait_leader(nodes).await;
     nodes[leader]
@@ -57,6 +76,14 @@ async fn replace_leader(
     let old = nodes.remove(leader);
     let id = old.service.manager.node_id();
     old.stop().await;
+    // Survivors hold a committed vote for the stopped leader: they reject
+    // campaigns until its lease (election_timeout_max) expires and then wait
+    // out a randomized election timeout, with synchronized timers making split
+    // votes likely. Campaign exactly one survivor instead; its automatic
+    // retries land as soon as the lease expires, so failover takes ~lease time
+    // rather than lease + timeout + split-vote rounds. nodes[0] is always an
+    // original voter with a complete log (node 4 is only ever appended last).
+    nodes[0].raft.trigger().elect().await.unwrap();
     let next = wait_leader(nodes).await;
     let next_id = nodes[next].service.manager.node_id();
     let listener = TcpListener::bind(&members[&id].addr).await.unwrap();
@@ -295,16 +322,8 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
             .is_none()
     );
     let leader = replace_leader(&mut nodes, leader, dir.path(), &config, &members).await;
-    nodes[leader]
-        .service
-        .admit_member_locked(4, candidate)
-        .await
-        .unwrap();
-    nodes[leader]
-        .service
-        .admit_member_locked(4, candidate)
-        .await
-        .unwrap();
+    admit_with_retry(&nodes[leader].service, 4, candidate).await;
+    admit_with_retry(&nodes[leader].service, 4, candidate).await;
     assert!(
         nodes[leader]
             .service
