@@ -100,6 +100,8 @@ pub struct Metrics {
     pub raft_router_queue_depth: Gauge,
     pub raft_router_queue_high_water: Gauge,
     raft_router_queue_high_water_value: Arc<AtomicU64>,
+    /// Raft router submissions rejected because the in-flight bound was reached.
+    pub raft_router_overloads_total: Counter,
     /// Last-observed depth and monotonic high-water of the bounded commit queue.
     pub raft_commit_queue_depth: Gauge,
     pub raft_commit_queue_high_water: Gauge,
@@ -158,6 +160,7 @@ impl Default for Metrics {
             raft_router_queue_depth: Gauge::default(),
             raft_router_queue_high_water: Gauge::default(),
             raft_router_queue_high_water_value: Arc::new(AtomicU64::new(0)),
+            raft_router_overloads_total: Counter::default(),
             raft_commit_queue_depth: Gauge::default(),
             raft_commit_queue_high_water: Gauge::default(),
             raft_commit_queue_high_water_value: Arc::new(AtomicU64::new(0)),
@@ -336,6 +339,11 @@ impl Metrics {
             m.raft_router_queue_high_water.clone(),
         );
         registry.register(
+            "nodus_raft_router_overloads_total",
+            "Raft router submissions rejected because the in-flight bound was reached",
+            m.raft_router_overloads_total.clone(),
+        );
+        registry.register(
             "nodus_raft_commit_queue_depth",
             "Last-observed bounded Raft commit queue depth",
             m.raft_commit_queue_depth.clone(),
@@ -442,6 +450,10 @@ impl Metrics {
             &self.raft_router_queue_high_water_value,
             depth,
         );
+    }
+
+    pub fn inc_raft_router_overload(&self) {
+        self.raft_router_overloads_total.inc();
     }
 
     pub fn observe_raft_commit_queue(&self, depth: usize) {
@@ -701,6 +713,7 @@ mod tests {
         metrics.observe_intent_batch(4);
         metrics.observe_commit_batch(4, Duration::from_millis(1));
         metrics.inc_commit_batch_fallback("queue_full");
+        metrics.inc_raft_router_overload();
         metrics.observe_commit("batch", "success", Duration::from_millis(3));
         metrics
             .raft_log_entries
@@ -730,6 +743,7 @@ mod tests {
         assert!(buf.contains("nodus_commit_batch_size_count 1"));
         assert!(buf.contains("nodus_commit_batch_wait_seconds_count 1"));
         assert!(buf.contains("nodus_commit_batch_fallbacks_total_total{reason=\"queue_full\"} 1"));
+        assert!(buf.contains("nodus_raft_router_overloads_total_total 1"));
         assert!(
             buf.contains("nodus_commit_latency_seconds_count{mode=\"batch\",result=\"success\"} 1")
         );

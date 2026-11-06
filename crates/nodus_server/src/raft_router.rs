@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc, oneshot};
 
 use crate::multi_raft::MultiRaftManager;
 
@@ -36,6 +36,36 @@ type AuthorityHook = Arc<dyn Fn(&ShardCommand) -> Result<()> + Send + Sync>;
 const COMMIT_BATCH_MAX: usize = 32;
 const COMMIT_BATCH_WAIT: Duration = Duration::from_millis(1);
 const COMMIT_QUEUE_MAX: usize = 1024;
+
+/// Process-wide-per-router cap on concurrent in-flight router requests
+/// (`submit`, `submit_voting`, `read_barrier`, `repair_legacy`). Each in-flight
+/// request parks its caller's blocking-pool thread on `blocking_recv` for up to
+/// the full replicate retry budget (~5s for a group without a leader), so an
+/// unbounded number of stalled-group writes could exhaust Tokio's default
+/// 512-thread blocking pool and stall unrelated traffic. Bounding in-flight
+/// requests well below the pool size fails excess submissions fast instead.
+const ROUTER_IN_FLIGHT_MAX: usize = 256;
+
+/// The message every overload rejection carries. The pgwire layer maps it to
+/// SQLSTATE 53300 (too_many_connections) by exact prefix — keep the text in
+/// sync with `sqlstate_for_execution_error` in nodus_pgwire.
+pub const ROUTER_OVERLOAD_MESSAGE: &str = "server overloaded: too many in-flight Raft requests";
+
+#[derive(Debug)]
+struct RouterOverloadError;
+
+impl std::fmt::Display for RouterOverloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(ROUTER_OVERLOAD_MESSAGE)
+    }
+}
+
+impl std::error::Error for RouterOverloadError {}
+
+#[cfg(test)]
+pub(crate) fn is_router_overload(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RouterOverloadError>().is_some()
+}
 
 struct CommitRequest {
     shard_id: String,
@@ -94,6 +124,10 @@ enum RouterRequest {
 pub struct RaftRouter {
     tx: mpsc::UnboundedSender<RouterRequest>,
     commit_tx: mpsc::Sender<CommitRequest>,
+    /// Bounds requests parked in `blocking_recv` waiting on a response; the
+    /// unbounded channel below stays near-empty (the dispatcher drains it
+    /// instantly), so this semaphore — not the channel — is the real bound.
+    in_flight: Arc<Semaphore>,
     router_queue_depth: Arc<AtomicUsize>,
     commit_queue_depth: Arc<AtomicUsize>,
     /// Isolated-fixture override; combined (OR) with the durable gate.
@@ -125,6 +159,10 @@ impl RaftRouter {
             node_id: manager.node_id(),
             incarnation: uuid::Uuid::new_v4(),
         };
+        // The dispatcher drains this channel near-instantly, so its depth
+        // stays ~0 regardless of load; the `in_flight` semaphore (acquired
+        // before send, held until the response) is what actually bounds
+        // concurrent requests.
         let (tx, mut rx) = mpsc::unbounded_channel::<RouterRequest>();
         // All peer traffic — ordinary forwarded writes, read-index requests,
         // and migration-protocol commands — rides the manager's transport: plain
@@ -204,6 +242,7 @@ impl RaftRouter {
         Self {
             tx,
             commit_tx,
+            in_flight: Arc::new(Semaphore::new(ROUTER_IN_FLIGHT_MAX)),
             router_queue_depth,
             commit_queue_depth,
             migration_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -286,6 +325,32 @@ impl RaftRouter {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Isolated fixtures only: shrink the in-flight bound so overload tests
+    /// need only a few parked threads instead of `ROUTER_IN_FLIGHT_MAX`.
+    #[cfg(test)]
+    pub(crate) fn with_in_flight_limit_for_test(mut self, max: usize) -> Self {
+        self.in_flight = Arc::new(Semaphore::new(max));
+        self
+    }
+
+    /// Take one in-flight permit, or fail immediately once the bound is
+    /// reached: the caller must never park waiting for a permit (it runs on a
+    /// blocking-pool thread, and parking is exactly what this bound prevents).
+    /// The returned permit is held until the response arrives, so it — not
+    /// channel depth — bounds threads parked in `blocking_recv`.
+    fn try_acquire_in_flight(&self) -> Result<SemaphorePermit<'_>> {
+        match self.in_flight.try_acquire() {
+            Ok(permit) => Ok(permit),
+            Err(_) => {
+                if let Some(metrics) = self.metrics.get() {
+                    metrics.inc_raft_router_overload();
+                }
+                tracing::debug!("Raft router in-flight bound reached; rejecting request");
+                Err(anyhow::Error::new(RouterOverloadError))
+            }
+        }
+    }
+
     fn send_router_request(&self, request: RouterRequest) -> Result<usize> {
         let depth = self.router_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         match self.tx.send(request) {
@@ -318,6 +383,7 @@ impl RaftRouter {
         key: bytes::Bytes,
         replacement: nodus_storage_api::IntentReplacement,
     ) -> Result<()> {
+        let _permit = self.try_acquire_in_flight()?;
         let (resp, rx) = oneshot::channel();
         let depth = self.send_router_request(RouterRequest::RepairLegacy {
             shard_id: shard_id.to_string(),
@@ -339,7 +405,20 @@ impl RaftRouter {
     /// a subsequent local read observes the write (read-your-writes); a non-leader
     /// fails here with `ForwardToLeader`.
     pub fn submit(&self, shard_id: &str, cmd: ShardCommand) -> Result<()> {
-        let response = self.submit_inner(shard_id, cmd)?;
+        let permit = self.try_acquire_in_flight()?;
+        self.submit_with_permit(shard_id, cmd, permit)
+    }
+
+    /// [`Self::submit`] with an already-held in-flight permit, so a caller that
+    /// acquired one (`submit_commit`'s fallback) never takes a second permit
+    /// on the same thread.
+    fn submit_with_permit(
+        &self,
+        shard_id: &str,
+        cmd: ShardCommand,
+        permit: SemaphorePermit<'_>,
+    ) -> Result<()> {
+        let response = self.submit_inner_with_permit(shard_id, cmd, permit)?;
         anyhow::ensure!(
             response.success,
             "{}",
@@ -353,7 +432,8 @@ impl RaftRouter {
     /// Like [`Self::submit`] but returns the applied [`ShardResponse`], so the
     /// caller can read its `success` flag — used for the 2PC prepare vote.
     pub fn submit_voting(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
-        self.submit_inner(shard_id, cmd)
+        let permit = self.try_acquire_in_flight()?;
+        self.submit_inner_with_permit(shard_id, cmd, permit)
     }
 
     pub fn submit_commit(
@@ -367,6 +447,11 @@ impl RaftRouter {
             self.write_batch_enabled(),
             "write batching requires verified cluster-wide compatibility"
         );
+        // Acquired before touching the commit queue, so a saturated router
+        // fails fast; held across the batched-response wait — that park is
+        // what the bound exists to cap. The single-commit fallback reuses
+        // this permit (`submit_with_permit`), so no thread ever holds two.
+        let permit = self.try_acquire_in_flight()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         let request = CommitRequest {
             shard_id: shard_id.to_string(),
@@ -392,7 +477,10 @@ impl RaftRouter {
                     metrics.inc_commit_batch_fallback("queue_full");
                 }
                 tracing::debug!("Raft commit queue full; using single-commit fallback");
-                self.submit(
+                // An overload rejection can only come from the initial
+                // acquire above (which returns before this point), so the
+                // fallback never sees one and needs no unwrap carve-out.
+                self.submit_with_permit(
                     shard_id,
                     ShardCommand::EpochWriteV1 {
                         epoch,
@@ -401,6 +489,7 @@ impl RaftRouter {
                             commit_ts,
                         },
                     },
+                    permit,
                 )
                 .map_err(|error| error.context(SingleCommitFallbackError))?;
                 Ok(false)
@@ -415,7 +504,12 @@ impl RaftRouter {
         }
     }
 
-    fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
+    fn submit_inner_with_permit(
+        &self,
+        shard_id: &str,
+        cmd: ShardCommand,
+        _permit: SemaphorePermit<'_>,
+    ) -> Result<ShardResponse> {
         #[cfg(test)]
         if cmd.requires_txn_authority_protocol() {
             let hook = self.authority_hook.lock().unwrap().clone();
@@ -470,6 +564,7 @@ impl RaftRouter {
     ///
     /// MUST be called from a blocking context (it waits via `blocking_recv`).
     pub fn read_barrier(&self, shard_id: &str) -> Result<()> {
+        let _permit = self.try_acquire_in_flight()?;
         let (resp_tx, resp_rx) = oneshot::channel();
         let depth = self.send_router_request(RouterRequest::Barrier {
             shard_id: shard_id.to_string(),
@@ -815,5 +910,145 @@ mod tests {
         assert!(!is_single_commit_fallback(&anyhow!(
             "batched commit failed"
         )));
+    }
+
+    #[test]
+    fn identifies_router_overload_errors() {
+        assert!(is_router_overload(&anyhow::Error::new(RouterOverloadError)));
+        assert_eq!(
+            anyhow::Error::new(RouterOverloadError).to_string(),
+            ROUTER_OVERLOAD_MESSAGE
+        );
+        assert!(!is_router_overload(&anyhow!("raft group unavailable")));
+    }
+
+    /// A stalled group (no leader) parks every submission for the full ~5s
+    /// replicate retry budget — plain writes via `submit`, and batched commits
+    /// via `submit_commit` (the batch resolves only after the same ~5s
+    /// `replicate` budget). Once the in-flight bound is reached, further
+    /// requests of EITHER kind must fail IMMEDIATELY with the overload error
+    /// instead of parking another blocking-pool thread, and the stalled
+    /// requests must release their permits when they error out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_bound_fails_fast_and_releases_permits() {
+        use nodus_raftstore::ShardCommand;
+        use nodus_storage_api::TxnId;
+
+        const TEST_LIMIT: usize = 4;
+
+        let base: Arc<dyn nodus_storage_api::KvEngine> =
+            Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let manager = Arc::new(crate::multi_raft::MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            Arc::new(openraft::Config::default().validate().unwrap()),
+            nodus_raftstore::server::RaftState::new(),
+            base,
+            None,
+            Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
+            Default::default(),
+        ));
+        // A group that exists but is never initialized elects no leader, so
+        // every write to it retries for the whole replicate budget.
+        manager.get_or_create_data("shard-stalled").await.unwrap();
+        let metrics = nodus_monitoring::Metrics::default();
+        let router = RaftRouter::spawn(manager.clone())
+            .with_write_batch_gate(|| true)
+            .with_in_flight_limit_for_test(TEST_LIMIT);
+        router.attach_metrics(&metrics);
+
+        fn command() -> ShardCommand {
+            ShardCommand::PutIntent {
+                txn_id: "txn".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                shard_id: Some("shard-stalled".into()),
+            }
+        }
+
+        // Saturate the router with a MIX of parked requests: two plain writes
+        // and two batched commits, each parked ~5s.
+        let mut parked = Vec::new();
+        for _ in 0..TEST_LIMIT / 2 {
+            let writer = router.clone();
+            parked.push(tokio::task::spawn_blocking(move || {
+                writer.submit("shard-stalled", command())
+            }));
+            let committer = router.clone();
+            parked.push(tokio::task::spawn_blocking(move || {
+                committer
+                    .submit_commit("shard-stalled", 0, TxnId::new(), 10)
+                    .map(|_| ())
+            }));
+        }
+        // Wait until every parked request actually holds a permit.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while router.in_flight.available_permits() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "submissions never saturated the in-flight bound"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Beyond the bound, BOTH a plain submission and a batched commit fail
+        // fast with the overload error — far below the ~5s retry budget a
+        // parked request would spend.
+        let started = Instant::now();
+        let router2 = router.clone();
+        let error = tokio::task::spawn_blocking(move || router2.submit("shard-stalled", command()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error.to_string(), ROUTER_OVERLOAD_MESSAGE);
+        assert!(is_router_overload(&error));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "overload must fail fast, not park for the retry budget: {elapsed:?}"
+        );
+
+        let started = Instant::now();
+        let router2 = router.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            router2.submit_commit("shard-stalled", 0, TxnId::new(), 10)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error.to_string(), ROUTER_OVERLOAD_MESSAGE);
+        assert!(is_router_overload(&error));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "submit_commit overload must fail fast, not park for the retry budget: {elapsed:?}"
+        );
+        assert_eq!(metrics.raft_router_overloads_total.get(), 2);
+
+        // The stalled requests exhaust their retry budget, error out, and
+        // release their permits.
+        for handle in parked {
+            let error = handle.await.unwrap().unwrap_err();
+            assert!(
+                error.to_string().contains("did not reach a leader"),
+                "stalled request fails from the retry budget: {error}"
+            );
+        }
+        assert_eq!(router.in_flight.available_permits(), TEST_LIMIT);
+
+        // New submissions are accepted again: this one passes the bound and
+        // fails fast only because its group does not exist.
+        let started = Instant::now();
+        let error = tokio::task::spawn_blocking(move || router.submit("shard-x", command()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a freed permit must admit the next submission immediately"
+        );
+        manager.shutdown_all().await;
     }
 }

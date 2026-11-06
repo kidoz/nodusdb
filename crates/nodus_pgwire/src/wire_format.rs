@@ -27,6 +27,13 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     if err_str == "prepared transactions are disabled" {
         return "55000"; // object_not_in_prerequisite_state
     }
+    // The Raft router's in-flight bound rejected the submission instead of
+    // parking the thread (see `ROUTER_OVERLOAD_MESSAGE` in
+    // nodus_server::raft_router — keep the text in sync). Transient: the
+    // client may retry once the stalled group recovers or drains.
+    if err_str.starts_with("server overloaded: too many in-flight Raft requests") {
+        return "53300"; // too_many_connections
+    }
     // Routing retries and unsupported consistency modes.
     if err_str.starts_with("shard unavailable:") || err_str.starts_with("shard routing changed") {
         "40001" // serialization_failure: retry against a current, available route
@@ -691,6 +698,28 @@ mod tests {
         };
         assert_eq!(info.code, "0A000");
         assert_eq!(info.message, "CREATE FUNCTION is not supported");
+    }
+
+    #[test]
+    fn maps_router_overload_to_too_many_connections() {
+        // The exact message `RaftRouter` raises when its in-flight bound is
+        // reached (ROUTER_OVERLOAD_MESSAGE in nodus_server::raft_router).
+        assert_eq!(
+            sqlstate_for_execution_error("server overloaded: too many in-flight Raft requests"),
+            "53300"
+        );
+        // Trailing executor error fields must not break the match.
+        assert_eq!(
+            sqlstate_for_execution_error(
+                "server overloaded: too many in-flight Raft requests\u{1f}detail=router saturated"
+            ),
+            "53300"
+        );
+        // An unrelated overload phrasing still falls back to internal_error.
+        assert_eq!(
+            sqlstate_for_execution_error("server overloaded: disk full"),
+            "XX000"
+        );
     }
 
     #[test]
