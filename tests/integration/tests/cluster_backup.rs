@@ -66,20 +66,40 @@ async fn rows_on(client: &tokio_postgres::Client, expect: usize) -> Vec<i32> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial_test::serial]
 async fn cluster_backup_covers_every_shard_exactly_once() {
+    backup_round_trip(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial_test::serial]
+async fn tracked_cluster_backup_restores_rows_indexes_and_new_transaction_writes() {
+    backup_round_trip(true).await;
+}
+
+async fn backup_round_trip(tracked: bool) {
     let dir = tempfile::tempdir().unwrap();
     let certs = nodus_testkit::write_test_certs(dir.path());
     let repo = tempfile::tempdir().unwrap();
     let repo_uri = format!("file://{}", repo.path().to_string_lossy());
     let cluster = ClusterFixture::start_cluster_mtls(3, &certs, {
         let repo_uri = repo_uri.clone();
-        move |config| config.backup.repository_uri = repo_uri.clone()
+        move |config| {
+            config.backup.repository_uri = repo_uri.clone();
+            config.cluster.raft_heartbeat_ms = 200;
+            config.cluster.raft_election_timeout_min_ms = 2000;
+            config.cluster.raft_election_timeout_max_ms = 4000;
+        }
     })
     .await
     .unwrap();
 
     finalize(&cluster, "snapshot-v2").await;
     finalize(&cluster, "migration-v3").await;
+    if tracked {
+        finalize(&cluster, "write-batching-v4").await;
+        finalize(&cluster, "transaction-authority-v5").await;
+    }
 
     let seed = connect(cluster.nodes[0].pgwire_addr()).await;
     seed.batch_execute("CREATE TABLE t (id INT PRIMARY KEY, note TEXT)")
@@ -179,9 +199,14 @@ async fn cluster_backup_covers_every_shard_exactly_once() {
     }
 
     // Restore into a fresh cluster replicates to every member.
-    let restored = ClusterFixture::start_cluster_mtls(3, &certs, {
+    let mut restored = ClusterFixture::start_cluster_mtls(3, &certs, {
         let repo_uri = repo_uri.clone();
-        move |config| config.backup.repository_uri = repo_uri.clone()
+        move |config| {
+            config.backup.repository_uri = repo_uri.clone();
+            config.cluster.raft_heartbeat_ms = 200;
+            config.cluster.raft_election_timeout_min_ms = 2000;
+            config.cluster.raft_election_timeout_max_ms = 4000;
+        }
     })
     .await
     .unwrap();
@@ -193,5 +218,52 @@ async fn cluster_backup_covers_every_shard_exactly_once() {
     for idx in 0..3 {
         let client = connect(restored.nodes[idx].pgwire_addr()).await;
         assert_eq!(rows_on(&client, 5).await, [1, 2, 3, 10, 20]);
+        assert_eq!(
+            client
+                .query_one("SELECT id FROM t WHERE note = 'b'", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            2
+        );
+    }
+    if tracked {
+        for target in [
+            "snapshot-v2",
+            "migration-v3",
+            "write-batching-v4",
+            "transaction-authority-v5",
+        ] {
+            finalize(&restored, target).await;
+        }
+        let client = connect(restored.nodes[1].pgwire_addr()).await;
+        client
+            .batch_execute("INSERT INTO t VALUES (30,'restored-write')")
+            .await
+            .unwrap();
+        for idx in 0..3 {
+            let client = connect(restored.nodes[idx].pgwire_addr()).await;
+            assert_eq!(rows_on(&client, 6).await, [1, 2, 3, 10, 20, 30]);
+            assert_eq!(
+                client
+                    .query_one("SELECT id FROM t WHERE note='restored-write'", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i32>(0),
+                30
+            );
+        }
+        drop(client);
+        restored.restart(1).await.unwrap();
+        let client = connect(restored.nodes[1].pgwire_addr()).await;
+        assert_eq!(rows_on(&client, 6).await, [1, 2, 3, 10, 20, 30]);
+        assert_eq!(
+            client
+                .query_one("SELECT id FROM t WHERE note='restored-write'", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            30
+        );
     }
 }

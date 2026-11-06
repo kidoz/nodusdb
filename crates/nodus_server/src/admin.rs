@@ -1529,7 +1529,7 @@ enum RestoreFailure {
 /// else means the destination has (or once had) user/catalog/cluster data, so
 /// an overlaying restore would silently merge two states.
 fn is_restore_bootstrap_key(key: &[u8]) -> bool {
-    nodus_backup::is_backup_excluded_key(key)
+    (nodus_backup::is_backup_excluded_key(key) && !nodus_backup::is_transaction_control_key(key))
         || key == crate::HLC_WATERMARK_KEY
         || key == nodus_executor::CATALOG_STATE_KEY
 }
@@ -2660,6 +2660,18 @@ ALTER TABLE ONLY t ADD CONSTRAINT t_pkey PRIMARY KEY (id);
 #[cfg(test)]
 mod restore_tests {
     use super::*;
+
+    #[test]
+    fn source_transaction_control_is_excluded_but_makes_destination_nonempty() {
+        for key in [
+            b"\x01txn-authority/v1/txn".as_slice(),
+            b"shard-7\0\x01txn-participant/v1/txn",
+            b"\x01txn-resolution/v1/high-water",
+        ] {
+            assert!(nodus_backup::is_backup_excluded_key(key));
+            assert!(!is_restore_bootstrap_key(key));
+        }
+    }
 
     fn engine_and_catalog() -> (
         std::sync::Arc<dyn nodus_storage_api::KvEngine>,

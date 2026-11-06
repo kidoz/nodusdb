@@ -170,6 +170,11 @@ use std::path::{Path, PathBuf};
 ///   resurrected onto a restored node.
 /// - `\x01backup/…` — backup job journals: transient control state for an
 ///   in-flight export, likewise never resurrected.
+/// - `\x01txn-authority/…`, `\x01txn-participant/…`, `\x01txn-resolution/…`
+///   — source-cluster transaction fences and Raft-indexed resolution work.
+///   Logical restore publishes committed user versions on a new lineage;
+///   source coordinators, prepared intents and their private progress do not
+///   resume there. Raft snapshots retain these records within the cluster.
 ///
 /// Everything else round-trips deliberately: user/catalog data, `meta:*`
 /// shard maps and placements, `\x00catalog\x00state`, `\x00txn2pc\x00…` 2PC
@@ -182,6 +187,16 @@ pub fn is_backup_excluded_key(key: &[u8]) -> bool {
         || inner.starts_with(b"\x01upgrade/")
         || inner.starts_with(b"\x01migration/")
         || inner.starts_with(b"\x01backup/")
+        || is_transaction_control_key(key)
+}
+
+/// Source-cluster transaction state excluded from logical backup/PITR. Its
+/// presence at a restore destination still means that destination was used.
+pub fn is_transaction_control_key(key: &[u8]) -> bool {
+    let inner = shard_namespace_inner(key);
+    inner.starts_with(b"\x01txn-authority/")
+        || inner.starts_with(b"\x01txn-participant/")
+        || inner.starts_with(b"\x01txn-resolution/")
 }
 
 /// Strips a `shard-{id}\0` data-group namespace prefix, returning the inner
@@ -1916,6 +1931,9 @@ mod tests {
             // Same namespaces inside a data-group shard prefix.
             b"shard-1234\0\x00raft\x00vote",
             b"shard-1234\0\x01migration/v1/fence",
+            b"\x01txn-authority/v1/txn",
+            b"shard-1234\0\x01txn-participant/v1/txn",
+            b"\x01txn-resolution/v1/high-water",
         ] {
             assert!(
                 is_backup_excluded_key(key),
@@ -1948,6 +1966,9 @@ mod tests {
             name: "kv_data.json".into(),
             bytes: Bytes::from(
                 serde_json::to_vec(&serde_json::json!([
+                    {"key": b"\x01txn-authority/v1/txn".to_vec(), "value": b"foreign-owner".to_vec(), "deleted": false, "version": 10},
+                    {"key": b"shard-7\0\x01txn-participant/v1/txn".to_vec(), "value": b"foreign-prepare".to_vec(), "deleted": false, "version": 10},
+                    {"key": b"\x01txn-resolution/v1/high-water".to_vec(), "value": b"foreign-index".to_vec(), "deleted": false, "version": 10},
                     {"key": b"row".to_vec(), "value": b"v".to_vec(), "deleted": false, "version": 10},
                     {"key": b"\x00raft\x00vote".to_vec(), "value": b"foreign-vote".to_vec(), "deleted": false, "version": 10},
                     {"key": b"shard-7\0\x00raft\x00applied".to_vec(), "value": b"foreign-applied".to_vec(), "deleted": false, "version": 10},
@@ -1968,6 +1989,9 @@ mod tests {
             b"shard-7\0\x00raft\x00applied",
             b"\x01migration/v1/fence",
             b"\x00recovery\x00generation",
+            b"\x01txn-authority/v1/txn",
+            b"shard-7\0\x01txn-participant/v1/txn",
+            b"\x01txn-resolution/v1/high-water",
         ] {
             assert!(
                 kv.get(excluded, 100).unwrap().is_none(),
@@ -1979,6 +2003,14 @@ mod tests {
         let txn = TxnId::new();
         let wal = test_wal_bytes(vec![
             WalRecord::V1(WalRecordV1::BeginTxn { txn_id: txn }),
+            // A real tracked participant commits data and its private marker
+            // in one transaction. Filtering the marker must retain the data.
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: txn,
+                key: b"restored-user-row".to_vec(),
+                value: b"committed-with-marker".to_vec(),
+                started_at: None,
+            }),
             WalRecord::V1(WalRecordV1::WriteIntent {
                 txn_id: txn,
                 key: b"\x00raft\x00vote".to_vec(),
@@ -1994,6 +2026,24 @@ mod tests {
             WalRecord::V1(WalRecordV1::DeleteIntent {
                 txn_id: txn,
                 key: b"\x00recovery\x00generation".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: txn,
+                key: b"\x01txn-authority/v1/txn".to_vec(),
+                value: b"foreign-owner".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: txn,
+                key: b"shard-7\0\x01txn-participant/v1/txn".to_vec(),
+                value: b"foreign-prepare".to_vec(),
+                started_at: None,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: txn,
+                key: b"\x01txn-resolution/v1/high-water".to_vec(),
+                value: b"foreign-index".to_vec(),
                 started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
@@ -2030,10 +2080,17 @@ mod tests {
         let plan = orch.plan_pitr_restore(20).await.unwrap();
         let segments = orch.load_pitr_wal_segments(&plan).await.unwrap();
         BackupOrchestrator::replay_pitr_wal_segments(&plan, &segments, &kv, None).unwrap();
+        assert_eq!(
+            kv.get(b"restored-user-row", 20).unwrap().as_deref(),
+            Some(b"committed-with-marker".as_slice())
+        );
         for excluded in [
             b"\x00raft\x00vote".as_slice(),
             b"\x01migration/v2/table/t",
             b"\x00recovery\x00generation",
+            b"\x01txn-authority/v1/txn",
+            b"shard-7\0\x01txn-participant/v1/txn",
+            b"\x01txn-resolution/v1/high-water",
         ] {
             assert!(
                 kv.get(excluded, 100).unwrap().is_none(),

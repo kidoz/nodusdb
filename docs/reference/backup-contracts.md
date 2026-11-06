@@ -33,6 +33,13 @@ data-group namespaces:
 - `\x00recovery\x00generation` — the local storage recovery generation.
 - `\x01upgrade/…` — upgrade authority and admission ledger.
 - `\x01migration/…` — shard-migration fences and coordinator journals.
+- `\x01backup/…` — in-flight backup journals.
+- `\x01txn-authority/…`, `\x01txn-participant/…`, `\x01txn-resolution/…` —
+  source-cluster coordinator fences and Raft-indexed resolution progress.
+  These transfer through Raft snapshots within a cluster. Logical restore and
+  PITR publish committed user versions on a new lineage; they do not resume
+  source coordinators or prepared intents. Transaction control records at a
+  destination still make it nonempty, preventing an overlay restore.
 
 Everything else round-trips deliberately: user and catalog data, `meta:*`
 shard maps and placements, the `\x00catalog\x00state` blob, `\x00txn2pc\x00…`
