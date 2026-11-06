@@ -228,6 +228,11 @@ async fn authenticated_upgrade_survives_leader_loss_and_requires_every_member() 
     let old = nodes.remove(leader);
     let old_id = old.service.manager.node_id();
     old.stop().await;
+    // Campaign one surviving voter instead of passively waiting out the dead
+    // leader's lease plus randomized election timeouts and likely split-vote
+    // rounds (same reasoning as replace_leader in admission.rs); both
+    // survivors are original voters with complete logs.
+    nodes[0].raft.trigger().elect().await.unwrap();
     let new_leader = wait_leader(&nodes).await;
     assert_eq!(
         nodes[new_leader].service.get_state().await.unwrap()["phase"],
