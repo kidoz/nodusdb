@@ -157,9 +157,13 @@ positive-value validation, and environment override. It now sets the age at
 which an unknown-owned intent is reported as uncertain, and continues to set
 the inspection cadence (half the threshold, clamped to 1–30 seconds). Expiry
 does not authorize abort. Inspection emits no transaction protocol records.
-The [dormant ownership and participant protocol](../explanation/transaction-authority.md)
-has versioned durable records and race/recovery tests, but production activation
-and automatic orphan cleanup remain unavailable at cluster levels 1–4.
+The [ownership and participant protocol](../explanation/transaction-authority.md)
+activates only after `transaction-authority-v5` finalization with authenticated
+readers on every voter and learner. Its bounded meta-leader worker replays only
+terminal decisions and persists participant acknowledgements. Active, Preparing
+and unknown legacy transactions remain protected from automatic abort. Levels
+1–4 keep the legacy protocol. Logical backup/PITR excludes source transaction
+fences and Raft-indexed recovery progress while retaining committed user data.
 
 The latest successful sweep updates these Prometheus samples:
 
@@ -176,8 +180,8 @@ writers, migration fencing, MVCC retention progress, or legacy snapshot builds
 and log reclamation. Fencing must remain blocked until resolution is known;
 shortening the threshold is not a safe cleanup mechanism. Automatic cleanup
 requires a durable cluster-wide ownership/abort-decision authority that fences
-late commits. That protocol and bounded orphan reclamation remain follow-up
-work. The two-node tests prove the targeted safety regressions, not general
+late commits. The tracked ownership protocol is available at level 5, but automatic orphan
+abort and bounded decision reclamation remain follow-up work. The two-node tests prove the targeted safety regressions, not general
 distributed isolation, process-crash recovery of undecided transactions, or
 power-loss behavior.
 

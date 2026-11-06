@@ -1,12 +1,12 @@
 # Transaction ownership and decisions
 
-This is a staged design for safe transaction recovery. Authority, participant
-fencing and coordinator integration are implemented, with activation available
-only in isolated tests. Normal SQL transactions still use the existing
-commit-only 2PC journal. Automatic intent cleanup remains disabled.
+Tracked transactions activate only after **`transaction-authority-v5`** is
+finalized. Levels 1–4 retain the existing commit-only 2PC protocol. The meta
+leader automatically replays terminal tracked decisions with durable progress;
+undecided and untracked transactions remain protected from automatic abort.
 
-**Status:** participant and coordinator integration implemented; production
-activation unavailable, 2026-11-05.
+**Status:** production activation and bounded terminal recovery implemented,
+2026-11-05. Performance and safe decision reclamation remain unqualified.
 
 ## Why a separate authority exists
 
@@ -48,17 +48,17 @@ legacy transactions.
 
 ## Acknowledgement and participant boundary
 
-Both dormant command families can be applied through Raft for tests; every
-public forwarded write rejects them, including authenticated peer traffic.
-The production router has no activation path. Authority success means its
-conditional transition was committed and applied; user commit success additionally
-requires resolution on every enrolled participant.
+Authority, participant and resolution commands require finalized level 5 and
+peer mTLS at forwarded ingress. The production router reads the durable gate.
+Authority success means its conditional transition was committed and applied;
+user commit success additionally requires resolution on every enrolled
+participant. Existing legacy transactions stay on their original protocol.
 
 The implemented coordinator enrolls each participant through meta Raft **before
 sending its first intent**, freezes the complete set, prepares every participant,
 durably decides commit, and resolves from a fresh linearizable authority read.
 Single-shard transactions, batches, deletes and savepoint repairs use the same
-protocol. The protocol is pinned at a transaction's first write, so future
+protocol. The protocol is pinned at a transaction's first write, so
 activation cannot convert a live legacy transaction halfway through its work.
 
 Participant records bind the owner, generation and shard epoch. Prepare compares
@@ -91,67 +91,108 @@ storage lookups on legacy writes in untouched groups. That guard is recovered at
 startup and set before participant apply or snapshot installation; it never
 clears while a store is live.
 
-A local replica read or a caller-supplied record is not a decision certificate:
-the trusted resolver establishes the authoritative meta decision through
-ReadIndex before constructing a resolution. Production activation must restrict
-these messages to authenticated peer transport and compatible readers; accepting
-an arbitrary JSON record is insufficient.
+A local replica read or a caller-supplied record is not a decision certificate.
+The resolver reads through meta ReadIndex, and forwarded participant writes,
+prepares and resolutions independently pass another meta ReadIndex before the
+receiver compares owner, generation, epoch, phase and the exact terminal record
+to canonical authority. A forged or stale decision is rejected even from a
+CA-authenticated peer. Without meta quorum, resolution is deferred.
 
-On coordinator failure, a meta leader can read and conditionally fence-abort a
-pending record; a concurrent commit and fence-abort serialize in meta Raft.
-If commit wins, recovery finishes commit. If abort wins, the delayed coordinator
-cannot obtain a commit decision. Without a meta quorum, no new decision can be
-made; availability yields to safety. Partial participant resolution must resume
-from the retained decision. Existing untracked intents remain protected.
+## Bounded terminal recovery
+
+The terminal decision atomically publishes a pending queue entry, progress record
+and high-water index in the same KV transaction as the authority. The queue is
+ordered by the meta Raft index. After a participant acknowledges resolution,
+the resolver replicates that group's acknowledgement through meta Raft. A lost
+response safely repeats participant resolution. Once all groups acknowledge,
+the queue entry is deleted and compact completion proof is retained.
+
+On meta leadership gain and periodic ticks, the existing recovery loop scans at
+most 32 pending transactions and attempts at most 16 participant steps per pass.
+It checks a two-second budget between RPCs; a single RPC can exceed that budget
+within its own transport/retry timeout. A replicated conditional cursor persists
+scan progress. Each cycle fixes its end index, so continuous incoming work cannot
+prevent wrapping. Failed participants stay queued and later transactions get
+another turn. Tracked replay runs before the legacy journal, so a failed legacy
+record cannot starve this queue. Storage/decode failures stop the pass rather than hide corruption.
+The existing recovery metric counts completed transactions; pass summaries and
+participant failures are logged.
+
+The worker never chooses abort. Active and Preparing records have no terminal
+queue entry. Explicit internal recovery can conditionally fence-abort a tracked
+pending record; commit and fence-abort serialize in meta Raft. This is not an
+operator cleanup API and is not invoked by the automatic worker or intent janitor.
+Unknown legacy intents remain protected.
+
+Snapshots preserve pending work, acknowledgements, high water and cursor.
+Installation rejects an omitted pending entry unless the incoming snapshot also
+contains its durable completion proof, and rejects acknowledgement or decision
+rollback. Logical backups and PITR omit these source-cluster control records:
+they restore committed user versions on a new lineage, without resuming source
+coordinators. A restore destination containing transaction records counts as
+used, so their export exclusion cannot authorize an overlay restore.
 
 ## Compatibility and rollback
 
 | Binary and cluster | Writers | Readers |
 | --- | --- | --- |
-| Existing binary, levels 1–4 | Existing transaction formats | Existing formats; unknown authority command fails closed |
-| New binary, levels 1–4 | Same existing transaction formats | Existing formats plus dormant authority records |
-| Future activation | Requires a new finalized level and capability evidence from every voter and learner | Requires authority and participant enforcement on every member |
+| Previous binary, levels 1–4 | Existing formats | Existing formats |
+| New binary, levels 1–4 | Existing formats; no new transaction records | Existing and tracked formats |
+| New binary, finalized level 5 | Tracked writes for newly selected transactions; legacy transactions can finish | Authority, participant and resolution enforcement |
 
-This stage adds no upgrade target, capability claim, configuration switch or
-janitor writer. Level 4 is insufficient to enable it. Commands are appended to
-the enum, preserving old variant ordinals, and authority and participant keys
-are reserved against ordinary and epoch-aware mutations. Normal traffic produces
-no new protocol records, so rollback has no new format boundary in this stage.
-Test-created protocol data is not a supported old-binary input. Rejection of
-historical recorded-ID cleanup can retain additional unknown intents; it never
-converts them into a commit or an authoritative abort.
-Activation will close rollback at its finalized format boundary and must update
-node admission, snapshot capability checks and the mixed-binary matrix together.
+The target is sequential after `write-batching-v4`. Start, refresh and finalize
+require fresh challenge-bound `txn_authority_version >= 1` reports from **every
+voter and learner**, as well as earlier level prerequisites. Production nodes
+omit this capability unless peer mTLS is configured. Before finalization,
+`transaction_authority` stays false and no tracked records are emitted by SQL.
+There is no configuration switch that bypasses finalization.
+
+The level-5 target is explicit in its version-1 upgrade command. Levels 2–4 keep
+the historical command representation; optional capabilities are omitted from
+persisted base reports. Admission records also omit the new capability below
+level 5, matching readers that discard the optional field. The sender re-probes a recipient before transmitting the
+first level-5 control command or tracked command. During the level-5 upgrade and
+after finalization, consensus senders and receivers require fresh reader evidence
+for append, vote and every snapshot chunk, including cached/resumed streams.
+Admission approval and retries enforce the same requirement before catch-up or
+promotion. Restart without configured mTLS refuses this reader boundary.
+
+Finalization is irreversible. Rollback to level 1 is allowed only before the
+first finalized level and before any admission ledger exists. The current admin service refuses rollback across prior finalized levels.
+Version-1 apply retains the old level-2/3 rollback result for deterministic mixed
+readers; do not issue those later rollbacks through an older coordinator. The
+level-5 all-reader fence permits the stronger replicated refusal at level 4. Replacing a
+level-5 member with a readerless executable is unsupported and fenced by current
+peers; the actual-binary gate also tests the pinned level-4 reader's startup
+refusal against level-5 data.
 
 ## Verification and remaining work
 
-Authority tests cover conditional decision orderings, concurrent single-voter Raft requests,
-stale generations and revisions, invalid or future records, namespace protection,
-ingress rejection, and process-exit recovery after acknowledged Raft decisions.
-Participant and coordinator tests use two independent LSM-backed nodes over real
-TCP, with one voter and one learner per group and different data-group leaders.
-A test-only loopback write handler allows the dormant messages; production
-ingress rejection is tested separately at every existing cluster level.
+Tests cover conditional decision orderings, stale tokens, namespace protection,
+exact prepare sets, legacy bypass rejection, and snapshots preserving pending
+work or proof of completion. The coordinator fixture uses two LSM-backed nodes,
+one voter and one learner per group, real mTLS, production handlers, sequential
+level-5 finalization and different data-group leaders. Coordinator pauses test
+both commit/fence-abort orderings. SQL tests verify rows, indexes and savepoints.
+An unavailable meta voter protects intents and blocks supplied decisions.
 
-The tests pause the actual coordinator after prepare, let recovery fence-abort
-through meta Raft, resolve all participants, resume the coordinator, and reject
-its delayed mutations. The opposite ordering lets commit win and both resolvers
-converge. SQL tests verify rows, unique indexes and rollback to savepoint across
-data and meta participants. Stopping the sole meta voter leaves data intents
-protected until the authority restarts. Process-exit tests terminate the whole
-fixture after the durable decision, after the marker's WAL intent but before
-commit, and after acknowledged user commit; reopening both stores recovers every
-committed value. Snapshot tests retain participant fences and reject omissions.
-These crash tests also exposed unfinished local applied-state writes blocking
-restart. Exclusive group startup now recovers unpublished Raft metadata writes
-as described in the [durability contract](../reference/durability-contract.md#raft-log-purge),
-while preserving all uncertain user intents.
-This is not a deterministic simulation, a multi-voter partition test, a real
-production-binary activation test, or power-loss evidence.
+Process-exit tests stop after the durable decision, after the participant marker
+intent before atomic user commit, and after acknowledgement. Reopen and automatic
+terminal replay recover committed values. The timer-driven recovery test retains
+one failed transaction while completing a later transaction and preserving a live
+owner. Exclusive startup recovers unpublished Raft metadata as described in the
+[durability contract](../reference/durability-contract.md#raft-log-purge).
 
-The next slice is a new finalized upgrade level, reader capability checks on
-every voter and learner, authenticated forwarding, admission and snapshot
-compatibility, and an expanded mixed-binary matrix. Performance of the additional
-meta barriers and tracked-group legacy lookups is not qualified. Only after that
-gate may automatic recovery consider tracked pending transactions; legacy intents
-remain protected. Safe reclamation of retained decisions is separate future work.
+The candidate [mixed-binary gate](../how-to/test-mixed-binary-upgrades.md) adds
+level-4 reader refusal, level-5 finalization, production forwarded SQL, forged
+decision rejection, SIGKILL/failover/restart, snapshot catch-up, and incompatible
+admission/downgrade checks. Its result file records completion and blockers for
+the exact candidate. This is not a power-loss, Byzantine, sustained-load or
+concurrent-history linearizability proof.
+
+Additional meta barriers and reader re-probes add latency; throughput has not
+been qualified. Terminal authority, participant fences and completion proofs
+remain retained. Their accumulated size is subject to the existing 128 MiB
+snapshot limit, so this gate is not sustained-load qualification. Safe
+reclamation, streaming snapshots and automatic abort of orphaned tracked owners
+are separate work; legacy orphan cleanup remains disabled.
