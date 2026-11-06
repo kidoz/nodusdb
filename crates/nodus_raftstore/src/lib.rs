@@ -35,6 +35,7 @@ mod control_recovery;
 pub mod migration;
 pub mod network;
 mod purge;
+pub mod read_barrier;
 pub mod server;
 mod snapshots;
 pub use snapshots::v2::SnapshotCompatibility;

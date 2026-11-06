@@ -18,7 +18,7 @@
 use anyhow::{Result, anyhow};
 use nodus_raftstore::{NodusTypeConfig, ShardCommand, ShardResponse};
 use openraft::Raft;
-use openraft::error::{CheckIsLeaderError, ClientWriteError, ForwardToLeader, RaftError};
+use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -33,9 +33,6 @@ type WriteResult = Result<ShardResponse>;
 #[cfg(test)]
 type AuthorityHook = Arc<dyn Fn(&ShardCommand) -> Result<()> + Send + Sync>;
 
-/// How long a follower waits for its state machine to catch up to the leader's
-/// read index before giving the linearizable read up (and retrying).
-const BARRIER_WAIT: Duration = Duration::from_secs(5);
 const COMMIT_BATCH_MAX: usize = 32;
 const COMMIT_BATCH_WAIT: Duration = Duration::from_millis(1);
 const COMMIT_QUEUE_MAX: usize = 1024;
@@ -685,6 +682,16 @@ async fn replicate(
                         &request_id,
                     )
                     .await
+                } else if cmd.requires_txn_authority_protocol() {
+                    forward_txn_protocol(
+                        transport,
+                        leader_id,
+                        &node.addr,
+                        group_id,
+                        &cmd,
+                        &request_id,
+                    )
+                    .await
                 } else {
                     transport
                         .forward_command(&node.addr, group_id, &cmd, &request_id)
@@ -708,6 +715,22 @@ async fn replicate(
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     Err(anyhow!("raft write to '{group_id}' did not reach a leader"))
+}
+
+async fn forward_txn_protocol(
+    transport: &nodus_raftstore::network::RaftTransport,
+    leader_id: Option<u64>,
+    addr: &str,
+    group: &str,
+    cmd: &ShardCommand,
+    request_id: &str,
+) -> WriteResult {
+    let id = leader_id.ok_or_else(|| anyhow!("transaction forward leader is unknown"))?;
+    let report = transport
+        .probe(id, addr, uuid::Uuid::new_v4(), false)
+        .await?;
+    nodus_raftstore::upgrade::require_txn_reader(&report)?;
+    transport.forward_write(addr, group, cmd, request_id).await
 }
 
 /// Forwards a migration-protocol command to the group's leader over the peer
@@ -763,46 +786,7 @@ async fn linearizable_barrier(
     group_id: &str,
     transport: &nodus_raftstore::network::RaftTransport,
 ) -> Result<()> {
-    for _ in 0..25 {
-        match raft.ensure_linearizable().await {
-            // Leader: leadership confirmed and the state machine is caught up.
-            Ok(_) => return Ok(()),
-            // Follower: fetch the leader's read index, then wait for our own
-            // state machine to catch up to it before reading locally.
-            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
-                leader_node: Some(node),
-                ..
-            }))) => {
-                match transport.read_index(&node.addr, group_id).await {
-                    Ok(Some(index)) => {
-                        raft.wait(Some(BARRIER_WAIT))
-                            .applied_index_at_least(Some(index), "linearizable read barrier")
-                            .await
-                            .map_err(|e| {
-                                anyhow!("await applied index {index} for {group_id}: {e}")
-                            })?;
-                        return Ok(());
-                    }
-                    // Empty leader log — nothing committed yet, so nothing to wait for.
-                    Ok(None) => return Ok(()),
-                    Err(e) => {
-                        tracing::debug!("read-index for {group_id} from {} failed: {e}", node.addr)
-                    }
-                }
-            }
-            // No known leader, or leadership unconfirmable for now — retry.
-            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
-                leader_node: None,
-                ..
-            })))
-            | Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {}
-            Err(e) => return Err(anyhow!("linearizable barrier on {group_id}: {e}")),
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    Err(anyhow!(
-        "linearizable barrier on '{group_id}' did not converge"
-    ))
+    nodus_raftstore::read_barrier::ensure_local(raft, group_id, transport).await
 }
 
 #[cfg(test)]

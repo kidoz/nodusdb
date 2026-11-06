@@ -71,6 +71,19 @@ impl RaftTransport {
             Ok(crate::upgrade::admission::read(kv.as_ref())?.is_some())
         })
     }
+    fn requires_txn_reader(&self) -> anyhow::Result<bool> {
+        self.admission_source.as_ref().map_or(Ok(false), |kv| {
+            Ok(crate::upgrade::requires_txn_reader(&crate::upgrade::read(
+                kv.as_ref(),
+            )?))
+        })
+    }
+    async fn probe_txn_reader(&self, node: u64, address: &str) -> anyhow::Result<()> {
+        let report = self
+            .probe(node, address, uuid::Uuid::new_v4(), false)
+            .await?;
+        crate::upgrade::require_txn_reader(&report)
+    }
     async fn probe_admission(&self, node: u64, address: &str) -> anyhow::Result<()> {
         let report = self
             .probe(node, address, uuid::Uuid::new_v4(), false)
@@ -296,6 +309,23 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         let needs_admission = self.transport.requires_admission_reader().map_err(|e| {
             RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
         })?;
+        let transaction_command = rpc.entries.iter().any(|entry| {
+            matches!(&entry.payload,
+            openraft::EntryPayload::Normal(cmd) if cmd.requires_txn_authority_protocol()
+                || matches!(cmd, crate::ShardCommand::UpgradeControlV1(command)
+                    if command.target_level >= Some(crate::upgrade::TXN_AUTHORITY_LEVEL)))
+        });
+        let needs_txn = self.transport.requires_txn_reader().map_err(|e| {
+            RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+        })?;
+        if transaction_command || needs_txn {
+            self.transport
+                .probe_txn_reader(self.target, &self.target_node.addr)
+                .await
+                .map_err(|e| {
+                    RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                })?;
+        }
         if admission_command || needs_admission {
             self.transport
                 .probe_admission(self.target, &self.target_node.addr)
@@ -332,6 +362,17 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
+        let needs_txn = self.transport.requires_txn_reader().map_err(|e| {
+            RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+        })?;
+        if needs_txn {
+            self.transport
+                .probe_txn_reader(self.target, &self.target_node.addr)
+                .await
+                .map_err(|e| {
+                    RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                })?;
+        }
         if self.transport.check_snapshots {
             if rpc.offset == 0 {
                 self.snapshot_format = Some((
@@ -393,6 +434,17 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         rpc: VoteRequest<u64>,
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let needs_txn = self.transport.requires_txn_reader().map_err(|e| {
+            RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+        })?;
+        if needs_txn {
+            self.transport
+                .probe_txn_reader(self.target, &self.target_node.addr)
+                .await
+                .map_err(|e| {
+                    RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                })?;
+        }
         let url = format!(
             "{}://{}/raft/{}/vote",
             self.scheme, self.target_node.addr, self.shard_id

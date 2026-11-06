@@ -1,7 +1,7 @@
 use super::*;
 use nodus_raftstore::{ShardCommand, SnapshotCompatibility, upgrade::admission};
 
-fn tls_config(dir: &Path) -> nodus_config::ClusterConfig {
+pub(super) fn tls_config(dir: &Path) -> nodus_config::ClusterConfig {
     let (cert, key, ca) = crate::tests::write_test_certs(dir);
     nodus_config::ClusterConfig {
         tls: nodus_config::ClusterTlsConfig {

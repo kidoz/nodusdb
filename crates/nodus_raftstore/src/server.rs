@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 use crate::{NodusTypeConfig, ReadIndexResponse, ShardCommand, ShardResponse};
+mod transactions;
 
 pub type NodusRaft = Raft<NodusTypeConfig>;
 
@@ -72,9 +73,14 @@ pub struct RaftState {
     /// Forms a local replica of a data group on demand (the server's group
     /// manager owns the mechanics; the hook is installed at startup).
     instantiate_hook: Arc<std::sync::OnceLock<InstantiateHook>>,
+    peer_transport: Arc<std::sync::OnceLock<crate::network::RaftTransport>>,
 }
 
 impl RaftState {
+    /// Install the production peer client for capability and authority checks.
+    pub fn set_peer_transport(&self, transport: crate::network::RaftTransport) {
+        let _ = self.peer_transport.set(transport);
+    }
     pub fn set_capability_storage(&self, kv: Arc<dyn nodus_storage_api::KvEngine>) {
         let _ = self.capability_kv.set(kv);
     }
@@ -92,6 +98,7 @@ impl RaftState {
             node_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capability_kv: Arc::new(std::sync::OnceLock::new()),
             instantiate_hook: Arc::new(std::sync::OnceLock::new()),
+            peer_transport: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -210,6 +217,13 @@ async fn capabilities(
         state.node_id.load(std::sync::atomic::Ordering::Acquire),
         request.challenge,
     );
+    if !state
+        .peer_transport
+        .get()
+        .is_some_and(|t| t.scheme() == "https")
+    {
+        report.txn_authority_version = None;
+    }
     if !request.preflight {
         return Json(report).into_response();
     }
@@ -240,8 +254,14 @@ async fn get_raft(state: &RaftState, shard_id: &str) -> Option<NodusRaft> {
 async fn vote(
     Path(shard_id): Path<String>,
     State(state): State<RaftState>,
+    auth_mode: Option<axum::Extension<RaftAuthMode>>,
     Json(req): Json<VoteRequest<u64>>,
 ) -> impl axum::response::IntoResponse {
+    if let Err(error) =
+        transactions::verify_consensus_peer(&state, auth_mode, req.vote.leader_id.voted_for()).await
+    {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+    }
     if let Some(raft) = get_raft(&state, &shard_id).await {
         let res = raft.vote(req).await;
         Json(res).into_response()
@@ -253,8 +273,14 @@ async fn vote(
 async fn append(
     Path(shard_id): Path<String>,
     State(state): State<RaftState>,
+    auth_mode: Option<axum::Extension<RaftAuthMode>>,
     Json(req): Json<AppendEntriesRequest<NodusTypeConfig>>,
 ) -> impl axum::response::IntoResponse {
+    if let Err(error) =
+        transactions::verify_consensus_peer(&state, auth_mode, req.vote.leader_id.voted_for()).await
+    {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+    }
     if let Some(raft) = get_raft(&state, &shard_id).await {
         let res = raft.append_entries(req).await;
         Json(res).into_response()
@@ -266,8 +292,14 @@ async fn append(
 async fn snapshot(
     Path(shard_id): Path<String>,
     State(state): State<RaftState>,
+    auth_mode: Option<axum::Extension<RaftAuthMode>>,
     Json(req): Json<InstallSnapshotRequest<NodusTypeConfig>>,
 ) -> impl axum::response::IntoResponse {
+    if let Err(error) =
+        transactions::verify_consensus_peer(&state, auth_mode, req.vote.leader_id.voted_for()).await
+    {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+    }
     if let Some(raft) = get_raft(&state, &shard_id).await {
         let res = raft.install_snapshot(req).await;
         Json(res).into_response()
@@ -288,14 +320,28 @@ async fn write(
     headers: HeaderMap,
     Json(cmd): Json<ShardCommand>,
 ) -> impl axum::response::IntoResponse {
-    // Level 4 does not authorize this format. Keep even peer-authenticated
-    // forwarding closed until participant enforcement and a new upgrade target.
     if cmd.requires_txn_authority_protocol() {
-        return (
-            axum::http::StatusCode::NOT_IMPLEMENTED,
-            "transaction authority activation is unavailable",
-        )
-            .into_response();
+        let finalized = state
+            .capability_kv
+            .get()
+            .and_then(|kv| crate::upgrade::read(kv.as_ref()).ok())
+            .is_some_and(|r| r.cluster_version >= crate::upgrade::TXN_AUTHORITY_LEVEL);
+        if !finalized
+            || !matches!(
+                auth_mode,
+                Some(axum::Extension(RaftAuthMode::TransportAuthenticated))
+            )
+            || !state
+                .peer_transport
+                .get()
+                .is_some_and(|t| t.scheme() == "https")
+        {
+            return (
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                "transaction protocol requires finalized level 5 and authenticated peer transport",
+            )
+                .into_response();
+        }
     }
     if cmd.is_upgrade_command() {
         return (
@@ -330,6 +376,22 @@ async fn write(
     let Some(raft) = get_raft(&state, &shard_id).await else {
         return (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response();
     };
+    if cmd.requires_txn_authority_protocol() {
+        match transactions::verify(&state, &shard_id, &cmd).await {
+            Ok(true) => {}
+            Ok(false) => return Json(ShardResponse {
+                success: false,
+                error: Some(
+                    "transaction command has no matching authoritative decision; retry transaction"
+                        .into(),
+                ),
+            })
+            .into_response(),
+            Err(error) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+            }
+        }
+    }
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -508,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_authority_ingress_stays_closed_for_every_existing_level() {
+    async fn transaction_ingress_requires_configured_peer_tls_even_at_level_five() {
         let cmd = ShardCommand::TxnAuthorityV1(crate::txn_authority::CommandV1 {
             txn_id: uuid::Uuid::new_v4(),
             expected: None,

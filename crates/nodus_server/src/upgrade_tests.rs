@@ -1,5 +1,6 @@
 //! Real LSM, mTLS/Raft failover and abrupt restart evidence for upgrade authority.
 mod admission;
+mod transactions;
 
 use crate::{
     multi_raft::{META_SHARD, MultiRaftManager},
