@@ -156,6 +156,17 @@ pub trait KvEngine: Send + Sync {
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>>;
 
+    /// A bounded page in key order. Lazy engines retain their streaming scan;
+    /// materializing engines must override this to bound the allocation too.
+    fn scan_limited(
+        &self,
+        range: KeyRange,
+        read_ts: Timestamp,
+        limit: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        Ok(Box::new(self.scan(range, read_ts)?.take(limit)))
+    }
+
     /// Scans committed MVCC versions in `range` with `since_ts < version <= read_ts`.
     /// Unlike `scan`, this includes tombstones (`value = None`) so incremental
     /// backup can preserve deletes.
@@ -344,6 +355,30 @@ impl NamespacedKvEngine {
 }
 
 impl KvEngine for NamespacedKvEngine {
+    fn scan_limited(
+        &self,
+        range: KeyRange,
+        read_ts: Timestamp,
+        limit: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        let physical = KeyRange {
+            start: self.physical_key(&range.start),
+            end: self.physical_key(&range.end),
+        };
+        let prefix = self.prefix.clone();
+        Ok(Box::new(
+            self.inner
+                .scan_limited(physical, read_ts, limit)?
+                .map(move |row| {
+                    row.map(|mut pair| {
+                        if let Some(key) = pair.key.strip_prefix(prefix.as_ref()) {
+                            pair.key = Bytes::copy_from_slice(key);
+                        }
+                        pair
+                    })
+                }),
+        ))
+    }
     fn recovery_generation(&self) -> Result<Option<recovery::RecoveryGeneration>> {
         self.inner.recovery_generation()
     }

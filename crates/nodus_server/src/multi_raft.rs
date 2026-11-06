@@ -42,6 +42,14 @@ impl ClockAdvancingKvEngine {
 }
 
 impl KvEngine for ClockAdvancingKvEngine {
+    fn scan_limited(
+        &self,
+        range: KeyRange,
+        ts: Timestamp,
+        limit: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        self.inner.scan_limited(range, ts, limit)
+    }
     fn recovery_generation(
         &self,
     ) -> Result<Option<nodus_storage_api::recovery::RecoveryGeneration>> {

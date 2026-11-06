@@ -34,6 +34,35 @@ impl Default for MemKvEngine {
 }
 
 impl KvEngine for MemKvEngine {
+    fn scan_limited(
+        &self,
+        range: KeyRange,
+        read_ts: Timestamp,
+        limit: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        let guard = self.store.read().unwrap();
+        let rows: Vec<_> = guard
+            .range(range.start..range.end)
+            .filter_map(|(key, chain)| {
+                chain.read(read_ts).map(|value| {
+                    Ok(KvPair {
+                        key: key.clone(),
+                        value: Bytes::copy_from_slice(value),
+                        version: chain
+                            .versions
+                            .iter()
+                            .filter(|v| v.is_visible(read_ts))
+                            .map(|v| v.version)
+                            .max()
+                            .unwrap_or(0),
+                    })
+                })
+            })
+            .take(limit)
+            .collect();
+        Ok(Box::new(rows.into_iter()))
+    }
     fn snapshot_rows(
         &self,
         scope: &nodus_storage_api::SnapshotScope,
@@ -405,6 +434,41 @@ impl KvEngine for MemKvEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limited_scans_bound_visible_rows_and_preserve_nested_namespace_keys() {
+        let raw = std::sync::Arc::new(MemKvEngine::new());
+        let outer = std::sync::Arc::new(nodus_storage_api::NamespacedKvEngine::new(
+            raw.clone(),
+            "outer",
+        ));
+        let inner = nodus_storage_api::NamespacedKvEngine::new(outer, "inner");
+        for i in 0..20u8 {
+            let txn = TxnId::new();
+            inner
+                .write_intent(txn, Bytes::from(vec![i]), Bytes::from(vec![i]))
+                .unwrap();
+            inner.commit(txn, 10).unwrap();
+        }
+        let deleted = TxnId::new();
+        inner.delete_intent(deleted, Bytes::from(vec![0])).unwrap();
+        inner.commit(deleted, 20).unwrap();
+        let range = || KeyRange {
+            start: Bytes::new(),
+            end: Bytes::from(vec![255]),
+        };
+        let keys = |ts, limit| {
+            inner
+                .scan_limited(range(), ts, limit)
+                .unwrap()
+                .map(|r| r.unwrap().key[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(10, 3), [0, 1, 2]);
+        assert_eq!(keys(20, 3), [1, 2, 3]);
+        assert!(keys(20, 0).is_empty());
+        assert_eq!(keys(20, 100).len(), 19);
+    }
     use nodus_storage_api::KvError;
 
     #[test]
