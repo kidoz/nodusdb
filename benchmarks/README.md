@@ -16,10 +16,12 @@ just test-iceberg-resource-live
 
 The second command runs the [server SQL workloads](workloads/server_sql.md).
 See [Run the benchmarks](../docs/how-to/run-benchmarks.md) for smoke mode and
-result-recording rules. The [2026-10-27 write-batching comparison](reports/server-write-batching-2026-10-27.md)
-contains the current repeated measurements and evidence limits; the
-[2026-10-24 server baseline](reports/server-baseline-2026-10-24.md) retains the
-earlier single-run baseline. The
+result-recording rules. The [2026-11-06 write-batching resource comparison](reports/server-write-batching-resources-2026-11-06.md)
+contains the current repeated latency, throughput, memory, queue, and Raft-log
+observations and their evidence limits. The
+[2026-10-27 write-batching comparison](reports/server-write-batching-2026-10-27.md)
+and [2026-10-24 server baseline](reports/server-baseline-2026-10-24.md) retain the
+earlier measurements. The
 [release qualification manifest](reports/release-qualification-2026-10-25.md) records
 the clean-commit local, hosted-CI, recovery, and release-gate evidence.
 

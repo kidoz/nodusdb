@@ -72,11 +72,16 @@ failures produce null fields rather than zero.
 
 The Prometheus snapshots also include general and bounded-commit Raft queue
 depth/high-water, approximate LSM memtable bytes/high-water, SSTable count,
-and result-labelled flush/compaction counts and duration histograms. Queue
-and memtable high-water values are monotonic within one server process; depth
-and current-byte gauges are last-observed values. Flush and compaction metrics
-exclude empty no-ops, and flush duration includes any compaction triggered by
-that flush. The LSM observer is attached only to durable storage.
+and result-labelled flush/compaction counts and duration histograms. Per-group
+`nodus_raft_log_entries` counts retained entries and
+`nodus_raft_log_serialized_bytes` totals their exact serialized JSON payload
+bytes. The latter is a logical payload gauge, not physical LSM or filesystem
+usage; both are last-observed values sampled by the server's two-second metrics
+loop. Queue and memtable high-water values are monotonic within one server
+process; depth and current-byte gauges are last-observed values. Flush and
+compaction metrics exclude empty no-ops, and flush duration includes any
+compaction triggered by that flush. The LSM observer is attached only to durable
+storage.
 
 Per-group `nodus_raft_snapshot_builds_total` and
 `nodus_raft_snapshot_build_seconds` measure successful local snapshot builds.
@@ -91,10 +96,13 @@ legitimately contain no snapshot observations.
 The CI smoke job catches harness breakage and provides coarse output for
 regression review; shared runners do not enforce stable performance budgets.
 The [2026-10-29 repeated schema-2 baseline](../reports/server-baseline-2026-10-29.md)
-records three full legacy-write-path runs on one host. An opt-in
-[mixed-activity smoke drill](mixed_activity_soak.md) exercises scheduled
+records three full legacy-write-path runs on one host. The
+[2026-11-06 resource comparison](../reports/server-write-batching-resources-2026-11-06.md)
+adds three full legacy and three full batched runs at one source revision,
+including request latency, memory, queue, and retained-log-entry observations.
+An opt-in [mixed-activity smoke drill](mixed_activity_soak.md) exercises scheduled
 maintenance with versioned resource artifacts. Recovery and performance budget
-approval, scheduled full-load/soak workflows, sustained resource evidence, and
-the final 24-hour soak remain PR2 work. Production budgets require maintainer
-approval and repeated supported-profile evidence, never a number invented from
-one laptop run.
+approval, repeated log-byte-growth and physical-storage evidence, scheduled
+full-load/soak workflows, sustained resource evidence, and the final 24-hour soak
+remain open. Production budgets require maintainer approval and repeated
+supported-profile evidence, never a number invented from one laptop run.
