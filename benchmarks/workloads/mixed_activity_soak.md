@@ -80,23 +80,35 @@ Maintenance proceeds in this order while the workload continues:
 9. Continue sampling during a 10-second post-activity observation window.
 
 A `passed` summary covers only these executed activity and correctness checks.
-It does not assert long-term memory stabilization, an approved performance SLO,
-or general production readiness.
+It does not assert long-term memory stabilization, bounded physical storage, an
+approved performance SLO, or general production readiness.
 
 ## Artifacts
 
 `events.jsonl` contains schema-version-1 `activity` and `sample` events. Activity
 events include success and operation-specific details. Samples are collected
 once per second and contain elapsed and wall-clock time, phase, process RSS and
-allocator bytes, and per-node Prometheus samples. A stopped node has null
-`metrics` and an error string. Unsupported process-resource collection also
-produces null, not zero.
+allocator bytes, and per-node Prometheus and physical-storage samples. A stopped
+node has null `metrics` and an error string. Unsupported process-resource
+collection also produces null, not zero.
+
+Each node's `storage.usage.logical_bytes` sums regular-file lengths in its whole
+persistent data directory. On Unix, `storage.usage.allocated_bytes` sums
+filesystem-reported allocated 512-byte blocks, counts hard-linked files once,
+and does not follow symlinks; directories themselves are not counted. Other
+platforms report allocated bytes as null. `storage.volume_available_bytes` is
+the containing filesystem's available space for unprivileged users, derived
+from `f_bavail` and `f_frsize` on Unix. A directory scan failure leaves `usage`
+null and records `storage.error`; free-space collection failures leave
+`volume_available_bytes` null. These measurements remain distinct from the
+Raft payload gauge and from one another.
 
 `summary.json` contains schema version, run identity, source/build metadata,
 workload configuration and results, activity timings, exact-row validation,
-100-millisecond process RSS/allocator summaries, and resource assessment. The
-`bounded_memory`, `bounded_queues`, and `production_budgets_met` verdicts remain
-null. `raft_log_reclamation_observed` records only the observed purge activity.
+100-millisecond process RSS/allocator summaries, storage-sampling semantics,
+and resource assessment. The `bounded_memory`, `bounded_queues`, and
+`production_budgets_met` verdicts remain null.
+`raft_log_reclamation_observed` records only the observed purge activity.
 
 ## Limits
 
@@ -111,6 +123,7 @@ null. `raft_log_reclamation_observed` records only the observed purge activity.
 - Migration uses a coordinated write pause with continued reads. It does not
   prove uninterrupted online writes or migration progress under continuous
   write pressure.
-- The short run and high-water samples cannot prove bounded memory or queues.
-  Sustained stabilization, approved budgets, scheduled execution, and the
-  final 24-hour soak remain separate release-qualification work.
+- One-second directory scans can miss shorter-lived physical peaks. The short
+  run and high-water samples cannot prove bounded memory, queues, or physical
+  storage. Sustained stabilization, approved budgets, scheduled execution, and
+  the final 24-hour soak remain separate release-qualification work.

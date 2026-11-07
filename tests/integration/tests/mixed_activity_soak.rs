@@ -4,7 +4,8 @@ use nodus_testkit::benchmark::{
 };
 use nodus_testkit::cluster::ClusterFixture;
 use nodus_testkit::soak::{
-    ResourceAssessment, SOAK_SCHEMA_VERSION, SoakArtifact, SoakNodeSample, SoakSummary,
+    ResourceAssessment, SOAK_SCHEMA_VERSION, SoakArtifact, SoakNodeSample, SoakStorageSample,
+    SoakSummary,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -301,20 +302,22 @@ async fn reader(client: Arc<tokio_postgres::Client>, workload: Arc<Workload>) ->
     Ok(())
 }
 
-async fn scrape_nodes(http: &reqwest::Client, addresses: &[SocketAddr]) -> Vec<SoakNodeSample> {
-    let mut samples = Vec::with_capacity(addresses.len());
-    for (index, address) in addresses.iter().enumerate() {
-        samples.push(match scrape_metrics(http, *address).await {
-            Ok(metrics) => SoakNodeSample {
-                node_id: index as u64 + 1,
-                metrics: Some(metrics),
-                error: None,
-            },
-            Err(error) => SoakNodeSample {
-                node_id: index as u64 + 1,
-                metrics: None,
-                error: Some(error.to_string()),
-            },
+async fn scrape_nodes(
+    http: &reqwest::Client,
+    nodes: &[(SocketAddr, PathBuf)],
+) -> Vec<SoakNodeSample> {
+    let mut samples = Vec::with_capacity(nodes.len());
+    for (index, (address, data_path)) in nodes.iter().enumerate() {
+        let (metrics, error) = match scrape_metrics(http, *address).await {
+            Ok(metrics) => (Some(metrics), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let storage = SoakStorageSample::read(data_path).await;
+        samples.push(SoakNodeSample {
+            node_id: index as u64 + 1,
+            metrics,
+            error,
+            storage,
         });
     }
     samples
@@ -322,7 +325,7 @@ async fn scrape_nodes(http: &reqwest::Client, addresses: &[SocketAddr]) -> Vec<S
 
 fn start_sampler(
     artifact: Arc<SoakArtifact>,
-    addresses: Vec<SocketAddr>,
+    nodes: Vec<(SocketAddr, PathBuf)>,
     phase: Arc<Mutex<String>>,
 ) -> Sampler {
     let (stop, mut stopped) = tokio::sync::watch::channel(());
@@ -334,7 +337,7 @@ fn start_sampler(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             artifact.sample(
-                scrape_nodes(&http, &addresses).await,
+                scrape_nodes(&http, &nodes).await,
                 json!({"phase": current_phase}),
             )?;
             tokio::select! {
@@ -807,12 +810,16 @@ async fn execute(
     wait_for_data_group_quorum(&cluster, &group).await?;
 
     let phase = Arc::new(Mutex::new("workload".to_string()));
-    let addresses = cluster
+    let targets = cluster
         .nodes
         .iter()
-        .map(|node| node.http_addr().parse())
-        .collect::<std::result::Result<Vec<SocketAddr>, _>>()?;
-    let sampler = start_sampler(artifact.clone(), addresses, phase.clone());
+        .map(|node| {
+            node.http_addr()
+                .parse()
+                .map(|address| (address, node.data_path().to_path_buf()))
+        })
+        .collect::<std::result::Result<Vec<(SocketAddr, PathBuf)>, _>>()?;
+    let sampler = start_sampler(artifact.clone(), targets, phase.clone());
     let workload = Arc::new(Workload::new());
     parts.workload_handle = Some(workload.clone());
     let mut clients = Vec::new();
@@ -1102,7 +1109,17 @@ async fn mixed_activity_smoke_drill() {
         workload: parts.workload,
         activities: activities.clone(),
         validation: parts.validation,
-        resources: json!({"rss": rss, "allocator": allocator}),
+        resources: json!({
+            "rss": rss,
+            "allocator": allocator,
+            "storage_sampling": {
+                "interval_seconds": 1,
+                "source": "events.jsonl sample events",
+                "allocated_block_bytes": 512,
+                "volume_available_bytes": "filesystem f_bavail multiplied by f_frsize",
+                "physical_storage_bounded": null,
+            },
+        }),
         assessment: ResourceAssessment {
             raft_log_reclamation_observed: Some(activities.iter().any(|activity| {
                 activity["name"] == "second_snapshot_and_log_reclamation_while_follower_down"

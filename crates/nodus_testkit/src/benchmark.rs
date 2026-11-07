@@ -379,7 +379,7 @@ fn directory_storage_usage(root: &Path) -> io::Result<StorageUsage> {
     Ok(usage)
 }
 
-async fn read_storage_usage(path: &Path) -> io::Result<StorageUsage> {
+pub async fn read_storage_usage(path: &Path) -> io::Result<StorageUsage> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || directory_storage_usage(&path))
         .await

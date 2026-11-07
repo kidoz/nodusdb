@@ -1,6 +1,8 @@
 //! Versioned artifacts for scheduled mixed-activity soak drills.
 
-use crate::benchmark::{MetricSamples, process_allocator_bytes, process_rss_bytes};
+use crate::benchmark::{
+    MetricSamples, StorageUsage, process_allocator_bytes, process_rss_bytes, read_storage_usage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
@@ -10,6 +12,44 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SOAK_SCHEMA_VERSION: u32 = 1;
+
+#[cfg(unix)]
+fn volume_available_bytes(path: &Path) -> io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` points to writable storage of
+    // the exact structure required by statvfs. Success initializes it.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a zero return from statvfs initialized `stats`.
+    let stats = unsafe { stats.assume_init() };
+    let fragment_size = if stats.f_frsize == 0 {
+        stats.f_bsize
+    } else {
+        stats.f_frsize
+    };
+    u64::try_from(stats.f_bavail)
+        .ok()
+        .and_then(|available| {
+            u64::try_from(fragment_size)
+                .ok()
+                .and_then(|size| available.checked_mul(size))
+        })
+        .ok_or_else(|| io::Error::other("available filesystem bytes overflow u64"))
+}
+
+#[cfg(not(unix))]
+fn volume_available_bytes(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem free-space collection is supported on Unix",
+    ))
+}
 
 fn now_unix_micros() -> u64 {
     SystemTime::now()
@@ -23,10 +63,37 @@ pub fn process_resource_sample() -> (Option<u64>, Option<u64>) {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SoakStorageSample {
+    pub usage: Option<StorageUsage>,
+    pub volume_available_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl SoakStorageSample {
+    pub async fn read(path: &Path) -> Self {
+        let volume_available_bytes = volume_available_bytes(path).ok();
+        match read_storage_usage(path).await {
+            Ok(usage) => Self {
+                usage: Some(usage),
+                volume_available_bytes,
+                error: None,
+            },
+            Err(error) => Self {
+                usage: None,
+                volume_available_bytes,
+                error: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SoakNodeSample {
     pub node_id: u64,
     pub metrics: Option<MetricSamples>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub storage: SoakStorageSample,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -218,7 +285,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_round_trip_preserves_unavailable_observations() {
+    fn event_round_trip_preserves_unavailable_observations_and_reads_legacy_events() {
         let directory = tempfile::tempdir().unwrap();
         let artifact = SoakArtifact::create(directory.path(), "test-run".into()).unwrap();
         artifact
@@ -227,6 +294,7 @@ mod tests {
                     node_id: 3,
                     metrics: None,
                     error: Some("node stopped".into()),
+                    storage: SoakStorageSample::default(),
                 }],
                 serde_json::json!({"phase": "restart"}),
             )
@@ -237,6 +305,33 @@ mod tests {
         assert_eq!(event.nodes[0].metrics, None);
         assert_eq!(event.nodes[0].error.as_deref(), Some("node stopped"));
         assert!(body.contains("\"metrics\":null"));
+
+        let mut legacy: Value = serde_json::from_str(body.trim_end()).unwrap();
+        legacy["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("storage");
+        let legacy: SoakEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.nodes[0].storage, SoakStorageSample::default());
+    }
+
+    #[tokio::test]
+    async fn storage_sample_distinguishes_directory_usage_and_free_space() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("file"), b"abc").unwrap();
+        let sample = SoakStorageSample::read(directory.path()).await;
+        assert_eq!(sample.error, None);
+        assert_eq!(sample.usage.unwrap().logical_bytes, 3);
+        #[cfg(unix)]
+        {
+            assert!(sample.usage.unwrap().allocated_bytes.unwrap() > 0);
+            assert!(sample.volume_available_bytes.unwrap() > 0);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(sample.usage.unwrap().allocated_bytes, None);
+            assert_eq!(sample.volume_available_bytes, None);
+        }
     }
 
     #[test]
