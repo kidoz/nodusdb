@@ -263,6 +263,22 @@ async fn restore_into_non_empty_engine_is_rejected_without_fencing() {
     assert_eq!(body["code"], "restore_destination_not_empty");
     assert_eq!(body["restored"], 0);
 
+    // A PITR restore attempt carries `target_ts` in the query string; the
+    // audit record must preserve it structurally. This target predates every
+    // backup, so planning finds no eligible base and nothing is restored.
+    let pitr: serde_json::Value = http
+        .post(format!(
+            "{base}/api/v1/backups/{id}/restore?target_ts=1750000000000"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pitr["restored"], 0);
+    assert!(pitr["error"].is_string(), "expected planning error: {pitr}");
+
     // A refused restore must not fence the engine: queries keep working.
     let rows = client
         .query("SELECT v FROM guarded WHERE id = 1", &[])
@@ -279,13 +295,22 @@ async fn restore_into_non_empty_engine_is_rejected_without_fencing() {
         .await
         .unwrap();
     let reason = format!("POST /api/v1/backups/{id}/restore");
+    let events = audit.as_array().unwrap();
     assert!(
-        audit.as_array().unwrap().iter().any(|event| {
+        events.iter().any(|event| {
             event["action"] == "ManageBackups"
                 && event["result"] == "Failure"
                 && event["reason"] == reason
         }),
         "rejected restore must be audited: {audit}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["action"] == "ManageBackups"
+                && event["reason"] == reason
+                && event["target_ts"] == 1_750_000_000_000_u64
+        }),
+        "PITR restore attempt must be audited with its target timestamp: {audit}"
     );
 }
 

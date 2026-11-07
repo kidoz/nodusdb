@@ -113,6 +113,17 @@ fn shard_migration_unavailable() -> Response {
 #[derive(Clone, Copy)]
 pub struct AuthPrincipal(pub PrincipalId);
 
+/// The point-in-time recovery target carried by restore requests, lifted from
+/// the query string into the audit record. A malformed value audits as `None`:
+/// auditing must never fail the request it records.
+fn query_target_ts(query: Option<&str>) -> Option<u64> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("target_ts="))?
+        .parse()
+        .ok()
+}
+
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
 /// an admin token is configured. A no-op when no token is set.
 async fn require_token(
@@ -201,9 +212,11 @@ async fn require_token(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Audit every mutating control-plane request (anything but a read). Capture
-    // the method/path now because `next.run` consumes `req`.
+    // the method/path now because `next.run` consumes `req`. The PITR target is
+    // lifted out of the query string so restore audits record it structurally.
     let method = req.method().clone();
     let path = path.to_string();
+    let target_ts = query_target_ts(req.uri().query());
     let is_mutation = !matches!(
         method,
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
@@ -226,6 +239,7 @@ async fn require_token(
             result: result.to_string(),
             error,
             authz_catalog_version: None,
+            target_ts,
         });
     };
 
@@ -2660,6 +2674,19 @@ ALTER TABLE ONLY t ADD CONSTRAINT t_pkey PRIMARY KEY (id);
 #[cfg(test)]
 mod restore_tests {
     use super::*;
+
+    #[test]
+    fn query_target_ts_parses_only_a_valid_restore_target() {
+        assert_eq!(
+            query_target_ts(Some("target_ts=1750000000000")),
+            Some(1750000000000)
+        );
+        assert_eq!(query_target_ts(Some("foo=1&target_ts=42")), Some(42));
+        assert_eq!(query_target_ts(Some("target_ts=not-a-number")), None);
+        assert_eq!(query_target_ts(Some("target_ts=")), None);
+        assert_eq!(query_target_ts(Some("other=1")), None);
+        assert_eq!(query_target_ts(None), None);
+    }
 
     #[test]
     fn source_transaction_control_is_excluded_but_makes_destination_nonempty() {

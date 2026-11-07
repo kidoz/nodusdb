@@ -2158,6 +2158,7 @@ impl MemExecutor {
                 Some("permission denied".to_string())
             },
             authz_catalog_version: Some(decision.catalog_version),
+            target_ts: None,
         });
 
         if !decision.allowed {

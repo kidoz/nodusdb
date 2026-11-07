@@ -17,6 +17,9 @@ pub struct AuditEvent {
     pub result: String, // e.g., "Success", "Denied"
     pub error: Option<String>,
     pub authz_catalog_version: Option<u64>,
+    /// Point-in-time recovery target (microseconds since the Unix epoch) when
+    /// the audited request is a restore with `target_ts`; `None` otherwise.
+    pub target_ts: Option<u64>,
 }
 
 pub trait AuditSink: Send + Sync {
@@ -247,6 +250,7 @@ mod tests {
             result: result.into(),
             error: None,
             authz_catalog_version: Some(1),
+            target_ts: None,
         }
     }
 
@@ -277,6 +281,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sink.query(&limited).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_without_target_ts_still_deserializes() {
+        // Events written before `target_ts` existed (e.g. inside an older
+        // backup's audit export) must remain readable.
+        let event = event(PrincipalId::new(), "POST", "Success");
+        let json = serde_json::to_value(&event).unwrap();
+        let mut object = json.as_object().unwrap().clone();
+        object.remove("target_ts");
+        let decoded: AuditEvent = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(decoded.target_ts, None);
     }
 
     #[test]
