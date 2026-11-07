@@ -88,6 +88,10 @@ bench:
 bench-soak:
     cargo test -p nodus_integration_tests --test mixed_activity_soak --locked -- --ignored --nocapture
 
+# Check a server_bench measurements directory against order-of-magnitude floors
+bench-floor dir:
+    python3 -B tools/testing/bench_floor.py {{dir}}
+
 # Build fuzz targets without running the fuzzers
 fuzz-check:
     cargo check --manifest-path tests/fuzz/Cargo.toml

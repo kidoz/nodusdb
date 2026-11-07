@@ -49,6 +49,22 @@ The output directory must not already contain `measurements.jsonl`; use a fresh
 directory for each run. Generated artifacts stay under `target/` and are not
 committed.
 
+## Check the order-of-magnitude floors
+
+CI runs the smoke benchmark on every push and then checks the recorded
+throughputs against order-of-magnitude floors — one tenth of the recorded
+same-host baseline — which catch harness breakage and >10x regressions. They
+are not performance budgets; shared runners do not enforce those. Run the same
+check against any capture directory:
+
+```bash
+python3 -B tools/testing/bench_floor.py target/server-bench-smoke
+```
+
+Pass `--require <workload>` for each workload the capture must contain; absent
+workloads are otherwise skipped with a note, and unknown workloads are
+reported without a floor.
+
 ## Scheduled soak and full-load runs
 
 The `soak` GitHub Actions workflow runs the bounded mixed-activity drill

@@ -12,6 +12,7 @@ Current benchmark entrypoints:
 just bench
 cargo bench --locked -p nodus_integration_tests --bench server_bench
 just bench-soak
+python3 -B tools/testing/bench_floor.py target/server-bench/<run-id>
 just test-iceberg-resource-live
 ```
 

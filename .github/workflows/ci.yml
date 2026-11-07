@@ -44,7 +44,9 @@ jobs:
       - name: Compile Storage Engine Benchmarks
         run: cargo bench --locked --no-run -p nodus_storage_lsm
       - name: Server benchmark smoke (1/100 scale sanity floor)
-        run: NODUS_BENCH_SCALE=smoke cargo bench --locked -p nodus_integration_tests --bench server_bench
+        run: NODUS_BENCH_SCALE=smoke NODUS_BENCH_ARTIFACT_DIR=target/server-bench-smoke cargo bench --locked -p nodus_integration_tests --bench server_bench
+      - name: Order-of-magnitude regression floor
+        run: python3 -B tools/testing/bench_floor.py target/server-bench-smoke --require point_insert --require indexed_point_insert --require point_read --require mixed_oltp --require bulk_insert --require range_scan
 
   iceberg:
     name: Live Lakekeeper interoperability
