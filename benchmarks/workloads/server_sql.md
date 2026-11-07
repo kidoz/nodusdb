@@ -116,8 +116,11 @@ The [2026-11-07 storage-growth capture](../reports/server-storage-growth-2026-11
 adds three full batched runs with retained-log payload bytes and logical and
 allocated data-directory measurements. An opt-in
 [mixed-activity smoke drill](mixed_activity_soak.md) exercises scheduled
-maintenance with versioned resource artifacts. Recovery and performance budget
-approval, sustained snapshot/reclamation and physical-storage evidence, scheduled
-full-load/soak workflows, and the final 24-hour soak remain open. Production
+maintenance with versioned resource artifacts. Its
+[2026-11-07 reclamation capture](../reports/raft-log-reclamation-2026-11-07.md)
+observes two snapshot/purge cycles, periodic physical storage, and exact restart
+validation. Recovery and performance budget approval, sustained-load and
+long-term storage evidence, scheduled full-load/soak workflows, and the final
+24-hour soak remain open. Production
 budgets require maintainer approval and repeated supported-profile evidence,
 never a number invented from one laptop run.

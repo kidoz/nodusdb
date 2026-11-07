@@ -7,7 +7,8 @@ writes, and the production snapshot, compaction, and Raft timer settings
 (200 ms heartbeat, 600–1200 ms election timeouts, 256 KiB snapshot chunks, and
 a 30-second snapshot RPC timeout). It is a short correctness and observability
 drill, not the final 24-hour release-candidate soak or a production capacity
-test.
+test. The [2026-11-07 reclamation and physical-storage capture](../reports/raft-log-reclamation-2026-11-07.md)
+records measured results and operational limitations.
 
 ## Run
 
