@@ -71,6 +71,7 @@ impl DriverFixture {
             manager: manager.clone(),
             txn_groups: std::sync::Mutex::new(HashMap::new()),
             metrics: Default::default(),
+            recovery_gate: Default::default(),
         });
         Self {
             manager,

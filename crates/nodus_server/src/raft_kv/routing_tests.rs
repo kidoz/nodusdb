@@ -91,6 +91,7 @@ async fn fixture() -> Fixture {
         manager,
         txn_groups: Mutex::new(HashMap::new()),
         metrics: nodus_monitoring::Metrics::default(),
+        recovery_gate: Default::default(),
     });
     let f = Fixture {
         engine,

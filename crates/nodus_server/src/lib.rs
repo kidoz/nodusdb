@@ -836,6 +836,8 @@ pub async fn run_server_full(
         manager: multi_raft.clone(),
         txn_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
         metrics: state.metrics.clone(),
+        #[cfg(test)]
+        recovery_gate: Default::default(),
     });
 
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {

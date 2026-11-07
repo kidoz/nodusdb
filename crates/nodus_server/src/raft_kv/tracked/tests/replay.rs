@@ -1,7 +1,7 @@
 use super::*;
 use nodus_raftstore::txn_resolution as journal;
 
-fn defer_resolutions(router: &RaftRouter, selected: Option<Uuid>) {
+pub(super) fn defer_resolutions(router: &RaftRouter, selected: Option<Uuid>) {
     router.set_authority_hook_for_test(Some(Arc::new(move |cmd| {
         if let ShardCommand::TxnParticipantV1(cmd) = cmd {
             if matches!(cmd.operation, participant::OperationV1::Resolve { .. })

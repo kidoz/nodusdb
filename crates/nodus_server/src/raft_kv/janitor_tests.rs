@@ -176,6 +176,7 @@ impl Cluster {
                 manager,
                 txn_groups: Mutex::new(HashMap::new()),
                 metrics: nodus_monitoring::Metrics::default(),
+                recovery_gate: Default::default(),
             });
             engines.push(engine);
             servers.push(tokio::spawn(async move {

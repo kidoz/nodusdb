@@ -1,6 +1,7 @@
 use super::*;
 use std::time::Duration;
 
+mod coordinator_loss;
 mod crash;
 mod fixture;
 mod ingress;
@@ -246,6 +247,7 @@ async fn activation_keeps_existing_legacy_transaction_on_its_original_protocol()
         manager: original.manager.clone(),
         txn_groups: Mutex::new(HashMap::new()),
         metrics: nodus_monitoring::Metrics::default(),
+        recovery_gate: Default::default(),
     });
     let keys = c.keys();
     let clone = e.clone();

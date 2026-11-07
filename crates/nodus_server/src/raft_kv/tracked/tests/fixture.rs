@@ -1,5 +1,6 @@
 use super::*;
 use nodus_raftstore::server::{RaftRouteAuth, RaftState, raft_routes};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub(super) struct Cluster {
@@ -9,14 +10,56 @@ pub(super) struct Cluster {
     pub mapping: Arc<nodus_meta::MemMetaStore>,
     pub catalog: Arc<nodus_catalog::MemoryCatalog>,
     pub clock: Arc<nodus_txn::MemTxnManager>,
-    servers: Vec<(
-        axum_server::Handle<std::net::SocketAddr>,
-        tokio::task::JoinHandle<()>,
-    )>,
+    servers: Vec<
+        Option<(
+            axum_server::Handle<std::net::SocketAddr>,
+            tokio::task::JoinHandle<()>,
+        )>,
+    >,
 }
 
 impl Cluster {
     pub async fn open(root: &Path) -> Self {
+        Self::open_with_topology(
+            root,
+            2,
+            &[
+                (1, vec![], vec![2]),
+                (1, vec![], vec![2]),
+                (2, vec![], vec![1]),
+            ],
+        )
+        .await
+    }
+
+    /// Three nodes arranged so node 1 — the meta leader and transaction
+    /// coordinator — holds no data-group vote: meta votes span {1,2,3} led by
+    /// node 1, group[0] is led by node 2 with voters {2,3}, and group[1] by
+    /// node 3 with voters {2,3}. Node 1 follows both data groups as a learner
+    /// only, so its replica can forward the coordinator's writes without its
+    /// death ever touching a data-group quorum, and meta keeps a 2/3 quorum.
+    pub async fn open_coordinator_loss(root: &Path) -> Self {
+        Self::open_with_topology(
+            root,
+            3,
+            &[
+                (1, vec![2, 3], vec![]),
+                (2, vec![3], vec![1]),
+                (3, vec![2], vec![1]),
+            ],
+        )
+        .await
+    }
+
+    /// `topology` lists `(leader_id, voter_ids, learner_ids)` — 1-based node
+    /// ids, voters excluding the leader — for the meta group and each data
+    /// group, in that order. Learners replicate (so a non-voter coordinator's
+    /// local replica knows the leader and forwards writes) but never vote.
+    async fn open_with_topology(
+        root: &Path,
+        nodes: usize,
+        topology: &[(u64, Vec<u64>, Vec<u64>)],
+    ) -> Self {
         std::fs::create_dir_all(root).unwrap();
         let (cert, key, ca) = crate::tests::write_test_certs(root);
         let cluster = nodus_config::ClusterConfig {
@@ -34,7 +77,7 @@ impl Cluster {
             .map(|b| serde_json::from_slice(&b).unwrap());
         let mut listeners = Vec::new();
         let mut addresses = Vec::new();
-        for index in 0..2 {
+        for index in 0..nodes {
             let address = previous
                 .as_ref()
                 .map_or("127.0.0.1:0", |a| a[index].as_str());
@@ -144,6 +187,7 @@ impl Cluster {
                 manager,
                 txn_groups: Mutex::new(HashMap::new()),
                 metrics: nodus_monitoring::Metrics::default(),
+                recovery_gate: Default::default(),
             }));
             let app = raft_routes(RaftRouteAuth::TransportAuthenticated).with_state(state);
             let (tls, _) = crate::load_raft_tls_config(&cluster.tls).unwrap().unwrap();
@@ -160,9 +204,14 @@ impl Cluster {
                 .await
                 .unwrap();
             });
-            servers.push((stop, task));
+            servers.push(Some((stop, task)));
         }
-        for (group, leader_id) in [(META_SHARD, 1), (&groups[0], 1), (&groups[1], 2)] {
+        let formation = [
+            (META_SHARD, &topology[0]),
+            (groups[0].as_str(), &topology[1]),
+            (groups[1].as_str(), &topology[2]),
+        ];
+        for (group, &(leader_id, ref voters, ref learners)) in formation {
             let leader = engines[leader_id as usize - 1]
                 .manager
                 .get(group)
@@ -184,36 +233,50 @@ impl Cluster {
             })
             .await
             .unwrap();
-            let other = 3 - leader_id;
-            let has_learner = leader
-                .metrics()
-                .borrow()
-                .membership_config
-                .membership()
-                .nodes()
-                .any(|(id, _)| *id == other);
-            if !has_learner {
-                leader
-                    .add_learner(
-                        other,
-                        openraft::BasicNode::new(addresses[other as usize - 1].clone()),
-                        true,
-                    )
+            for &follower_id in voters.iter().chain(learners) {
+                let has_learner = leader
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .nodes()
+                    .any(|(id, _)| *id == follower_id);
+                if !has_learner {
+                    leader
+                        .add_learner(
+                            follower_id,
+                            openraft::BasicNode::new(addresses[follower_id as usize - 1].clone()),
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let follower = engines[follower_id as usize - 1]
+                    .manager
+                    .get(group)
                     .await
                     .unwrap();
-            }
-            let follower = engines[other as usize - 1]
-                .manager
-                .get(group)
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while follower.metrics().borrow().current_leader != Some(leader_id) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while follower.metrics().borrow().current_leader != Some(leader_id) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !voters.is_empty() {
+                let target: BTreeSet<u64> = voters.iter().copied().chain([leader_id]).collect();
+                let current: BTreeSet<u64> = leader
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect();
+                if current != target {
+                    leader.change_membership(target, true).await.unwrap();
                 }
-            })
-            .await
-            .unwrap();
+            }
         }
         let service = crate::raft_upgrade::RaftUpgradeCoordinator {
             kv: engines[0].local.clone(),
@@ -300,6 +363,23 @@ impl Cluster {
         }
     }
 
+    /// Kills one node: its Raft groups shut down (so peers can re-elect) and
+    /// its listener stops. The server slot becomes inert, so a later
+    /// `shutdown` skips it.
+    pub async fn stop_node(&mut self, index: usize) {
+        self.engines[index].manager.shutdown_all().await;
+        if let Some((stop, mut task)) = self.servers[index].take() {
+            stop.shutdown();
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
     pub async fn shutdown(self) {
         let storage: Vec<_> = self
             .engines
@@ -309,7 +389,7 @@ impl Cluster {
         for engine in &self.engines {
             engine.manager.shutdown_all().await;
         }
-        for (stop, mut task) in self.servers {
+        for (stop, mut task) in self.servers.into_iter().flatten() {
             stop.shutdown();
             if tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await

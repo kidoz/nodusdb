@@ -45,6 +45,11 @@ fn record_key(txn_id: &str) -> Vec<u8> {
     k
 }
 
+/// Test-only pause gate for 2PC recovery passes; mirrors the router's
+/// `AuthorityHook` pattern.
+#[cfg(test)]
+pub(crate) type RecoveryGate = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// `KvEngine` that replicates mutations through Raft and routes each key to the
 /// group that owns its shard. A key `"{table_id}:{pk}"` is mapped via the
 /// [`ShardRouter`] to a `ShardId`; reads and writes use a namespaced view of the
@@ -67,6 +72,11 @@ pub struct RaftKvEngine {
     pub txn_groups: Mutex<HashMap<TxnId, BTreeMap<String, TxnParticipant>>>,
     /// Observability for the cross-shard commit/recovery paths.
     pub metrics: nodus_monitoring::Metrics,
+    /// Test-only pause gate consulted at the top of `recover_pending_txns`;
+    /// an installed gate's error aborts the pass, and the recovery loop logs
+    /// it and retries on its next tick (see `pending_txn_recovery_loop`).
+    #[cfg(test)]
+    pub recovery_gate: Arc<Mutex<Option<RecoveryGate>>>,
 }
 
 /// In-memory write set: only acknowledged mutations change `intents`. A
@@ -370,6 +380,13 @@ impl RaftKvEngine {
     /// (it submits through the Raft router). Returns the number repaired.
     pub fn recover_pending_txns(&self) -> Result<usize> {
         let _span = tracing::info_span!("txn.recover_pending").entered();
+        #[cfg(test)]
+        {
+            let gate = self.recovery_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate()?;
+            }
+        }
         // A failed legacy decision must not starve the independently durable
         // tracked queue. Count its completed work even if legacy replay fails.
         let tracked = self.replay_terminal_decisions()?;
@@ -397,6 +414,11 @@ impl RaftKvEngine {
         }
         self.metrics.txn_recoveries_total.inc_by(repaired as u64);
         Ok(repaired + tracked)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_recovery_gate_for_test(&self, gate: Option<RecoveryGate>) {
+        *self.recovery_gate.lock().unwrap() = gate;
     }
 }
 
@@ -870,6 +892,7 @@ mod tests {
             manager: manager.clone(),
             txn_groups: Mutex::new(HashMap::new()),
             metrics: nodus_monitoring::Metrics::default(),
+            recovery_gate: Default::default(),
         });
 
         let row_t = format!("{table_t}:pk1");
@@ -971,6 +994,7 @@ mod tests {
             manager,
             txn_groups: Mutex::new(HashMap::new()),
             metrics: nodus_monitoring::Metrics::default(),
+            recovery_gate: Default::default(),
         });
         TwoShard {
             engine,
@@ -1235,6 +1259,7 @@ mod tests {
                 manager: e.manager.clone(),
                 txn_groups: Mutex::new(HashMap::new()),
                 metrics: Default::default(),
+                recovery_gate: Default::default(),
             };
             assert_eq!(recovered.recover_pending_txns().unwrap(), 1);
             assert_eq!(
