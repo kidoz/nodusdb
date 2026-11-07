@@ -65,15 +65,13 @@ Pass `--require <workload>` for each workload the capture must contain; absent
 workloads are otherwise skipped with a note, and unknown workloads are
 reported without a floor.
 
-## Scheduled soak and full-load runs
+## Manual soak and full-load runs
 
-The `soak` GitHub Actions workflow runs the bounded mixed-activity drill
-nightly and the full-scale server benchmark weekly (or on manual dispatch with
-`full_load` enabled), uploading the soak artifacts and `measurements.jsonl`
-for trend review. The nightly drill is the
+Scheduled soak and full-load workflows are deferred. Run the bounded
 [mixed-activity soak](../../benchmarks/workloads/mixed_activity_soak.md)
-workload; run it locally with `just bench-soak`. The 24-hour release-candidate soak exceeds hosted-runner
-limits and stays a manual step on the supported deployment profile.
+locally with `just bench-soak`, and use the full-scale benchmark command above
+for manual captures. The 24-hour release-candidate soak remains a manual step
+on the supported deployment profile.
 
 ## Measure the external Iceberg reader
 
