@@ -163,7 +163,9 @@ curl -X DELETE -H "Authorization: Bearer nodus-dev-token" \
 ```
 
 Deletion is manual and chain-aware. The server refuses to remove a parent needed
-by a retained incremental, and refuses deletion while any manifest is unreadable.
+by a retained incremental, and refuses deletion while any manifest is unreadable
+— see [Recover from an unreadable backup manifest](recover-from-an-unreadable-backup-manifest.md)
+for the symptoms and the remediation.
 There is no scheduled retention policy yet. Size retention from your recovery
 point objective, full/incremental cadence, WAL rate, chain length, and restore
 time objective; keep enough free space for a complete new full backup plus its
