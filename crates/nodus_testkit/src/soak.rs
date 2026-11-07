@@ -33,13 +33,8 @@ fn volume_available_bytes(path: &Path) -> io::Result<u64> {
     } else {
         stats.f_frsize
     };
-    u64::try_from(stats.f_bavail)
-        .ok()
-        .and_then(|available| {
-            u64::try_from(fragment_size)
-                .ok()
-                .and_then(|size| available.checked_mul(size))
-        })
+    u64::from(stats.f_bavail)
+        .checked_mul(fragment_size)
         .ok_or_else(|| io::Error::other("available filesystem bytes overflow u64"))
 }
 
