@@ -19,6 +19,12 @@ pub type NodusRaft = Raft<NodusTypeConfig>;
 /// (whose previous response was lost in flight) is recognized on the leader.
 pub const REQUEST_ID_HEADER: &str = "x-nodus-request-id";
 
+/// Response header carrying the serving node's current HLC timestamp, so peers
+/// converge their clocks on every Raft RPC instead of only on applied
+/// commits/snapshots. Purely additive: older peers never send it and newer
+/// peers tolerate its absence, so this is rolling-upgrade safe by construction.
+pub const CLOCK_HEADER: &str = "x-nodus-clock";
+
 /// How many recent forwarded-write request ids the leader remembers.
 const REQUEST_DEDUP_CAPACITY: usize = 4096;
 
@@ -74,6 +80,9 @@ pub struct RaftState {
     /// manager owns the mechanics; the hook is installed at startup).
     instantiate_hook: Arc<std::sync::OnceLock<InstantiateHook>>,
     peer_transport: Arc<std::sync::OnceLock<crate::network::RaftTransport>>,
+    /// Reports this node's current HLC timestamp; served as [`CLOCK_HEADER`] on
+    /// every raft-route response so peers converge their clocks on each RPC.
+    clock_probe: Arc<std::sync::OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>>,
 }
 
 impl RaftState {
@@ -91,6 +100,11 @@ impl RaftState {
     pub fn set_instantiate_hook(&self, hook: InstantiateHook) {
         let _ = self.instantiate_hook.set(hook);
     }
+    /// Installs the HLC probe served as [`CLOCK_HEADER`] on raft-route
+    /// responses (idempotent; the first wins).
+    pub fn set_clock_probe(&self, probe: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let _ = self.clock_probe.set(probe);
+    }
     pub fn new() -> Self {
         Self {
             rafts: Arc::new(RwLock::new(HashMap::new())),
@@ -99,6 +113,7 @@ impl RaftState {
             capability_kv: Arc::new(std::sync::OnceLock::new()),
             instantiate_hook: Arc::new(std::sync::OnceLock::new()),
             peer_transport: Arc::new(std::sync::OnceLock::new()),
+            clock_probe: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -194,6 +209,21 @@ async fn require_raft_auth(
     }
 }
 
+/// Attaches this node's current HLC timestamp as [`CLOCK_HEADER`] to every
+/// response from the raft routes — including auth rejections and error/404
+/// responses, since even failed calls carry convergence signal (mixed-version
+/// peers probe with requests a newer node may refuse). Registered outermost so
+/// it wraps the auth layer too.
+async fn attach_clock_header(State(state): State<RaftState>, req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    if let Some(probe) = state.clock_probe.get() {
+        response
+            .headers_mut()
+            .insert(CLOCK_HEADER, axum::http::HeaderValue::from(probe()));
+    }
+    response
+}
+
 pub fn raft_routes(auth: RaftRouteAuth) -> Router<RaftState> {
     Router::new()
         .route("/raft/capabilities/v1", post(capabilities))
@@ -207,6 +237,20 @@ pub fn raft_routes(auth: RaftRouteAuth) -> Router<RaftState> {
             auth,
             require_raft_auth,
         ))
+}
+
+/// Like [`raft_routes`], plus the [`CLOCK_HEADER`] middleware bound to
+/// `state`'s installed clock probe (a clone shares the probe cell). The header
+/// needs the state at router construction — axum middleware cannot extract the
+/// router state — so it lives on this separate constructor rather than
+/// changing every existing `raft_routes` caller; production serving uses this
+/// one. Peers tolerate the header's absence, so routers built with plain
+/// [`raft_routes`] simply serve no clock signal.
+pub fn raft_routes_with_clock(auth: RaftRouteAuth, state: &RaftState) -> Router<RaftState> {
+    raft_routes(auth).route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        attach_clock_header,
+    ))
 }
 
 async fn capabilities(
@@ -640,6 +684,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Serves the Raft routes with the clock-header middleware bound to
+    /// `state` and returns the bound address.
+    async fn serve_with_clock_probe(state: RaftState, probe: Option<u64>) -> std::net::SocketAddr {
+        if let Some(ts) = probe {
+            state.set_clock_probe(Arc::new(move || ts));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app =
+            raft_routes_with_clock(RaftRouteAuth::TransportAuthenticated, &state).with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// The `x-nodus-clock` response header carries the installed probe's value
+    /// on every raft-route response — even a 404 for an unknown group — so
+    /// peers converge their clocks on each RPC, failed calls included.
+    #[tokio::test]
+    async fn clock_header_is_served_on_every_response_when_probe_installed() {
+        let addr = serve_with_clock_probe(RaftState::new(), Some(424_242)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/raft/no-such-group/read_index"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers().get(CLOCK_HEADER).unwrap(),
+            "424242",
+            "the clock header must ride even error responses"
+        );
+
+        // The instantiate route (501 without a hook) carries it too.
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/raft/no-such-group/instantiate"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.headers().get(CLOCK_HEADER).unwrap(), "424242");
+    }
+
+    /// Without a probe (an older binary, or one where the clock was never
+    /// wired) no clock header is served, and peers must tolerate its absence.
+    #[tokio::test]
+    async fn clock_header_is_absent_without_probe() {
+        let addr = serve_with_clock_probe(RaftState::new(), None).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/raft/no-such-group/read_index"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(response.headers().get(CLOCK_HEADER).is_none());
     }
 
     /// Migration-protocol ingress: admitted only on the mTLS peer listener

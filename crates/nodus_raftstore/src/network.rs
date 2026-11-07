@@ -21,6 +21,12 @@ pub struct RaftTransport {
     /// routes on their public listener require it (the admin token doubles as
     /// the cluster's shared secret); mTLS-only peer listeners ignore it.
     auth_token: Option<Arc<str>>,
+    /// Receives the peer's HLC timestamp from the `x-nodus-clock` response
+    /// header on every RPC, so this node's clock converges with its peers'
+    /// instead of only advancing on applied commits/snapshots. Best-effort: a
+    /// missing or unparseable header (an older peer) is silently skipped, and
+    /// observation never fails an RPC.
+    clock_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// The outbound HTTP client behind a [`RaftTransport`].
@@ -57,6 +63,32 @@ impl RaftTransport {
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {
         self.auth_token = token.map(Into::into);
         self
+    }
+
+    /// Installs the HLC observer fed from peers' `x-nodus-clock` response
+    /// headers (see the field docs).
+    pub fn with_clock_observer(mut self, observer: Arc<dyn Fn(u64) + Send + Sync>) -> Self {
+        self.clock_observer = Some(observer);
+        self
+    }
+
+    /// Hands the peer's `x-nodus-clock` response header, if any, to the
+    /// installed clock observer. Call right after `send()` returns — headers
+    /// are available before the body is consumed, so even error responses
+    /// (and responses whose body parsing later fails) converge the clock.
+    /// A missing or unparseable header (an older peer) is silently skipped.
+    fn observe_clock(&self, headers: &reqwest::header::HeaderMap) {
+        let Some(observer) = &self.clock_observer else {
+            return;
+        };
+        let Some(ts) = headers
+            .get(crate::server::CLOCK_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return;
+        };
+        observer(ts);
     }
 
     /// Applies the configured bearer credential to an outbound request.
@@ -102,7 +134,7 @@ impl RaftTransport {
             self.scheme() == "https",
             "remote upgrade verification requires peer mTLS"
         );
-        let mut response = self
+        let response = self
             .authorize(
                 self.client()
                     .post(format!("https://{addr}/raft/capabilities/v1")),
@@ -113,8 +145,9 @@ impl RaftTransport {
                 preflight,
             })
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        self.observe_clock(response.headers());
+        let mut response = response.error_for_status()?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             anyhow::ensure!(
@@ -136,6 +169,7 @@ impl RaftTransport {
             check_snapshots: false,
             admission_source: None,
             auth_token: None,
+            clock_observer: None,
         }
     }
 
@@ -148,6 +182,7 @@ impl RaftTransport {
             check_snapshots: false,
             admission_source: None,
             auth_token: None,
+            clock_observer: None,
         }
     }
 
@@ -164,6 +199,7 @@ impl RaftTransport {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("read-index to {addr}: {e}"))?;
+        self.observe_clock(response.headers());
         anyhow::ensure!(
             response.status().is_success(),
             "leader {addr} could not serve read-index: {}",
@@ -199,6 +235,7 @@ impl RaftTransport {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("replica request to {addr}: {e}"))?;
+        self.observe_clock(response.headers());
         anyhow::ensure!(
             response.status().is_success(),
             "replica instantiate on {addr} returned {}",
@@ -234,6 +271,7 @@ impl RaftTransport {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("forward to {addr}: {e}"))?;
+        self.observe_clock(response.headers());
         if response.status().is_success() {
             // The leader returns the applied ShardResponse so a forwarded
             // prepare's vote reaches the coordinator.
@@ -345,6 +383,7 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        self.transport.observe_clock(resp.headers());
 
         let res: Result<AppendEntriesResponse<u64>, RaftError<u64>> = resp
             .json()
@@ -420,6 +459,7 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        self.transport.observe_clock(resp.headers());
 
         let res: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> = resp
             .json()
@@ -456,6 +496,7 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        self.transport.observe_clock(resp.headers());
 
         let res: Result<VoteResponse<u64>, RaftError<u64>> = resp
             .json()
@@ -494,5 +535,110 @@ impl RaftNetworkFactory<NodusTypeConfig> for NodusNetworkFactory {
             client: self.transport.client(),
             scheme: self.transport.scheme.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::{CLOCK_HEADER, RaftState, raft_routes_with_clock};
+
+    #[test]
+    fn clock_header_extraction_is_best_effort() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let transport = RaftTransport::plain()
+            .with_clock_observer(Arc::new(move |ts| sink.lock().unwrap().push(ts)));
+
+        // A valid header is parsed and delivered.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            CLOCK_HEADER,
+            reqwest::header::HeaderValue::from(7_654_321u64),
+        );
+        transport.observe_clock(&headers);
+        assert_eq!(*observed.lock().unwrap(), vec![7_654_321]);
+
+        // A missing header is silently skipped.
+        transport.observe_clock(&reqwest::header::HeaderMap::new());
+        // Garbage is silently skipped too — never fails the RPC.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            CLOCK_HEADER,
+            reqwest::header::HeaderValue::from_static("not-a-timestamp"),
+        );
+        transport.observe_clock(&headers);
+        assert_eq!(observed.lock().unwrap().len(), 1, "no further observations");
+
+        // Without an observer nothing happens (and nothing panics).
+        RaftTransport::plain().observe_clock(&headers);
+    }
+
+    /// Serves the raft routes with a fixed clock probe and returns the address.
+    async fn serve_with_probe(probe: Option<u64>) -> std::net::SocketAddr {
+        let state = RaftState::new();
+        if let Some(ts) = probe {
+            state.set_clock_probe(Arc::new(move || ts));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app =
+            raft_routes_with_clock(crate::server::RaftRouteAuth::TransportAuthenticated, &state)
+                .with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// The observer fires with the probed value on every RPC response — here
+    /// `read_index` (404, unknown group) and `instantiate_replica` (501, no
+    /// hook), proving convergence rides even error responses.
+    #[tokio::test]
+    async fn transport_observes_peer_clock_on_every_response() {
+        let addr = serve_with_probe(Some(424_242)).await;
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let transport = RaftTransport::plain()
+            .with_clock_observer(Arc::new(move |ts| sink.lock().unwrap().push(ts)));
+
+        // Both calls fail (unknown group / no instantiate hook) — the header is
+        // observed before the status is even checked.
+        assert!(
+            transport
+                .read_index(&addr.to_string(), "no-such-group")
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .instantiate_replica(&addr.to_string(), "no-such-group")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![424_242, 424_242],
+            "the observer must fire once per response, errors included"
+        );
+    }
+
+    /// A peer that serves no clock header (an older binary) is tolerated: the
+    /// RPC behaves exactly as before and the observer never fires.
+    #[tokio::test]
+    async fn transport_tolerates_missing_clock_header() {
+        let addr = serve_with_probe(None).await;
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let transport = RaftTransport::plain()
+            .with_clock_observer(Arc::new(move |ts| sink.lock().unwrap().push(ts)));
+
+        assert!(
+            transport
+                .read_index(&addr.to_string(), "no-such-group")
+                .await
+                .is_err()
+        );
+        assert!(observed.lock().unwrap().is_empty());
     }
 }

@@ -706,11 +706,17 @@ pub async fn run_server_full(
     // Outbound Raft transport: plain HTTP, or an mTLS `https` client when
     // inter-node TLS is configured. The admin token is attached as a bearer
     // credential so peers that serve Raft RPCs on their public listener accept
-    // them (mTLS peer listeners authenticate via the client certificate).
+    // them (mTLS peer listeners authenticate via the client certificate). The
+    // clock observer adopts each peer's HLC timestamp from the `x-nodus-clock`
+    // response header, so clocks converge on every RPC.
     let raft_transport = build_raft_transport(&config.cluster)?
         .with_snapshot_checks()
         .with_admission_source(local_kv.clone())
-        .with_auth_token(config.admin.token.clone());
+        .with_auth_token(config.admin.token.clone())
+        .with_clock_observer({
+            let clock = txn.clone();
+            Arc::new(move |ts| nodus_txn::TxnManager::observe_timestamp(clock.as_ref(), ts))
+        });
     let authority = nodus_raftstore::upgrade::read(local_kv.as_ref())?;
     anyhow::ensure!(
         !nodus_raftstore::upgrade::requires_txn_reader(&authority)
@@ -1399,7 +1405,7 @@ pub async fn run_server_full(
         // On the shared listener the Raft endpoints are reachable by anything
         // that can reach the admin API, so they require the same credential.
         app = app.merge(
-            nodus_raftstore::server::raft_routes(raft_route_auth(&config))
+            nodus_raftstore::server::raft_routes_with_clock(raft_route_auth(&config), &raft_state)
                 .with_state(raft_state.clone()),
         );
     }
@@ -1424,8 +1430,10 @@ pub async fn run_server_full(
             Some(listener) => listener,
             None => TcpListener::bind(&addr).await?,
         };
-        let raft_app = Router::new()
-            .merge(nodus_raftstore::server::raft_routes(raft_auth).with_state(raft_state));
+        let raft_app = Router::new().merge(
+            nodus_raftstore::server::raft_routes_with_clock(raft_auth, &raft_state)
+                .with_state(raft_state),
+        );
         let mut raft_shutdown = shutdown.clone();
         tracing::info!(
             "Raft peer listener on {} (mTLS: {})",

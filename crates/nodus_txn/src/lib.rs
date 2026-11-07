@@ -116,6 +116,14 @@ pub trait TimestampStore: Send + Sync {
 /// far past the last *issued* timestamp, never below it.
 const RESERVATION_WINDOW: Timestamp = 1_000_000;
 
+/// How far ahead of the local wall clock an observed remote timestamp may be
+/// before it signals a misconfigured peer clock (microseconds — timestamps are
+/// µs since epoch, so 500_000 is 500ms, matching CockroachDB's default max
+/// clock offset). Exceeding the bound never refuses adoption (see the pinned
+/// `update` semantics: a node that applied a far-ahead replicated commit must
+/// keep issuing past it); it only raises an error-level log once per alarm.
+pub const MAX_OBSERVED_CLOCK_SKEW_US: Timestamp = 500_000;
+
 pub trait TxnManager: Send + Sync {
     fn begin_txn(&self) -> Result<TxnRecord>;
     /// Tracks a write intent to enable OCC (Optimistic Concurrency Control) conflict detection.
@@ -130,6 +138,14 @@ pub trait TxnManager: Send + Sync {
     /// reclaimed: the oldest in-flight read timestamp, or the current clock when
     /// no transactions are active. Default is `0` (reclaim nothing).
     fn gc_watermark(&self) -> Timestamp {
+        0
+    }
+
+    /// Reads the current clock without advancing it (the larger of wall-clock
+    /// now and the last issued timestamp). Served to peers so they can converge
+    /// their clocks on every exchange. Default `0` documents "no clock shared";
+    /// observing `0` is a harmless no-op since the clock never regresses.
+    fn clock_now(&self) -> Timestamp {
         0
     }
 
@@ -160,6 +176,32 @@ use std::collections::HashMap;
 struct ClockState {
     hlc: HybridLogicalClock,
     reserved: Timestamp,
+    /// Whether an observed peer timestamp was last seen beyond
+    /// [`MAX_OBSERVED_CLOCK_SKEW_US`]; bounds the skew alarm to one log per
+    /// transition into (and out of) the alarmed state.
+    skew_alarm: bool,
+}
+
+impl ClockState {
+    /// Logs once when an observed peer timestamp crosses beyond the skew bound
+    /// (suspected misconfigured peer clock), and once when observations return
+    /// within bound. Adoption is unaffected — callers always adopt for safety.
+    fn alarm_on_excessive_skew(&mut self, ts: Timestamp) {
+        let bound = HybridLogicalClock::wall_now().saturating_add(MAX_OBSERVED_CLOCK_SKEW_US);
+        if ts > bound {
+            if !self.skew_alarm {
+                self.skew_alarm = true;
+                tracing::error!(
+                    "observed peer timestamp {ts} exceeds local wall clock by more than \
+                     {MAX_OBSERVED_CLOCK_SKEW_US}us — suspected misconfigured peer clock; \
+                     adoption continues for safety"
+                );
+            }
+        } else if self.skew_alarm {
+            self.skew_alarm = false;
+            tracing::info!("observed peer timestamps are within the clock-skew bound again");
+        }
+    }
 }
 
 pub struct MemTxnManager {
@@ -175,6 +217,7 @@ impl MemTxnManager {
             clock: RwLock::new(ClockState {
                 hlc: HybridLogicalClock::new(),
                 reserved: 0,
+                skew_alarm: false,
             }),
             persistence: None,
         }
@@ -193,6 +236,7 @@ impl MemTxnManager {
             clock: RwLock::new(ClockState {
                 hlc: HybridLogicalClock { last },
                 reserved: persisted,
+                skew_alarm: false,
             }),
             persistence: Some(store),
         })
@@ -370,17 +414,24 @@ impl TxnManager for MemTxnManager {
         oldest_active.unwrap_or_else(|| self.clock.read().unwrap().hlc.now())
     }
 
+    fn clock_now(&self) -> Timestamp {
+        self.clock.read().unwrap().hlc.now()
+    }
+
     fn observe_timestamp(&self, ts: Timestamp) {
         // Advancing the clock here needs no reservation: nothing durable is
         // written at this timestamp, and the next commit that issues a value
         // past it will reserve before returning.
-        self.clock.write().unwrap().hlc.update(ts);
+        let mut clock = self.clock.write().unwrap();
+        clock.alarm_on_excessive_skew(ts);
+        clock.hlc.update(ts);
     }
 
     fn observe_durable(&self, ts: Timestamp) -> Result<()> {
         // A version was durably applied at `ts`, so the clock must resume past it
         // after a restart: advance and extend the reservation to cover `ts`.
         let mut clock = self.clock.write().unwrap();
+        clock.alarm_on_excessive_skew(ts);
         clock.hlc.update(ts);
         self.reserve_through(&mut clock, ts)
     }
@@ -546,6 +597,34 @@ mod tests {
         );
         let commit_ts = manager.commit_txn(next.txn_id).unwrap();
         assert!(commit_ts > next.read_ts);
+    }
+
+    /// A remote timestamp beyond the skew bound (a misconfigured peer clock)
+    /// raises the error-level alarm but is still adopted: refusing it would let
+    /// this node issue timestamps at or below versions a peer already durably
+    /// committed at that timestamp. This pins "never refuse" for the
+    /// beyond-bound case; the alarm itself is log-only (no assertion).
+    #[test]
+    fn observing_beyond_the_skew_bound_still_adopts() {
+        let manager = MemTxnManager::new();
+        let remote = manager.clock_now() + 10 * MAX_OBSERVED_CLOCK_SKEW_US;
+        manager.observe_timestamp(remote);
+
+        let next = manager.begin_txn().unwrap();
+        assert!(
+            next.read_ts > remote,
+            "a beyond-bound observation must still advance the clock"
+        );
+        // `clock_now` reports the merged clock (≥ the adopted remote).
+        assert!(manager.clock_now() > remote);
+
+        // The same holds on the durable path.
+        let durable = remote + 1_000_000;
+        manager.observe_durable(durable).unwrap();
+        assert!(
+            manager.clock_now() > durable,
+            "a beyond-bound durable observation must still advance the clock"
+        );
     }
 }
 

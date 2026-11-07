@@ -229,6 +229,15 @@ impl MultiRaftManager {
         state.set_node_id(node_id);
         state.set_capability_storage(base_kv.clone());
         state.set_peer_transport(transport.clone());
+        // Serve this node's HLC now on every raft-route response, so peers
+        // converge their clocks on each RPC instead of only on applied
+        // commits/snapshots. (The outbound half — observing peers' headers —
+        // rides on the transport's clock observer, installed where the
+        // production transport is built.)
+        state.set_clock_probe({
+            let clock = clock.clone();
+            Arc::new(move || clock.clock_now())
+        });
         Self {
             node_id,
             advertise_addr,
