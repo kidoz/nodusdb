@@ -84,6 +84,10 @@ test-loom:
 bench:
     cargo bench -p nodus_storage_lsm
 
+# Run the bounded mixed-activity soak drill (artifacts under target/mixed-activity-soak)
+bench-soak:
+    cargo test -p nodus_integration_tests --test mixed_activity_soak --locked -- --ignored --nocapture
+
 # Build fuzz targets without running the fuzzers
 fuzz-check:
     cargo check --manifest-path tests/fuzz/Cargo.toml

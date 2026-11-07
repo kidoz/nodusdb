@@ -49,6 +49,16 @@ The output directory must not already contain `measurements.jsonl`; use a fresh
 directory for each run. Generated artifacts stay under `target/` and are not
 committed.
 
+## Scheduled soak and full-load runs
+
+The `soak` GitHub Actions workflow runs the bounded mixed-activity drill
+nightly and the full-scale server benchmark weekly (or on manual dispatch with
+`full_load` enabled), uploading the soak artifacts and `measurements.jsonl`
+for trend review. The nightly drill is the
+[mixed-activity soak](../../benchmarks/workloads/mixed_activity_soak.md)
+workload; run it locally with `just bench-soak`. The 24-hour release-candidate soak exceeds hosted-runner
+limits and stays a manual step on the supported deployment profile.
+
 ## Measure the external Iceberg reader
 
 ```sh

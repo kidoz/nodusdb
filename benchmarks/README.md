@@ -11,6 +11,7 @@ Current benchmark entrypoints:
 ```bash
 just bench
 cargo bench --locked -p nodus_integration_tests --bench server_bench
+just bench-soak
 just test-iceberg-resource-live
 ```
 
