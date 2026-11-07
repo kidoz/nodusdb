@@ -47,6 +47,8 @@ pub struct ServerHandle {
     catalog: Arc<nodus_catalog::MemoryCatalog>,
     #[cfg(any(test, feature = "test-utils"))]
     local_kv: Arc<dyn nodus_storage_api::KvEngine>,
+    #[cfg(any(test, feature = "test-utils"))]
+    multi_raft: Arc<crate::multi_raft::MultiRaftManager>,
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub pgwire_task: JoinHandle<anyhow::Result<()>>,
@@ -63,6 +65,28 @@ pub struct ServerHandle {
 impl ServerHandle {
     pub fn catalog(&self) -> Arc<nodus_catalog::MemoryCatalog> {
         self.catalog.clone()
+    }
+
+    pub async fn trigger_raft_snapshot(&self, group: &str) -> anyhow::Result<()> {
+        let raft = self
+            .multi_raft
+            .get(group)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Raft group {group} is not hosted"))?;
+        raft.trigger()
+            .snapshot()
+            .await
+            .map_err(|error| anyhow::anyhow!("trigger snapshot for {group}: {error}"))
+    }
+
+    pub async fn raft_applied_index(&self, group: &str) -> anyhow::Result<Option<u64>> {
+        let raft = self
+            .multi_raft
+            .get(group)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Raft group {group} is not hosted"))?;
+        let metrics = raft.metrics();
+        Ok(metrics.borrow().last_applied.map(|log_id| log_id.index))
     }
 
     pub fn local_index_entry_count(&self, table: &str, index_name: &str) -> anyhow::Result<usize> {
@@ -1715,6 +1739,8 @@ pub async fn run_server_full(
         catalog,
         #[cfg(any(test, feature = "test-utils"))]
         local_kv,
+        #[cfg(any(test, feature = "test-utils"))]
+        multi_raft,
         pgwire_addr,
         http_addr,
         pgwire_task,

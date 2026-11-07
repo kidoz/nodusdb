@@ -97,6 +97,24 @@ impl ClusterNode {
             .local_index_entry_count(table, index)
     }
 
+    pub async fn trigger_raft_snapshot(&self, group: &str) -> Result<()> {
+        self.running
+            .as_ref()
+            .context("node is stopped")?
+            .handle
+            .trigger_raft_snapshot(group)
+            .await
+    }
+
+    pub async fn raft_applied_index(&self, group: &str) -> Result<Option<u64>> {
+        self.running
+            .as_ref()
+            .context("node is stopped")?
+            .handle
+            .raft_applied_index(group)
+            .await
+    }
+
     fn config(&self) -> NodusConfig {
         let mut config = NodusConfig::default();
         config.admin.password = Some("nodus".into());
