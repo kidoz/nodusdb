@@ -48,15 +48,16 @@ Maintenance proceeds in this order while the workload continues:
 2. Create a full backup and verify it through the admin API.
 3. Require a real automatic LSM compaction. Production defaults flush at 4 MiB
    and compact when four SSTables accumulate.
-4. Require more than 1,500 retained entries in the data group, followed by a new
-   successful snapshot and an observed drop from the pre-snapshot retained peak.
-   The production policy builds after 5,000 new logs and keeps 1,000 at purge;
-   later samples may already include new writes.
+4. Require more than 1,500 retained entries and growth in both retained-entry
+   count and serialized log payload bytes, followed by a new successful snapshot
+   and observed drops from both pre-snapshot peaks. The production policy builds
+   after 5,000 new logs and keeps 1,000 at purge; later samples may already
+   include new writes.
 5. Record the follower's applied index and gracefully stop node 3. While it is
-   down, require another snapshot/purge cycle. The leader's applied index must
-   advance by more than the entries retained at that observation, so the
-   follower cannot catch up from the complete missed prefix and must receive a
-   snapshot.
+   down, require another snapshot/purge cycle with entry and serialized-byte
+   reclamation. The leader's applied index must advance by more than the entries
+   retained at that observation, so the follower cannot catch up from the
+   complete missed prefix and must receive a snapshot.
 6. Restart node 3 on its original ports and persistent directory, then require
    readiness and three live nodes within bounded 300-second waits. After pausing
    writes, also require the same data-group applied index on every replica

@@ -370,11 +370,42 @@ fn snapshot_builds(samples: &MetricSamples, group: &str) -> f64 {
     .unwrap_or(0.0)
 }
 
-fn retained_logs(samples: &MetricSamples, group: &str) -> Option<f64> {
-    metric(
-        samples,
-        &format!("nodus_raft_log_entries{{group=\"{group}\"}}"),
-    )
+#[derive(Clone, Copy, Debug)]
+struct LogRetention {
+    entries: f64,
+    serialized_bytes: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogGrowth {
+    before: LogRetention,
+    grown: LogRetention,
+}
+
+fn log_retention(samples: &MetricSamples, group: &str) -> Option<LogRetention> {
+    Some(LogRetention {
+        entries: metric(
+            samples,
+            &format!("nodus_raft_log_entries{{group=\"{group}\"}}"),
+        )?,
+        serialized_bytes: metric(
+            samples,
+            &format!("nodus_raft_log_serialized_bytes{{group=\"{group}\"}}"),
+        )?,
+    })
+}
+
+fn log_growth_detail(growth: LogGrowth) -> Value {
+    json!({
+        "before": {
+            "retained_log_entries": growth.before.entries,
+            "serialized_log_bytes": growth.before.serialized_bytes,
+        },
+        "grown": {
+            "retained_log_entries": growth.grown.entries,
+            "serialized_log_bytes": growth.grown.serialized_bytes,
+        },
+    })
 }
 
 async fn metrics(cluster: &ClusterFixture, index: usize) -> Result<MetricSamples> {
@@ -478,17 +509,29 @@ async fn wait_for_compaction(cluster: &ClusterFixture) -> Result<Value> {
     }
 }
 
-async fn wait_for_log_growth(cluster: &ClusterFixture, group: &str) -> Result<f64> {
+async fn wait_for_log_growth(cluster: &ClusterFixture, group: &str) -> Result<LogGrowth> {
     let deadline = Instant::now() + Duration::from_secs(300);
+    let mut before = None;
+    let mut latest = None;
     loop {
         let samples = metrics(cluster, 0).await?;
-        if let Some(retained) = retained_logs(&samples, group)
-            && retained > 1_500.0
-        {
-            return Ok(retained);
+        if let Some(current) = log_retention(&samples, group) {
+            latest = Some(current);
+            let baseline = *before.get_or_insert(current);
+            if current.entries > 1_500.0
+                && current.entries > baseline.entries
+                && current.serialized_bytes > baseline.serialized_bytes
+            {
+                return Ok(LogGrowth {
+                    before: baseline,
+                    grown: current,
+                });
+            }
         }
         if Instant::now() >= deadline {
-            bail!("Raft log did not grow beyond 1500 retained entries");
+            bail!(
+                "Raft log entries and serialized bytes did not grow beyond 1500 entries: before={before:?}, latest={latest:?}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -498,26 +541,37 @@ async fn wait_for_snapshot_and_purge(
     cluster: &ClusterFixture,
     group: &str,
     previous_builds: f64,
+    grown: LogRetention,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(600);
-    let mut peak_retained = 0.0_f64;
+    let mut peak = grown;
+    let mut latest = None;
     loop {
         let samples = metrics(cluster, 0).await?;
         let builds = snapshot_builds(&samples, group);
-        let retained = retained_logs(&samples, group);
-        peak_retained = peak_retained.max(retained.unwrap_or(0.0));
-        if builds > previous_builds && retained.is_some_and(|entries| entries < peak_retained) {
-            return Ok(json!({
-                "snapshot_builds": builds,
-                "peak_retained_log_entries": peak_retained,
-                "retained_log_entries": retained,
-                "reclaimed_log_entries": peak_retained - retained.unwrap_or(peak_retained),
-                "production_retained_limit_at_purge": SNAPSHOT_RETAINED_LIMIT,
-            }));
+        if let Some(current) = log_retention(&samples, group) {
+            latest = Some(current);
+            peak.entries = peak.entries.max(current.entries);
+            peak.serialized_bytes = peak.serialized_bytes.max(current.serialized_bytes);
+            if builds > previous_builds
+                && current.entries < peak.entries
+                && current.serialized_bytes < peak.serialized_bytes
+            {
+                return Ok(json!({
+                    "snapshot_builds": builds,
+                    "peak_retained_log_entries": peak.entries,
+                    "retained_log_entries": current.entries,
+                    "reclaimed_log_entries": peak.entries - current.entries,
+                    "peak_serialized_log_bytes": peak.serialized_bytes,
+                    "serialized_log_bytes": current.serialized_bytes,
+                    "reclaimed_serialized_log_bytes": peak.serialized_bytes - current.serialized_bytes,
+                    "production_retained_limit_at_purge": SNAPSHOT_RETAINED_LIMIT,
+                }));
+            }
         }
         if Instant::now() >= deadline {
             bail!(
-                "snapshot/purge did not complete: builds={builds}, previous={previous_builds}, peak={peak_retained}, retained={retained:?}"
+                "snapshot/purge did not reclaim entries and serialized bytes: builds={builds}, previous={previous_builds}, peak={peak:?}, latest={latest:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -872,15 +926,16 @@ async fn execute(
 
     set_phase(&phase, "first_snapshot");
     let initial_builds = snapshot_builds(&metrics(&cluster, 0).await?, &group);
-    let grown = wait_for_log_growth(&cluster, &group).await?;
+    let first_growth = wait_for_log_growth(&cluster, &group).await?;
     let started = Instant::now();
-    let first = wait_for_snapshot_and_purge(&cluster, &group, initial_builds).await?;
+    let first =
+        wait_for_snapshot_and_purge(&cluster, &group, initial_builds, first_growth.grown).await?;
     record_activity(
         &artifact,
         activities,
         "first_snapshot_and_log_reclamation",
         started,
-        json!({"retained_before": grown, "observation": first}),
+        json!({"log_growth": log_growth_detail(first_growth), "observation": first}),
     )
     .await?;
 
@@ -904,9 +959,10 @@ async fn execute(
     let first_builds = first["snapshot_builds"]
         .as_f64()
         .context("first snapshot observation omitted builds")?;
-    wait_for_log_growth(&cluster, &group).await?;
+    let second_growth = wait_for_log_growth(&cluster, &group).await?;
     let started = Instant::now();
-    let second = wait_for_snapshot_and_purge(&cluster, &group, first_builds).await?;
+    let second =
+        wait_for_snapshot_and_purge(&cluster, &group, first_builds, second_growth.grown).await?;
     let leader_applied = data_group_applied(&cluster, 0, &group)
         .await?
         .context("node 1 omitted leader applied index")?;
@@ -927,7 +983,7 @@ async fn execute(
         activities,
         "second_snapshot_and_log_reclamation_while_follower_down",
         started,
-        json!({"missed_acknowledged_writes": missed_writes, "follower_applied": follower_applied, "leader_applied": leader_applied, "missed_log_entries": missed_log_entries, "observation": second}),
+        json!({"missed_acknowledged_writes": missed_writes, "follower_applied": follower_applied, "leader_applied": leader_applied, "missed_log_entries": missed_log_entries, "log_growth": log_growth_detail(second_growth), "observation": second}),
     )
     .await?;
 
