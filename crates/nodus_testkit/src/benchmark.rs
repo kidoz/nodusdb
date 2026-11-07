@@ -303,6 +303,89 @@ pub struct NodeMetricRecord {
     pub delta: MetricSamples,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct StorageUsage {
+    pub logical_bytes: u64,
+    pub allocated_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NodeStorageRecord {
+    pub node: String,
+    pub before: StorageUsage,
+    pub after: StorageUsage,
+    pub logical_bytes_delta: i128,
+    pub allocated_bytes_delta: Option<i128>,
+}
+
+impl NodeStorageRecord {
+    fn new(node: String, before: StorageUsage, after: StorageUsage) -> Self {
+        Self {
+            node,
+            logical_bytes_delta: i128::from(after.logical_bytes) - i128::from(before.logical_bytes),
+            allocated_bytes_delta: before
+                .allocated_bytes
+                .zip(after.allocated_bytes)
+                .map(|(before, after)| i128::from(after) - i128::from(before)),
+            before,
+            after,
+        }
+    }
+}
+
+fn directory_storage_usage(root: &Path) -> io::Result<StorageUsage> {
+    let mut usage = StorageUsage::default();
+    let mut pending = vec![root.to_path_buf()];
+    #[cfg(unix)]
+    let mut visited = BTreeSet::new();
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if !visited.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+            let allocated = metadata.blocks().checked_mul(512).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("allocated bytes overflow for {}", path.display()),
+                )
+            })?;
+            let total = usage.allocated_bytes.get_or_insert(0);
+            *total = total.checked_add(allocated).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "allocated byte total overflow")
+            })?;
+        }
+        usage.logical_bytes = usage
+            .logical_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "logical byte total overflow")
+            })?;
+    }
+    Ok(usage)
+}
+
+async fn read_storage_usage(path: &Path) -> io::Result<StorageUsage> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || directory_storage_usage(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkRecord {
     pub schema_version: u32,
@@ -323,6 +406,8 @@ pub struct BenchmarkRecord {
     #[serde(default)]
     pub allocator: AllocatorSummary,
     pub node_metrics: Vec<NodeMetricRecord>,
+    #[serde(default)]
+    pub node_storage: Vec<NodeStorageRecord>,
 }
 
 pub struct BenchmarkArtifact {
@@ -390,6 +475,13 @@ pub fn global_artifact() -> io::Result<&'static BenchmarkArtifact> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BenchmarkNode {
+    pub node: String,
+    pub http_addr: SocketAddr,
+    pub data_path: PathBuf,
+}
+
 pub struct IterationMeasurement {
     workload: String,
     scale: String,
@@ -400,8 +492,9 @@ pub struct IterationMeasurement {
     recorder: LatencyRecorder,
     resources: ProcessResourceMonitor,
     http: reqwest::Client,
-    nodes: Vec<(String, SocketAddr)>,
+    nodes: Vec<BenchmarkNode>,
     before: Vec<MetricSamples>,
+    storage_before: Vec<StorageUsage>,
 }
 
 impl IterationMeasurement {
@@ -412,16 +505,20 @@ impl IterationMeasurement {
         client_count: usize,
         criterion_iterations: u64,
         request_kind: &str,
-        nodes: Vec<(String, SocketAddr)>,
+        nodes: Vec<BenchmarkNode>,
     ) -> io::Result<Self> {
         let http = reqwest::Client::new();
         let mut before = Vec::with_capacity(nodes.len());
-        for (_, address) in &nodes {
+        for node in &nodes {
             before.push(
-                scrape_metrics(&http, *address)
+                scrape_metrics(&http, node.http_addr)
                     .await
                     .map_err(io::Error::other)?,
             );
+        }
+        let mut storage_before = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            storage_before.push(read_storage_usage(&node.data_path).await?);
         }
         Ok(Self {
             workload: workload.to_owned(),
@@ -435,6 +532,7 @@ impl IterationMeasurement {
             http,
             nodes,
             before,
+            storage_before,
         })
     }
 
@@ -449,12 +547,16 @@ impl IterationMeasurement {
         row_count: Option<u64>,
     ) -> io::Result<()> {
         let mut after = Vec::with_capacity(self.nodes.len());
-        for (_, address) in &self.nodes {
+        for node in &self.nodes {
             after.push(
-                scrape_metrics(&self.http, *address)
+                scrape_metrics(&self.http, node.http_addr)
                     .await
                     .map_err(io::Error::other)?,
             );
+        }
+        let mut storage_after = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            storage_after.push(read_storage_usage(&node.data_path).await?);
         }
         let (rss, allocator) = self.resources.finish();
         let latency = self.recorder.summary();
@@ -482,14 +584,20 @@ impl IterationMeasurement {
         });
         let node_metrics = self
             .nodes
-            .into_iter()
+            .iter()
             .zip(self.before.into_iter().zip(after))
-            .map(|((node, _), (before, after))| NodeMetricRecord {
+            .map(|(node, (before, after))| NodeMetricRecord {
                 delta: metric_deltas(&before, &after),
-                node,
+                node: node.node.clone(),
                 before,
                 after,
             })
+            .collect();
+        let node_storage = self
+            .nodes
+            .into_iter()
+            .zip(self.storage_before.into_iter().zip(storage_after))
+            .map(|(node, (before, after))| NodeStorageRecord::new(node.node, before, after))
             .collect();
         global_artifact()?.append(BenchmarkRecord {
             schema_version: BENCHMARK_RECORD_SCHEMA_VERSION,
@@ -509,6 +617,7 @@ impl IterationMeasurement {
             rss,
             allocator,
             node_metrics,
+            node_storage,
         })
     }
 }
@@ -637,6 +746,59 @@ mod tests {
     }
 
     #[test]
+    fn storage_usage_counts_regular_files_without_following_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("nested")).unwrap();
+        std::fs::write(directory.path().join("first"), vec![0_u8; 8_192]).unwrap();
+        std::fs::write(directory.path().join("nested/second"), b"abc").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                directory.path().join("first"),
+                directory.path().join("file-link"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                directory.path().join("nested"),
+                directory.path().join("directory-link"),
+            )
+            .unwrap();
+        }
+        let usage = directory_storage_usage(directory.path()).unwrap();
+        assert_eq!(usage.logical_bytes, 8_195);
+        #[cfg(unix)]
+        assert!(usage.allocated_bytes.unwrap() > 0);
+        #[cfg(not(unix))]
+        assert_eq!(usage.allocated_bytes, None);
+    }
+
+    #[test]
+    fn storage_record_computes_signed_deltas() {
+        let record = NodeStorageRecord::new(
+            "1".into(),
+            StorageUsage {
+                logical_bytes: 100,
+                allocated_bytes: Some(400),
+            },
+            StorageUsage {
+                logical_bytes: 80,
+                allocated_bytes: Some(300),
+            },
+        );
+        assert_eq!(record.logical_bytes_delta, -20);
+        assert_eq!(record.allocated_bytes_delta, Some(-100));
+        let unavailable = NodeStorageRecord::new(
+            "1".into(),
+            StorageUsage::default(),
+            StorageUsage {
+                logical_bytes: 1,
+                allocated_bytes: None,
+            },
+        );
+        assert_eq!(unavailable.allocated_bytes_delta, None);
+    }
+
+    #[test]
     fn artifact_round_trip_preserves_schema_and_reads_legacy_records() {
         let directory = tempfile::tempdir().unwrap();
         let artifact = BenchmarkArtifact::new(directory.path(), "test-run".into()).unwrap();
@@ -670,6 +832,7 @@ mod tests {
                     high_water_bytes: Some(20),
                 },
                 node_metrics: Vec::new(),
+                node_storage: Vec::new(),
             })
             .unwrap();
         let output = std::fs::read_to_string(artifact.path()).unwrap();
@@ -679,12 +842,24 @@ mod tests {
         assert_eq!(record.rss.high_water_bytes, None);
         assert_eq!(record.allocator.high_water_bytes, Some(20));
 
+        let mut previous_schema_2: serde_json::Value =
+            serde_json::from_str(output.trim_end()).unwrap();
+        previous_schema_2
+            .as_object_mut()
+            .unwrap()
+            .remove("node_storage");
+        let previous_schema_2: BenchmarkRecord = serde_json::from_value(previous_schema_2).unwrap();
+        assert_eq!(previous_schema_2.schema_version, 2);
+        assert!(previous_schema_2.node_storage.is_empty());
+
         let mut legacy: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
         let object = legacy.as_object_mut().unwrap();
         object.insert("schema_version".into(), 1.into());
         object.remove("allocator");
+        object.remove("node_storage");
         let legacy: BenchmarkRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.schema_version, 1);
         assert_eq!(legacy.allocator, AllocatorSummary::default());
+        assert!(legacy.node_storage.is_empty());
     }
 }

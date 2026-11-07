@@ -9,7 +9,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nodus_testkit::TestServer;
-use nodus_testkit::benchmark::{IterationMeasurement, LatencyRecorder};
+use nodus_testkit::benchmark::{BenchmarkNode, IterationMeasurement, LatencyRecorder};
 use std::time::{Duration, Instant};
 use tokio_postgres::NoTls;
 
@@ -19,8 +19,12 @@ fn scale() -> &'static str {
     if smoke() { "smoke" } else { "full" }
 }
 
-fn single_node(server: &TestServer) -> Vec<(String, std::net::SocketAddr)> {
-    vec![("1".to_owned(), server.http_addr)]
+fn single_node(server: &TestServer, dir: &tempfile::TempDir) -> Vec<BenchmarkNode> {
+    vec![BenchmarkNode {
+        node: "1".to_owned(),
+        http_addr: server.http_addr,
+        data_path: dir.path().to_path_buf(),
+    }]
 }
 
 async fn observed<T>(
@@ -233,7 +237,7 @@ fn bench_concurrent_point_inserts(
                             client_count,
                             iters,
                             "insert",
-                            single_node(&_server),
+                            single_node(&_server, &_dir),
                         )
                         .await
                         .unwrap();
@@ -326,7 +330,7 @@ fn bench_point_read(c: &mut Criterion) {
                     1,
                     iters,
                     "select",
-                    single_node(&_server),
+                    single_node(&_server, &_dir),
                 )
                 .await
                 .unwrap();
@@ -397,7 +401,7 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                     8,
                     iters,
                     "mixed_sql",
-                    single_node(&_server),
+                    single_node(&_server, &_dir),
                 )
                 .await
                 .unwrap();
@@ -487,7 +491,7 @@ fn bench_bulk_insert(c: &mut Criterion) {
                     1,
                     iters,
                     "copy_batch_100_rows",
-                    single_node(&_server),
+                    single_node(&_server, &_dir),
                 )
                 .await
                 .unwrap();
@@ -523,7 +527,7 @@ fn bench_range_scan(c: &mut Criterion) {
                     1,
                     iters,
                     "ordered_select",
-                    single_node(&_server),
+                    single_node(&_server, &_dir),
                 )
                 .await
                 .unwrap();
@@ -586,10 +590,14 @@ fn bench_replicated_oltp(c: &mut Criterion) {
             let next_id = next_id.clone();
             rt.block_on(async {
                 let total = iters as usize * n;
-                let metric_nodes = cluster
+                let nodes = cluster
                     .nodes
                     .iter()
-                    .map(|node| (node.node_id.to_string(), node.http_addr().parse().unwrap()))
+                    .map(|node| BenchmarkNode {
+                        node: node.node_id.to_string(),
+                        http_addr: node.http_addr().parse().unwrap(),
+                        data_path: node.data_path().to_path_buf(),
+                    })
                     .collect();
                 let measurement = IterationMeasurement::begin(
                     "replicated_oltp",
@@ -598,7 +606,7 @@ fn bench_replicated_oltp(c: &mut Criterion) {
                     8,
                     iters,
                     "mixed_sql",
-                    metric_nodes,
+                    nodes,
                 )
                 .await
                 .unwrap();

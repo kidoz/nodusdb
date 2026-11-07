@@ -48,10 +48,12 @@ Each `iter_custom` invocation also appends a schema-version-2 JSON object to
 `NODUS_BENCH_ARTIFACT_DIR` to choose a different output directory. The record
 contains the workload and configuration, Criterion iteration count, request and
 optional row counts, elapsed time and throughput, request-latency summary,
-process RSS and allocator summaries, and before/after/delta Prometheus samples
-for every server node. The benchmark fails if it cannot collect required metrics
-or write the artifact. Schema-version-1 records remain readable; their missing
-allocator summary deserializes as unavailable.
+process RSS and allocator summaries, before/after/delta Prometheus samples, and
+before/after/delta data-directory storage usage for every server node. The
+benchmark fails if it cannot collect required metrics or storage usage or write
+the artifact. Schema-version-1 records remain readable; their missing allocator
+summary deserializes as unavailable. Earlier schema-version-2 records without
+storage usage also remain readable and deserialize with an empty storage list.
 
 Latency is measured around each awaited pgwire request and pooled across the
 workload's clients. p50, p95, and p99 use nearest-rank samples after sorting;
@@ -69,6 +71,16 @@ from the macOS default malloc zone's `size_in_use` or GNU/Linux
 allocator high-water is the highest 100 ms observation, including the start and
 end samples, not a native lifetime peak. Unsupported platforms and collection
 failures produce null fields rather than zero.
+
+`node_storage` measures each persistent data directory immediately before and
+after the timed SQL section; directory scanning is excluded from the reported
+elapsed time. `logical_bytes` sums regular-file lengths. On Unix,
+`allocated_bytes` sums filesystem-reported allocated 512-byte blocks and counts
+each hard-linked file once; symlinks are not followed and directories themselves
+are not counted. Other platforms report `allocated_bytes` as null. These are
+whole-data-directory observations, including WAL, SSTables, manifests, snapshots,
+and other server files, not a breakdown by storage component or a volume-wide
+free-space measurement. Background maintenance can run during either scan.
 
 The Prometheus snapshots also include general and bounded-commit Raft queue
 depth/high-water, approximate LSM memtable bytes/high-water, SSTable count,
@@ -100,9 +112,12 @@ records three full legacy-write-path runs on one host. The
 [2026-11-06 resource comparison](../reports/server-write-batching-resources-2026-11-06.md)
 adds three full legacy and three full batched runs at one source revision,
 including request latency, memory, queue, and retained-log-entry observations.
-An opt-in [mixed-activity smoke drill](mixed_activity_soak.md) exercises scheduled
+The [2026-11-07 storage-growth capture](../reports/server-storage-growth-2026-11-07.md)
+adds three full batched runs with retained-log payload bytes and logical and
+allocated data-directory measurements. An opt-in
+[mixed-activity smoke drill](mixed_activity_soak.md) exercises scheduled
 maintenance with versioned resource artifacts. Recovery and performance budget
-approval, repeated log-byte-growth and physical-storage evidence, scheduled
-full-load/soak workflows, sustained resource evidence, and the final 24-hour soak
-remain open. Production budgets require maintainer approval and repeated
-supported-profile evidence, never a number invented from one laptop run.
+approval, sustained snapshot/reclamation and physical-storage evidence, scheduled
+full-load/soak workflows, and the final 24-hour soak remain open. Production
+budgets require maintainer approval and repeated supported-profile evidence,
+never a number invented from one laptop run.

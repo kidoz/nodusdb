@@ -14,7 +14,7 @@
 //! Persistent data directories are retained across stop/restart.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -79,6 +79,10 @@ impl ClusterNode {
 
     pub fn pgwire_addr(&self) -> SocketAddr {
         format!("127.0.0.1:{}", self.pgwire_port).parse().unwrap()
+    }
+
+    pub fn data_path(&self) -> &Path {
+        &self.data_path
     }
 
     pub fn is_running(&self) -> bool {
