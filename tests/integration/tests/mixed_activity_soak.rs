@@ -424,6 +424,9 @@ async fn data_group_applied(
     index: usize,
     group: &str,
 ) -> Result<Option<u64>> {
+    if group == "shard-meta" {
+        return cluster.nodes[index].raft_applied_index(group).await;
+    }
     let groups = cluster.admin_get(index, "/api/v1/cluster/groups").await?;
     Ok(groups["groups"]
         .as_array()
@@ -647,6 +650,10 @@ async fn validate_on_every_node(
         .await?
         .batch_execute("CREATE INDEX mixed_activity_value_idx ON mixed_activity_soak (value)")
         .await?;
+    applied.push(json!({
+        "group": "shard-meta",
+        "applied_on_every_node": wait_for_data_group_catchup(cluster, "shard-meta").await?,
+    }));
     let mut nodes = Vec::new();
     for index in 0..cluster.nodes.len() {
         let client = cluster.pg_client(index).await?;

@@ -73,8 +73,10 @@ Maintenance proceeds in this order while the workload continues:
 8. Drain writers and readers, require Raft queue depths to return to zero, and
    require every post-split data group to converge to the same applied index on
    every node. Only then create the secondary index, so its backfill cannot scan
-   incomplete local rows. Compare the complete acknowledged `(id, value)`
-   multiset on every node using quiescent MVCC reads; this is not a shared
+   incomplete local rows. Require meta-group applied-index convergence after
+   index creation before comparing follower index entries. Compare the complete
+   acknowledged `(id, value)` multiset on every node using quiescent MVCC reads;
+   this is not a shared
    cross-shard linearizable snapshot. Check for missing, duplicate, unexpected,
    and value-mismatched rows. A bounded per-node retry waits for the secondary-
    index lookup to return exactly one expected row.
