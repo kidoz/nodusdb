@@ -1,6 +1,6 @@
 # Mixed-activity smoke drill
 
-This opt-in PR2 drill combines a bounded SQL workload with real maintenance on a
+This opt-in drill combines a bounded SQL workload with real maintenance on a
 three-node in-process cluster. It uses persistent LSM directories, real pgwire,
 Raft over dedicated mTLS peer listeners, a filesystem backup repository, legacy
 writes, and the production snapshot, compaction, and Raft timer settings
@@ -14,7 +14,7 @@ test.
 Use an optimized test build and a fresh artifact directory:
 
 ```bash
-NODUS_SOAK_ARTIFACT_DIR=target/pr2-mixed-activity-smoke \
+NODUS_SOAK_ARTIFACT_DIR=target/mixed-activity-smoke \
 cargo test --release --locked -p nodus_integration_tests \
   --test mixed_activity_soak -- --ignored --nocapture
 ```
@@ -112,5 +112,5 @@ null. `raft_log_reclamation_observed` records only the observed purge activity.
   prove uninterrupted online writes or migration progress under continuous
   write pressure.
 - The short run and high-water samples cannot prove bounded memory or queues.
-  Sustained stabilization, approved budgets, scheduled CI execution, and the
-  final 24-hour soak remain separate PR2 gates.
+  Sustained stabilization, approved budgets, scheduled execution, and the
+  final 24-hour soak remain separate release-qualification work.
