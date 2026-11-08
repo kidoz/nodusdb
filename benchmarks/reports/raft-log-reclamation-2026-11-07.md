@@ -126,16 +126,44 @@ convergence and exposed a harness timing gap. No production index-code defect
 was reproduced by the focused checks. The completed drill now requires
 meta-group applied-index convergence before its exact-entry assertions.
 
-## Operational follow-up
+## Operational finding and resolution
 
-The successful console log contains 81,951 OpenRaft append-response decode
-errors. Of these, 16,232 refer to `shard-meta` during the follower-stop/restart
-window. The remaining 65,719 refer to the retired pre-split data group and
-continue through the end of the run. The SQL and applied-index checks passed,
-but this volume of transport errors and log output is not healthy lifecycle
-behavior. Retired-group replication shutdown and empty/error response encoding
-need separate diagnosis. The first capture attempt was also terminated by the
-tool's console-output limit; later runs redirected output to files.
+The first successful console log contained 81,951 OpenRaft append-response
+decode errors. Of these, 16,232 referred to `shard-meta` during the
+follower-stop/restart window. The remaining 65,719 referred to the retired
+pre-split data group and continued through the end of the run. Migration
+removed the source only on the driver, leaving other replicas active; a removed
+peer's plain-text 404 was also parsed as JSON.
+
+The follow-up implementation removes sources with `Done` migration journals on
+every member through the existing reconcile loop, and checks HTTP status before
+decoding append, vote, and snapshot responses. Active-migration sources remain
+hosted. A focused snapshot/split/rebalance/index regression passed in 589.99
+seconds and required source removal on every node.
+
+The full follow-up drill passed in 2,123.209 seconds with
+`source_decommissioned_on_every_node=true`, exact rows and indexes, both
+reclamation cycles, and zero quiet-window queues. Its log has **zero JSON decode
+errors**. Retired-group append traffic stopped 1,005.443 seconds before the run
+finished, rather than continuing through completion. During the removal window,
+65,203 connection-refused errors and 6,995 explicit HTTP 404 errors were still
+recorded, so transient transport log volume remains an operational concern.
+The first capture attempt was also terminated by the tool's console-output
+limit; later runs redirected output to files.
+
+Follow-up evidence is under `target/raft-teardown-2026-11-08/`, with
+independent validation by `summarize.py`. SHA-256 values:
+
+- Events: `839ec6e8bafc7b3b03c34fba63a2e7b1715bd285e1ae60758de3d27f43abde43`
+- Drill summary: `fd5806476e5579c60309e0899c148333004e6fe1c32f388573a9e7fe6f95f07e`
+- Independent summary: `8aa95af9f8bc9e57a30ca91f87c3859aa2881595b2ae20b93f51ff810817e8a7`
+- Implementation patch: `4860c9941a50f8154e0903379c010cdcd9726ffd513106b9d08aa466b1d5dce8`
+- Validator: `4b687f48be3b5d1f785c8781c9589a3809a89db450c89447b9a8cf9f185ce2ed`
+
+Revalidate with `python3 -B target/raft-teardown-2026-11-08/summarize.py`.
+Expected output begins with `validated 1021 events, 1012 storage sample sets,
+two snapshot/purge cycles, restart catch-up, zero quiet queues, and exact rows
+on three nodes`.
 
 ## Artifacts and independent validation
 
@@ -172,6 +200,14 @@ on three nodes`.
 Earlier incomplete or failed development attempts are preserved under the same
 artifact root but are not counted as passing evidence.
 
+## Quality gates
+
+The completed source passed Clippy, formatting, diff checks, and the full
+workspace suite: **1,064 tests passed, 0 failed, and 7 intentional ignores
+across 111 suites**. The focused roster regression, full follow-up drill, and
+both independent artifact validators also passed. These are local working-tree
+results, not clean-checkout, hosted-CI, or release-candidate qualification.
+
 ## Limits
 
 - One short macOS run and focused checks are not a 24-hour soak, repeated
@@ -185,5 +221,6 @@ artifact root but are not counted as passing evidence.
 - Exact validation used per-group convergence and quiescent reads, not a shared
   cross-shard linearizable snapshot or a cross-shard isolation proof.
 - Physical peaks can be missed between scans. Long-term storage, memory, and
-  queue bounds remain unassessed, and retired-group transport noise remains an
-  operational defect to investigate.
+  queue bounds remain unassessed. Retired-group traffic stopped in the
+  follow-up run, but transient connection and HTTP-error log volume remains an
+  operational concern.
