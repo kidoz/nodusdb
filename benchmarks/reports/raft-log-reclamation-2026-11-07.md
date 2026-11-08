@@ -165,6 +165,40 @@ Expected output begins with `validated 1021 events, 1012 storage sample sets,
 two snapshot/purge cycles, restart catch-up, zero quiet queues, and exact rows
 on three nodes`.
 
+## Transport retry backoff follow-up — 2026-11-08
+
+The transport adapter now classifies refused connections and unknown-group 404
+responses as unavailable targets for append, vote, and snapshot RPCs. OpenRaft
+applies its 500 ms retry backoff instead of immediately reissuing those requests.
+Other HTTP statuses and response-decoding errors retain their previous handling.
+This changes retry pacing only: quorum acknowledgement, membership, snapshot,
+and source-removal behavior are unchanged.
+
+The focused roster regression passed in 628.33 seconds. The full drill passed in
+2,181.791 seconds with exact rows and indexes, both reclamation cycles, zero
+quiet-window queues, and source removal on every node. Independent validation
+checked 1,076 events and 1,067 storage sample sets. Connection-refused errors
+fell from **65,203 to 1,152 (98.23%)**, and HTTP 404 errors fell from **6,995 to
+6 (99.91%)**. Every remaining refusal and 404 used the backoff classification;
+there were zero JSON decode errors. The stopped follower remains a voter, so
+bounded-rate unavailability logs during its outage are expected and are not
+suppressed.
+
+Evidence is under `target/raft-retry-backoff-2026-11-08/`. SHA-256 values:
+
+- Events: `a49fb2f307f5597af48d68b6a9e64b1a73473fa78e56c259e96225254458f395`
+- Drill summary: `0b3a4cded2eaee918593b7e2ee7be7e5419c2f186c510cde801eb588d4e70177`
+- Independent summary: `33e32be4a6f252ea9897e1103aee40022599189a9b34ade8f759652604dd27c0`
+- Console log: `1625aea5c3b71d9aefac0e2ac2dcfabe51adb0e3bcd9e79b929b71f7521d40f9`
+- Implementation patch: `33b78f4cee5d05f1d05c5a4c58823e25e735f3ca1975337796b0b6d8e94de489`
+- Validator: `378804f5780ba5b29a228e3692dabf5009ae9f9ff225c744f0b94c9a92cdde99`
+
+Revalidate with `python3 -B target/raft-retry-backoff-2026-11-08/summarize.py`.
+Expected output begins with `validated 1076 events, 1067 storage sample sets,
+two snapshot/purge cycles, restart catch-up, zero quiet queues, and exact rows
+on three nodes`. Two transient directory-scan errors are retained in the
+independent summary.
+
 ## Artifacts and independent validation
 
 Generated evidence is under `target/raft-reclamation-2026-11-07/`:
@@ -202,10 +236,10 @@ artifact root but are not counted as passing evidence.
 
 ## Quality gates
 
-The completed source passed Clippy, formatting, diff checks, and the full
-workspace suite: **1,064 tests passed, 0 failed, and 7 intentional ignores
+The latest source passed Clippy, formatting, partition and diff checks, and the
+full workspace suite: **1,066 tests passed, 0 failed, and 7 intentional ignores
 across 111 suites**. The focused roster regression, full follow-up drill, and
-both independent artifact validators also passed. These are local working-tree
+independent artifact validators also passed. These are local working-tree
 results, not clean-checkout, hosted-CI, or release-candidate qualification.
 
 ## Limits
@@ -221,6 +255,5 @@ results, not clean-checkout, hosted-CI, or release-candidate qualification.
 - Exact validation used per-group convergence and quiescent reads, not a shared
   cross-shard linearizable snapshot or a cross-shard isolation proof.
 - Physical peaks can be missed between scans. Long-term storage, memory, and
-  queue bounds remain unassessed. Retired-group traffic stopped in the
-  follow-up run, but transient connection and HTTP-error log volume remains an
-  operational concern.
+  queue bounds remain unassessed. Expected voter-outage and teardown logs remain
+  at a bounded rate; retry pacing does not prove an operational alerting budget.
