@@ -1006,6 +1006,10 @@ impl KvEngine for LsmKvEngine {
         self.replace_snapshot_rows(scope, rows, pointers)
     }
 
+    fn reclaim_namespace(&self, prefix: &[u8]) -> Result<()> {
+        self.reclaim_namespace_rows(prefix)
+    }
+
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;

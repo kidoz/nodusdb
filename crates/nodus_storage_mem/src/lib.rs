@@ -469,6 +469,40 @@ mod tests {
         assert!(keys(20, 0).is_empty());
         assert_eq!(keys(20, 100).len(), 19);
     }
+    #[test]
+    fn namespace_reclamation_is_idempotent_and_preserves_other_namespaces() {
+        let raw = std::sync::Arc::new(MemKvEngine::new());
+        let retired = nodus_storage_api::NamespacedKvEngine::new(raw.clone(), "shard-retired");
+        let survivor = nodus_storage_api::NamespacedKvEngine::new(raw.clone(), "shard-survivor");
+        for (engine, key, value) in [
+            (&retired, b"row".as_slice(), b"retired".as_slice()),
+            (&survivor, b"row".as_slice(), b"survivor".as_slice()),
+        ] {
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, Bytes::from_static(key), Bytes::from_static(value))
+                .unwrap();
+            engine.commit(txn, 10).unwrap();
+        }
+
+        raw.reclaim_namespace(b"shard-retired\0").unwrap();
+        assert!(retired.get(b"row", 10).unwrap().is_none());
+        assert!(
+            retired
+                .snapshot_rows(&nodus_storage_api::SnapshotScope::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            survivor.get(b"row", 10).unwrap(),
+            Some(Bytes::from_static(b"survivor"))
+        );
+        let generation = raw.recovery_generation().unwrap();
+        raw.reclaim_namespace(b"shard-retired\0").unwrap();
+        assert_eq!(raw.recovery_generation().unwrap(), generation);
+        assert!(raw.reclaim_namespace(b"").is_err());
+    }
+
     use nodus_storage_api::KvError;
 
     #[test]

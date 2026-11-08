@@ -80,7 +80,10 @@ curl -X POST -H "Authorization: Bearer nodus-dev-token" \
 The incremental contains changed MVCC versions and tombstones since its verified
 parent. Restore resolves the complete parent chain. An incomplete chain, an
 unavailable parent, or required history that is no longer available fails the
-operation; take a new full backup instead.
+operation; take a new full backup instead. Retired-shard namespace reclamation,
+like Raft snapshot installation, starts a new recovery generation: take a new
+full backup before extending an incremental or PITR chain across that boundary.
+Archived WAL remains subject to the repository retention policy.
 
 ## List and verify backups
 

@@ -145,6 +145,24 @@ pub trait KvEngine: Send + Sync {
         anyhow::bail!("atomic snapshot replacement is unsupported by this engine")
     }
 
+    /// Atomically removes every live key and version chain in a non-empty
+    /// namespace and starts a new recovery generation. The caller must first
+    /// stop routing and replication to the namespace. An absent namespace is a
+    /// no-op, making interrupted cleanup idempotent. Archived WAL retention is
+    /// unchanged; backup and PITR extension require a new full backup after the
+    /// checkpoint, exactly as they do after snapshot installation.
+    fn reclaim_namespace(&self, prefix: &[u8]) -> Result<()> {
+        anyhow::ensure!(!prefix.is_empty(), "namespace prefix must not be empty");
+        let scope = SnapshotScope {
+            prefix: prefix.to_vec(),
+            ..Default::default()
+        };
+        if self.snapshot_rows(&scope)?.is_empty() {
+            return Ok(());
+        }
+        self.replace_snapshot(&scope, Vec::new(), Vec::new())
+    }
+
     /// The newest value visible at `read_ts`, or `None` when no version is
     /// visible OR the newest visible version is a committed tombstone: a
     /// delete must hide values held by older sources (older SSTables), never

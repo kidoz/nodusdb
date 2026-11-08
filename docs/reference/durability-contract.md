@@ -382,9 +382,33 @@ shared engine. The same checkpoint publishes a local recovery generation and WAL
 floor. Source-bound backup operations reject cross-generation incremental ancestry
 and PITR extension until a new full backup; offline enforcement requires the
 repository to have observed the boundary. Live-reader retention, coordinated
-repository publication and superseded-file cleanup remain open. See the
-[MVCC snapshot and backup contract](../explanation/mvcc-snapshots.md). See the [snapshot limits and compatibility
+repository publication and ordinary snapshot-install superseded-file cleanup
+remain open. See the [MVCC snapshot and backup contract](../explanation/mvcc-snapshots.md). See the [snapshot limits and compatibility
 matrix](../explanation/shard-migration-protocol.md#snapshot-limits).
+
+## Retired namespace reclamation
+
+Removing a retired data group stops its routing and Raft instance before physical
+cleanup. Reclamation uses the same bounded atomic checkpoint as snapshot
+installation: the new manifest and WAL lineage omit the complete source namespace
+and preserve other groups' versions, pending intents, local records, and clock.
+Non-live SSTables are deleted only after publication; archived WAL remains
+subject to backup retention. The new recovery generation requires a fresh full
+backup before incremental or PITR extension.
+
+An already-absent namespace is a no-op, including after a crash or storage error.
+A retry also deletes any non-live SSTables left by an earlier pass and does not
+create another recovery generation. The retired group's snapshot directory is
+removed after the checkpoint. No durable record or network format changes. The
+implementation inherits the 128 MiB materialized-checkpoint limit and is not a
+streaming range-compaction claim.
+
+| Scenario | Evidence |
+| --- | --- |
+| Source history disappears, other namespaces survive, and repeated cleanup is idempotent | `nodus_storage_mem`: `namespace_reclamation_is_idempotent_and_preserves_other_namespaces` |
+| Other-group history/intents survive; non-live SSTables are deleted and archived WAL remains, including encrypted reopen | `nodus_storage_lsm`: `namespace_reclamation_deletes_non_live_sstables_and_retains_archived_wal` |
+| Abrupt exit before/after manifest publication recovers old or complete reclaimed state | `nodus_storage_lsm`: `abrupt_exit_during_reclamation_recovers_old_or_complete_state` |
+| Destination values survive and repeated source teardown leaves no source rows | `nodus_server`: `split_relocates_data_into_children_and_decommissions_the_source` |
 
 ## Dormant migration recovery
 

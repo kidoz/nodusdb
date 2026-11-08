@@ -71,11 +71,60 @@ impl LsmKvEngine {
             .collect())
     }
 
+    fn delete_non_live_sstables(&self, dir: &Path) -> Result<()> {
+        let live: HashSet<std::ffi::OsString> = self
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|sst| sst.path.file_name().map(std::ffi::OsString::from))
+            .collect();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("sst")
+                || live.contains(&entry.file_name())
+            {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
     pub(super) fn replace_snapshot_rows(
         &self,
         scope: &SnapshotScope,
         rows: Vec<SnapshotRow>,
         pointers: Vec<SnapshotRow>,
+    ) -> Result<()> {
+        self.replace_rows(scope, rows, pointers, false)
+    }
+
+    pub(super) fn reclaim_namespace_rows(&self, prefix: &[u8]) -> Result<()> {
+        anyhow::ensure!(!prefix.is_empty(), "namespace prefix must not be empty");
+        self.replace_rows(
+            &SnapshotScope {
+                prefix: prefix.to_vec(),
+                ..Default::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
+    }
+
+    fn replace_rows(
+        &self,
+        scope: &SnapshotScope,
+        rows: Vec<SnapshotRow>,
+        pointers: Vec<SnapshotRow>,
+        reclaim_files: bool,
     ) -> Result<()> {
         nodus_storage_api::snapshot::check_snapshot_size(&rows)?;
         nodus_storage_api::snapshot::check_snapshot_size(&pointers)?;
@@ -87,7 +136,14 @@ impl LsmKvEngine {
         self.snapshot_available()?;
         let _maintenance = self.flush_compact_lock.lock().unwrap();
         let mut merged = self.collect_snapshot(&SnapshotScope::default())?;
+        let has_namespace_rows = merged.keys().any(|key| scope.owns(key));
         merged.retain(|key, _| !scope.owns(key));
+        if reclaim_files && !has_namespace_rows {
+            if let Some(dir) = &self.data_dir {
+                self.delete_non_live_sstables(dir)?;
+            }
+            return Ok(());
+        }
         for row in rows.into_iter().chain(pointers) {
             merged.insert(
                 row.key,
@@ -221,8 +277,12 @@ impl LsmKvEngine {
         self.min_replay_wal.store(wal_id, Ordering::Relaxed);
         self.memtable_bytes.store(size, Ordering::Relaxed);
         self.snapshot_failed.store(false, Ordering::Release);
-        // Old files deliberately remain available to existing scan iterators
-        // and crash recovery; reclaiming them needs a separate retention policy.
+        if reclaim_files {
+            self.delete_non_live_sstables(dir)?;
+        }
+        // Ordinary snapshot installation retains old files for existing scan
+        // iterators and crash recovery. Namespace reclamation removes only
+        // non-live SSTables; archived WAL remains subject to backup retention.
         Ok(())
     }
 }
