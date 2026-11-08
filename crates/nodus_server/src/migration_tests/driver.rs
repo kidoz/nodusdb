@@ -562,19 +562,27 @@ pub(super) async fn assert_completed(
         fx.meta.get_shard_placements().unwrap(),
         plan.destination_placements
     );
-    // Source fences reopened at the operation's epoch; row sources are gone.
+    // The meta fence reopened at the operation's epoch; row-source namespaces
+    // and their local fences are physically reclaimed after decommission.
     for source in &plan.migration.sources {
         let ns = if source == META_SHARD {
             fx.base.clone()
         } else {
             Arc::new(NamespacedKvEngine::new(fx.base.clone(), source)) as Arc<dyn KvEngine>
         };
-        let fence = read_fence(ns.as_ref()).unwrap().unwrap();
-        assert!(!fence.closed, "source {source} reopened");
-        assert_eq!(fence.epoch, 1);
-        assert_eq!(fence.operation_id, plan.migration.operation_id);
-        if source != META_SHARD {
+        if source == META_SHARD {
+            let fence = read_fence(ns.as_ref()).unwrap().unwrap();
+            assert!(!fence.closed, "source {source} reopened");
+            assert_eq!(fence.epoch, 1);
+            assert_eq!(fence.operation_id, plan.migration.operation_id);
+        } else {
             assert!(!fx.manager.hosts(source), "source {source} decommissioned");
+            assert!(
+                ns.snapshot_rows(&nodus_storage_api::SnapshotScope::default())
+                    .unwrap()
+                    .is_empty(),
+                "source {source} namespace physically reclaimed"
+            );
         }
     }
     // Writers succeed against the new map.

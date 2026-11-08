@@ -236,10 +236,10 @@ Verified member capability negotiation and writer/forwarding activation,
 automatic journal discovery, orphan/uncertain 2PC recovery, reader and backup
 retention, post-finalization membership admission, and repository boundary publication
 coordination remain prerequisites. The [v2 codec and recovery boundary](mvcc-snapshots.md)
-are implemented with the documented limits. Destination
-readiness, durable copy checkpoints, data validation, conditional map/placement
-publication, and source cleanup are not implemented by this pre-copy slice.
-Public shard mutations stay disabled until those conditions are satisfied.
+is implemented with the documented limits. Destination readiness, durable copy
+checkpoints, exact-multiset validation, conditional map/placement publication,
+and physical source reclamation are implemented in the current V3 path with the
+limits described above. Public shard mutations require level-3 finalization.
 
 ## Activation design (target, not implemented)
 
@@ -361,8 +361,13 @@ the new copy/cutover spine:
 - **Done**: the source groups are decommissioned after the destination data and
   replicated routing decision are both durable. The driver removes one
   still-hosted source per step, and every member's reconcile loop removes the
-  same journaled sources. Their ranges become unreachable; physical byte
-  reclamation remains subject to storage GC and compaction.
+  same journaled sources. After routing and Raft stop, each member atomically
+  checkpoints the surviving store without the retired namespace, removes its
+  snapshot files, and deletes non-live SSTables. Other groups' versions and
+  pending intents survive. Empty namespaces are no-ops, so interrupted cleanup
+  resumes safely. The checkpoint starts a new recovery generation; a new full
+  backup is required before incremental or PITR extension. Archived WAL remains
+  subject to backup retention rather than being deleted with the source.
 
 While replicas converge on removal, unknown-group 404 responses and refused
 connections are classified as unavailable transport targets. OpenRaft applies

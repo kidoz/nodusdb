@@ -1244,7 +1244,7 @@ async fn create_backup(
     // Journaled (level ≥3) backups export per-shard objects plus a meta
     // object, recorded in the manifest's shard coverage; the legacy layout is
     // one kv_data.json dump. Rows whose namespace no live shard map claims
-    // (decommissioned groups awaiting GC) fold into meta.json, so no
+    // (decommissioned groups awaiting physical reclamation) fold into meta.json, so no
     // acknowledged data is silently dropped from the backup.
     let mut shard_coverage = None;
     if journaled {

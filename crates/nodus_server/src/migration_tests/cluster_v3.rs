@@ -426,7 +426,7 @@ async fn split_survives_meta_leader_loss_mid_copy() {
     copied.sort();
     assert_eq!(copied, expected, "exact multiset moved across the failover");
 
-    // Routing flipped on both survivors; the source fence reopened at epoch 1.
+    // Routing flipped on both survivors; the retired source namespace is gone.
     for node in &survivors {
         let map = nodus_meta::PersistentMetaStore::new(node.kv.clone())
             .get_shard_map(table)
@@ -437,8 +437,13 @@ async fn split_survives_meta_leader_loss_mid_copy() {
         driver_node.kv.clone(),
         &source_group,
     ));
-    let fence = read_fence(source_ns.as_ref()).unwrap().unwrap();
-    assert!(!fence.closed && fence.epoch == 1);
+    assert!(
+        source_ns
+            .snapshot_rows(&nodus_storage_api::SnapshotScope::default())
+            .unwrap()
+            .is_empty(),
+        "source namespace physically reclaimed after failover"
+    );
 
     for node in &mut nodes[1..] {
         node.manager.shutdown_all().await;

@@ -473,6 +473,69 @@ async fn wait_for_group_removal(cluster: &ClusterFixture, group: &str) -> Result
     }
 }
 
+async fn allocated_storage(cluster: &ClusterFixture) -> Result<Vec<(u64, u64, u64)>> {
+    let mut samples = Vec::with_capacity(cluster.nodes.len());
+    for node in &cluster.nodes {
+        let sample = SoakStorageSample::read(node.data_path()).await;
+        if let Some(error) = sample.error {
+            bail!("node {} storage scan failed: {error}", node.node_id);
+        }
+        let usage = sample
+            .usage
+            .context("storage sample omitted directory usage")?;
+        let allocated = usage
+            .allocated_bytes
+            .context("allocated storage is unavailable on this platform")?;
+        samples.push((node.node_id, usage.logical_bytes, allocated));
+    }
+    Ok(samples)
+}
+
+fn storage_detail(samples: &[(u64, u64, u64)]) -> Value {
+    json!(
+        samples
+            .iter()
+            .map(|(node_id, logical, allocated)| {
+                json!({"node_id": node_id, "logical_bytes": logical, "allocated_bytes": allocated})
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+async fn wait_for_physical_reclamation(
+    cluster: &ClusterFixture,
+    before: &[(u64, u64, u64)],
+) -> Result<Vec<(u64, u64, u64)>> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut latest = Vec::new();
+    loop {
+        match allocated_storage(cluster).await {
+            Ok(after) => {
+                let reclaimed = before.iter().zip(&after).all(
+                    |((before_id, _, before), (after_id, _, after))| {
+                        before_id == after_id && after < before
+                    },
+                );
+                if reclaimed {
+                    return Ok(after);
+                }
+                latest = after;
+            }
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "allocated storage did not fall on every node: before={before:?}, latest={latest:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn wait_for_data_group_quorum(cluster: &ClusterFixture, group: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut observed = Vec::new();
@@ -1082,7 +1145,9 @@ async fn execute(
     if rebalance["rebalanced"] != true {
         bail!("rebalance failed: {rebalance}");
     }
+    let storage_before = allocated_storage(&cluster).await?;
     wait_for_group_removal(&cluster, &format!("shard-{source}")).await?;
+    let storage_after = wait_for_physical_reclamation(&cluster, &storage_before).await?;
     workload.pause_writes.store(false, Ordering::Relaxed);
     set_phase(&phase, "workload");
     record_activity(
@@ -1090,7 +1155,7 @@ async fn execute(
         activities,
         "split_and_rebalance_with_read_load",
         started,
-        json!({"acknowledged_at_completion": workload.acknowledged_count(), "shards": split_map["shards"].as_array().map_or(0, Vec::len), "rebalanced": true, "source_decommissioned_on_every_node": true, "split_response": split, "write_pause": true, "reads_continued": true, "online_write_availability_verified": false}),
+        json!({"acknowledged_at_completion": workload.acknowledged_count(), "shards": split_map["shards"].as_array().map_or(0, Vec::len), "rebalanced": true, "source_decommissioned_on_every_node": true, "physical_reclamation_verified": true, "archived_wal_reclaimed": false, "storage_before": storage_detail(&storage_before), "storage_after": storage_detail(&storage_after), "split_response": split, "write_pause": true, "reads_continued": true, "online_write_availability_verified": false}),
     )
     .await?;
 

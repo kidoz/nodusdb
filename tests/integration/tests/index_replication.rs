@@ -1,5 +1,5 @@
 use futures_util::SinkExt as _;
-use nodus_testkit::benchmark::scrape_metrics;
+use nodus_testkit::benchmark::{read_storage_usage, scrape_metrics};
 use nodus_testkit::cluster::ClusterFixture;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -156,6 +156,15 @@ async fn diagnostics(cluster: &ClusterFixture) -> Value {
     Value::Array(nodes)
 }
 
+async fn allocated_storage(cluster: &ClusterFixture) -> Vec<(u64, u64)> {
+    let mut samples = Vec::with_capacity(cluster.nodes.len());
+    for node in &cluster.nodes {
+        let usage = read_storage_usage(node.data_path()).await.unwrap();
+        samples.push((node.node_id, usage.allocated_bytes.unwrap()));
+    }
+    samples
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(cluster)]
 async fn meta_applied_index_converges_after_catalog_write() {
@@ -269,7 +278,25 @@ async fn create_index_after_snapshot_catchup_replicates_every_entry() {
         )
         .await;
     }
+    let storage_before = allocated_storage(&cluster).await;
     wait_for_removal(&cluster, &group).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let storage_after = allocated_storage(&cluster).await;
+        if storage_before
+            .iter()
+            .zip(&storage_after)
+            .all(|((before_id, before), (after_id, after))| before_id == after_id && after < before)
+        {
+            println!("physical reclamation: before={storage_before:?}, after={storage_after:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "allocated storage did not fall on every node: before={storage_before:?}, after={storage_after:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     client
         .batch_execute("CREATE INDEX snapshot_index_value_idx ON snapshot_index_regression (value)")

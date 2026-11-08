@@ -70,11 +70,16 @@ Maintenance proceeds in this order while the workload continues:
    seconds so the 300-second abandoned-intent TTL and a janitor sweep can elapse,
    then split and rebalance across all three nodes. Accept the documented
    journaled-for-recovery response and wait for the two-shard map. Require the
-   retired source group to be removed on every node before resuming writes; any
-   other split error fails. Copy checkpoints contain 256 rows, up to 16 rows are
-   copied concurrently, and each bounded step has 120 seconds. Backup and
-   migration use their existing mutual-exclusion barrier and are not forced to
-   run simultaneously.
+   retired source group to be removed on every node, then require allocated
+   storage to decrease on every node before resuming writes. Measurements are
+   taken after destination copy/rebalance and after source teardown, excluding
+   the destination's own write growth from the comparison. The activity record
+   includes before/after logical and allocated bytes and sets
+   `physical_reclamation_verified=true`; archived WAL is deliberately retained
+   for backup policy. Any other split error fails. Copy checkpoints contain 256
+   rows, up to 16 rows are copied concurrently, and each bounded step has 120
+   seconds. Backup and migration use their existing mutual-exclusion barrier and
+   are not forced to run simultaneously.
 8. Drain writers and readers, require Raft queue depths to return to zero, and
    require every post-split data group to converge to the same applied index on
    every node. Only then create the secondary index, so its backfill cannot scan

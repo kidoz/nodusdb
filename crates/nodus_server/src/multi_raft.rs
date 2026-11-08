@@ -816,11 +816,11 @@ impl MultiRaftManager {
         }
     }
 
-    /// Decommissions the group for `group_id`: shuts down its Raft instance and
-    /// drops it from the group map / hosted set, so routing no longer reaches it.
-    /// The namespace's bytes become unreachable; physical reclamation is left to
-    /// GC/compaction.
+    /// Decommissions `group_id`: stops routing and Raft, then atomically removes
+    /// its namespace and snapshot files. Physical cleanup runs even when the
+    /// group is already absent, so a failure or process exit can be retried.
     pub async fn remove_group(&self, group_id: &str) -> Result<()> {
+        anyhow::ensure!(group_id != META_SHARD, "meta group cannot be reclaimed");
         let raft = self.state.rafts.write().await.remove(group_id);
         self.hosted.write().unwrap().remove(group_id);
         self.deferrals.write().unwrap().remove(group_id);
@@ -829,6 +829,26 @@ impl MultiRaftManager {
         if let Some(raft) = raft {
             let _ = raft.shutdown().await;
         }
+
+        let storage = self.base_kv.clone();
+        let prefix = format!("{group_id}\0").into_bytes();
+        let snapshot_dir = self.group_snapshot_dir(group_id);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            storage.reclaim_namespace(&prefix)?;
+            match std::fs::remove_dir_all(&snapshot_dir) {
+                Ok(()) => {
+                    if let Some(parent) = snapshot_dir.parent() {
+                        std::fs::File::open(parent)?.sync_all()?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("namespace reclamation task failed: {error}"))??;
+        tracing::info!(group_id, "retired Raft group and namespace reclaimed");
         Ok(())
     }
 
@@ -1355,6 +1375,16 @@ mod tests {
         assert_eq!(lhs.get(b"z", 100).unwrap(), None);
         assert_eq!(rhs.get(b"z", 100).unwrap(), Some(Bytes::from_static(b"vz")));
         assert_eq!(rhs.get(b"a", 100).unwrap(), None);
+        mgr.remove_group(&MultiRaftManager::data_group_id(source))
+            .await
+            .unwrap();
+        assert!(
+            src_ns
+                .snapshot_rows(&nodus_storage_api::SnapshotScope::default())
+                .unwrap()
+                .is_empty(),
+            "retired source namespace was not physically reclaimed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
