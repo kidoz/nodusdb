@@ -58,7 +58,10 @@ Maintenance proceeds in this order while the workload continues:
    down, require another snapshot/purge cycle with entry and serialized-byte
    reclamation. The leader's applied index must advance by more than the entries
    retained at that observation, so the follower cannot catch up from the
-   complete missed prefix and must receive a snapshot.
+   complete missed prefix and must receive a snapshot. Refused connections and
+   unknown-group 404 responses use OpenRaft's 500 ms unavailability backoff
+   instead of immediate retries; the stopped follower remains a Raft voter, so
+   bounded-rate error logs during this window are still expected.
 6. Restart node 3 on its original ports and persistent directory, then require
    readiness and three live nodes within bounded 300-second waits. After pausing
    writes, also require the same data-group applied index on every replica

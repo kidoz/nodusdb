@@ -364,6 +364,13 @@ the new copy/cutover spine:
   same journaled sources. Their ranges become unreachable; physical byte
   reclamation remains subject to storage GC and compaction.
 
+While replicas converge on removal, unknown-group 404 responses and refused
+connections are classified as unavailable transport targets. OpenRaft applies
+its 500 ms retry backoff rather than immediately reissuing the RPC. Other HTTP,
+response-decoding, storage, and Raft errors retain their existing handling.
+Backoff limits request and log rates; it does not acknowledge an unreplicated
+write, alter membership, or replace roster-wide source removal.
+
 `Cancelling → Cancelled` — reachable from every phase before `Publishing`
 commits, addressing every source including ones whose acquire/ack was lost;
 sealing semantics are the V2 ones (a cancelled source's delayed acquires are

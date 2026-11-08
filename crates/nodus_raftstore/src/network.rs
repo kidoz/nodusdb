@@ -1,12 +1,22 @@
 use crate::NodusTypeConfig;
 use openraft::BasicNode;
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
+use openraft::error::{
+    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
 use std::sync::{Arc, OnceLock};
+
+fn transport_rpc_error<E: std::error::Error>(error: reqwest::Error) -> RPCError<u64, BasicNode, E> {
+    if error.is_connect() || error.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+        RPCError::Unreachable(Unreachable::new(&error))
+    } else {
+        RPCError::Network(NetworkError::new(&error))
+    }
+}
 
 /// The HTTP client and URL scheme used for inter-node Raft RPCs. Plain HTTP by
 /// default; a TLS-configured client with `https` is supplied when inter-node
@@ -382,11 +392,9 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .json(&rpc)
             .send()
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+            .map_err(transport_rpc_error)?;
         self.transport.observe_clock(resp.headers());
-        let resp = resp
-            .error_for_status()
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let resp = resp.error_for_status().map_err(transport_rpc_error)?;
 
         let res: Result<AppendEntriesResponse<u64>, RaftError<u64>> = resp
             .json()
@@ -461,11 +469,9 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .json(&rpc)
             .send()
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+            .map_err(transport_rpc_error)?;
         self.transport.observe_clock(resp.headers());
-        let resp = resp
-            .error_for_status()
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let resp = resp.error_for_status().map_err(transport_rpc_error)?;
 
         let res: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> = resp
             .json()
@@ -501,11 +507,9 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .json(&rpc)
             .send()
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+            .map_err(transport_rpc_error)?;
         self.transport.observe_clock(resp.headers());
-        let resp = resp
-            .error_for_status()
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let resp = resp.error_for_status().map_err(transport_rpc_error)?;
 
         let res: Result<VoteResponse<u64>, RaftError<u64>> = resp
             .json()
@@ -633,7 +637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_unknown_group_reports_http_status_instead_of_json_decode() {
+    async fn append_unknown_group_backoffs_as_unreachable() {
         let addr = serve_with_probe(None).await;
         let transport = RaftTransport::plain();
         let mut factory = NodusNetworkFactory::new("no-such-group".into(), transport);
@@ -652,11 +656,63 @@ mod tests {
             )
             .await
             .unwrap_err();
+        assert!(
+            matches!(&error, RPCError::Unreachable(_)),
+            "unknown groups must use OpenRaft backoff: {error}"
+        );
         let message = error.to_string();
         assert!(message.contains("404"), "unexpected error: {message}");
         assert!(
             !message.contains("error decoding response body"),
             "plain-text 404 must not become a JSON decode error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_connection_refused_backoffs_as_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let transport = RaftTransport::plain();
+        let mut factory = NodusNetworkFactory::new("shard-test".into(), transport);
+        let mut network = factory
+            .new_client(2, &BasicNode::new(addr.to_string()))
+            .await;
+        let error = network
+            .append_entries(
+                AppendEntriesRequest {
+                    vote: openraft::Vote::new(1, 2),
+                    prev_log_id: None,
+                    entries: Vec::new(),
+                    leader_commit: None,
+                },
+                RPCOption::new(std::time::Duration::from_secs(30)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RPCError::Unreachable(_)),
+            "connection refusals must use OpenRaft backoff: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_http_statuses_remain_network_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .fallback(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let error = response.error_for_status().unwrap_err();
+        let error = transport_rpc_error::<RaftError<u64>>(error);
+        assert!(
+            matches!(&error, RPCError::Network(_)),
+            "unrelated HTTP failures must not be hidden by unavailability backoff: {error}"
         );
     }
 
