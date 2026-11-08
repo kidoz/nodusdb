@@ -456,6 +456,23 @@ async fn wait_for_data_group_catchup(cluster: &ClusterFixture, group: &str) -> R
     }
 }
 
+async fn wait_for_group_removal(cluster: &ClusterFixture, group: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut hosted = false;
+        for node in &cluster.nodes {
+            hosted |= node.raft_applied_index(group).await.is_ok();
+        }
+        if !hosted {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("retired group {group} remains hosted on at least one node");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn wait_for_data_group_quorum(cluster: &ClusterFixture, group: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut observed = Vec::new();
@@ -1065,6 +1082,7 @@ async fn execute(
     if rebalance["rebalanced"] != true {
         bail!("rebalance failed: {rebalance}");
     }
+    wait_for_group_removal(&cluster, &format!("shard-{source}")).await?;
     workload.pause_writes.store(false, Ordering::Relaxed);
     set_phase(&phase, "workload");
     record_activity(
@@ -1072,7 +1090,7 @@ async fn execute(
         activities,
         "split_and_rebalance_with_read_load",
         started,
-        json!({"acknowledged_at_completion": workload.acknowledged_count(), "shards": split_map["shards"].as_array().map_or(0, Vec::len), "rebalanced": true, "split_response": split, "write_pause": true, "reads_continued": true, "online_write_availability_verified": false}),
+        json!({"acknowledged_at_completion": workload.acknowledged_count(), "shards": split_map["shards"].as_array().map_or(0, Vec::len), "rebalanced": true, "source_decommissioned_on_every_node": true, "split_response": split, "write_pause": true, "reads_continued": true, "online_write_availability_verified": false}),
     )
     .await?;
 

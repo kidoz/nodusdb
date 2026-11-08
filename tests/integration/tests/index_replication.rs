@@ -90,6 +90,24 @@ async fn wait_for_catchup(cluster: &ClusterFixture, group: &str) {
     }
 }
 
+async fn wait_for_removal(cluster: &ClusterFixture, group: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut hosted = false;
+        for node in &cluster.nodes {
+            hosted |= node.raft_applied_index(group).await.is_ok();
+        }
+        if !hosted {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retired group {group} remains hosted"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn wait_for_purge(cluster: &ClusterFixture, group: &str) {
     let address = cluster.nodes[0].http_addr().parse().unwrap();
     let http = reqwest::Client::new();
@@ -251,6 +269,7 @@ async fn create_index_after_snapshot_catchup_replicates_every_entry() {
         )
         .await;
     }
+    wait_for_removal(&cluster, &group).await;
 
     client
         .batch_execute("CREATE INDEX snapshot_index_value_idx ON snapshot_index_regression (value)")

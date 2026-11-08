@@ -7,10 +7,10 @@ tested. Shard **init, split, merge, and rebalance are enabled** once the durable
 upgrade authority finalizes migration level 3. Pre-finalization, SQL submission
 and HTTP ingress reject migration commands and public operations return 501;
 there is no runtime switch to bypass cluster compatibility. Data groups
-currently replicate to every cluster member. Source-group decommission at
-`Done` is driver-local: replicas on other members remain inert until
-roster-wide teardown is reconciled. Sections marked as design remain the agreed
-target.
+currently replicate to every cluster member. Source-group decommission starts
+on the migration driver at `Done`; each member's reconcile loop also removes
+sources whose durable migration journal is `Done`. Sources needed by an active
+migration are not removed. Sections marked as design remain the agreed target.
 
 ## Coordinator journal
 
@@ -358,10 +358,11 @@ the new copy/cutover spine:
   can only complete.
 - **Completing**: residual writers observe the new map (fences open on the new
   epoch), and every participant acknowledges the cutover.
-- **Done**: the source groups are decommissioned and their ranges purged —
-  only after the destination data and the replicated routing decision are both
-  durable. Source removal is journaled like every other step, one still-hosted
-  source group per driver step.
+- **Done**: the source groups are decommissioned after the destination data and
+  replicated routing decision are both durable. The driver removes one
+  still-hosted source per step, and every member's reconcile loop removes the
+  same journaled sources. Their ranges become unreachable; physical byte
+  reclamation remains subject to storage GC and compaction.
 
 `Cancelling → Cancelled` — reachable from every phase before `Publishing`
 commits, addressing every source including ones whose acquire/ack was lost;

@@ -511,6 +511,30 @@ impl MultiRaftManager {
         format!("shard-{shard_id}")
     }
 
+    fn completed_migration_sources(&self) -> Result<HashSet<String>> {
+        let mut retired = HashSet::new();
+        for row in self.base_kv.scan(
+            KeyRange {
+                start: nodus_raftstore::migration::coordinator::v3::JOURNAL_PREFIX.into(),
+                end: b"\x01migration/v3/table0".to_vec().into(),
+            },
+            u64::MAX,
+        )? {
+            let record = nodus_raftstore::migration::coordinator::v3::decode(&row?.value)?;
+            if record.phase == nodus_raftstore::migration::coordinator::v3::PhaseV3::Done {
+                retired.extend(
+                    record
+                        .plan
+                        .migration
+                        .sources
+                        .into_iter()
+                        .filter(|source| source != META_SHARD),
+                );
+            }
+        }
+        Ok(retired)
+    }
+
     /// Brings this node's hosted groups into line with `placements`
     /// (`ShardId -> node id`): every shard placed on this node is formed as a
     /// data group replicated across all current cluster members, with this node
@@ -521,10 +545,12 @@ impl MultiRaftManager {
     ///
     /// Called at startup (to re-host assigned shards after a restart), after
     /// placement-changing admin operations, and periodically by the reconcile
-    /// loop. Tear-down of groups no longer placed here is deferred to data
-    /// movement (Phase 6); a placement string matches a node by its
-    /// `cluster.node_id` rendered as text.
+    /// loop. Sources from completed migration journals are removed on every
+    /// member; sources still needed by an active migration remain hosted.
     pub async fn reconcile(&self, placements: &HashMap<ShardId, String>) -> Result<usize> {
+        for group in self.completed_migration_sources()? {
+            self.remove_group(&group).await?;
+        }
         let mine = self.node_id.to_string();
         let mut created = 0;
         let mut owned: HashSet<String> = HashSet::new();

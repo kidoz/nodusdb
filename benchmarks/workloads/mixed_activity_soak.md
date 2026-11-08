@@ -66,19 +66,20 @@ Maintenance proceeds in this order while the workload continues:
 7. With reads continuing, drain Raft queues and pending intents, allowing 360
    seconds so the 300-second abandoned-intent TTL and a janitor sweep can elapse,
    then split and rebalance across all three nodes. Accept the documented
-   journaled-for-recovery response and wait for the two-shard map before resuming
-   writes; any other split error fails. Copy checkpoints contain 256 rows, up
-   to 16 rows are copied concurrently, and each bounded step has 120 seconds.
-   Backup and migration use their existing mutual-exclusion barrier and are not
-   forced to run simultaneously.
+   journaled-for-recovery response and wait for the two-shard map. Require the
+   retired source group to be removed on every node before resuming writes; any
+   other split error fails. Copy checkpoints contain 256 rows, up to 16 rows are
+   copied concurrently, and each bounded step has 120 seconds. Backup and
+   migration use their existing mutual-exclusion barrier and are not forced to
+   run simultaneously.
 8. Drain writers and readers, require Raft queue depths to return to zero, and
    require every post-split data group to converge to the same applied index on
    every node. Only then create the secondary index, so its backfill cannot scan
    incomplete local rows. Require meta-group applied-index convergence after
    index creation before comparing follower index entries. Compare the complete
    acknowledged `(id, value)` multiset on every node using quiescent MVCC reads;
-   this is not a shared
-   cross-shard linearizable snapshot. Check for missing, duplicate, unexpected,
+   this is not a shared cross-shard linearizable snapshot. Check for missing,
+   duplicate, unexpected,
    and value-mismatched rows. A bounded per-node retry waits for the secondary-
    index lookup to return exactly one expected row.
 9. Continue sampling during a 10-second post-activity observation window.
