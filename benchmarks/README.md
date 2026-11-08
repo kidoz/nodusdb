@@ -18,7 +18,9 @@ just test-iceberg-resource-live
 
 The second command runs the [server SQL workloads](workloads/server_sql.md).
 See [Run the benchmarks](../docs/how-to/run-benchmarks.md) for smoke mode and
-result-recording rules. The [2026-11-06 write-batching resource comparison](reports/server-write-batching-resources-2026-11-06.md)
+result-recording rules. The [unapproved resource-budget proposal](reports/resource-budget-proposal-2026-11-08.md)
+records the current sustained-load observations and the decisions that remain
+with maintainers. The [2026-11-06 write-batching resource comparison](reports/server-write-batching-resources-2026-11-06.md)
 contains the current repeated latency, throughput, memory, queue, and Raft-log
 observations and their evidence limits. The
 [2026-10-27 write-batching comparison](reports/server-write-batching-2026-10-27.md)
