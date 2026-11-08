@@ -158,11 +158,11 @@ Restore drills write JSON recovery evidence and Prometheus textfile metrics unde
 
 ## Mixed-activity smoke drill
 
-Run the opt-in PR2 workload with backup, automatic compaction, snapshot-required
-follower catch-up, restart, split, and rebalance activity:
+Run the opt-in mixed-activity workload with backup, automatic compaction,
+snapshot-required follower catch-up, restart, split, and rebalance activity:
 
 ```bash
-NODUS_SOAK_ARTIFACT_DIR=target/pr2-mixed-activity-smoke \
+NODUS_SOAK_ARTIFACT_DIR=target/mixed-activity-smoke \
 cargo test --release --locked -p nodus_integration_tests \
   --test mixed_activity_soak -- --ignored --nocapture
 ```
