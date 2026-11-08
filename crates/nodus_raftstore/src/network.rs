@@ -384,6 +384,9 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         self.transport.observe_clock(resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
 
         let res: Result<AppendEntriesResponse<u64>, RaftError<u64>> = resp
             .json()
@@ -460,6 +463,9 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         self.transport.observe_clock(resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
 
         let res: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> = resp
             .json()
@@ -497,6 +503,9 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         self.transport.observe_clock(resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
 
         let res: Result<VoteResponse<u64>, RaftError<u64>> = resp
             .json()
@@ -620,6 +629,34 @@ mod tests {
             *observed.lock().unwrap(),
             vec![424_242, 424_242],
             "the observer must fire once per response, errors included"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_unknown_group_reports_http_status_instead_of_json_decode() {
+        let addr = serve_with_probe(None).await;
+        let transport = RaftTransport::plain();
+        let mut factory = NodusNetworkFactory::new("no-such-group".into(), transport);
+        let mut network = factory
+            .new_client(2, &BasicNode::new(addr.to_string()))
+            .await;
+        let error = network
+            .append_entries(
+                AppendEntriesRequest {
+                    vote: openraft::Vote::new(1, 2),
+                    prev_log_id: None,
+                    entries: Vec::new(),
+                    leader_commit: None,
+                },
+                RPCOption::new(std::time::Duration::from_secs(30)),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("404"), "unexpected error: {message}");
+        assert!(
+            !message.contains("error decoding response body"),
+            "plain-text 404 must not become a JSON decode error: {message}"
         );
     }
 
