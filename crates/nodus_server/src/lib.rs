@@ -107,6 +107,14 @@ impl ServerHandle {
         }
         Ok(count)
     }
+
+    pub fn local_namespace_row_count(&self, group: &str) -> anyhow::Result<usize> {
+        let scope = nodus_storage_api::SnapshotScope {
+            prefix: format!("{group}\0").into_bytes(),
+            ..Default::default()
+        };
+        Ok(self.local_kv.snapshot_rows(&scope)?.len())
+    }
 }
 
 /// Reserved key under which the transaction clock's high-water mark is stored

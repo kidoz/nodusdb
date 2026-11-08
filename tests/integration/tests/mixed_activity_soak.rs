@@ -512,19 +512,32 @@ fn storage_detail(samples: &[(u64, u64, u64)]) -> Value {
 
 async fn wait_for_physical_reclamation(
     cluster: &ClusterFixture,
+    group: &str,
     before: &[(u64, u64, u64)],
 ) -> Result<Vec<(u64, u64, u64)>> {
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut latest = Vec::new();
+    let mut namespace_counts;
     loop {
+        namespace_counts = cluster
+            .nodes
+            .iter()
+            .map(|node| node.local_namespace_row_count(group))
+            .collect::<Result<Vec<_>>>()?;
         match allocated_storage(cluster).await {
             Ok(after) => {
-                let reclaimed = before.iter().zip(&after).all(
+                let empty = namespace_counts.iter().all(|count| *count == 0);
+                let no_growth = before.iter().zip(&after).all(
+                    |((before_id, _, before), (after_id, _, after))| {
+                        before_id == after_id && after <= before
+                    },
+                );
+                let reduced = before.iter().zip(&after).any(
                     |((before_id, _, before), (after_id, _, after))| {
                         before_id == after_id && after < before
                     },
                 );
-                if reclaimed {
+                if empty && no_growth && reduced {
                     return Ok(after);
                 }
                 latest = after;
@@ -537,7 +550,7 @@ async fn wait_for_physical_reclamation(
         }
         if Instant::now() >= deadline {
             bail!(
-                "allocated storage did not fall on every node: before={before:?}, latest={latest:?}"
+                "physical reclamation did not converge: before={before:?}, latest={latest:?}, namespace_counts={namespace_counts:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1173,7 +1186,9 @@ async fn execute(
     }
     let storage_before = allocated_storage(&cluster).await?;
     wait_for_group_removal(&cluster, &format!("shard-{source}")).await?;
-    let storage_after = wait_for_physical_reclamation(&cluster, &storage_before).await?;
+    let storage_after =
+        wait_for_physical_reclamation(&cluster, &format!("shard-{source}"), &storage_before)
+            .await?;
     workload.pause_writes.store(false, Ordering::Relaxed);
     set_phase(&phase, "workload");
     record_activity(
@@ -1181,7 +1196,7 @@ async fn execute(
         activities,
         "split_and_rebalance_with_read_load",
         started,
-        json!({"acknowledged_at_completion": workload.acknowledged_count(), "shards": split_map["shards"].as_array().map_or(0, Vec::len), "rebalanced": true, "source_decommissioned_on_every_node": true, "physical_reclamation_verified": true, "archived_wal_reclaimed": false, "storage_before": storage_detail(&storage_before), "storage_after": storage_detail(&storage_after), "split_response": split, "write_pause": true, "reads_continued": true, "online_write_availability_verified": false}),
+        json!({"acknowledged_at_completion": workload.acknowledged_count(), "shards": split_map["shards"].as_array().map_or(0, Vec::len), "rebalanced": true, "source_decommissioned_on_every_node": true, "physical_reclamation_verified": true, "source_namespaces_empty_on_every_node": true, "allocated_storage_not_increased_on_every_node": true, "allocated_reduction_observed": true, "archived_wal_reclaimed": false, "storage_before": storage_detail(&storage_before), "storage_after": storage_detail(&storage_after), "split_response": split, "write_pause": true, "reads_continued": true, "online_write_availability_verified": false}),
     )
     .await?;
 

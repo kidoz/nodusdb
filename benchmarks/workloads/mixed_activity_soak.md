@@ -86,13 +86,16 @@ Maintenance proceeds in this order while the workload continues:
    seconds so the 300-second abandoned-intent TTL and a janitor sweep can elapse,
    then split and rebalance across all three nodes. Accept the documented
    journaled-for-recovery response and wait for the two-shard map. Require the
-   retired source group to be removed on every node, then require allocated
-   storage to decrease on every node before resuming writes. Measurements are
-   taken after destination copy/rebalance and after source teardown, excluding
-   the destination's own write growth from the comparison. The activity record
-   includes before/after logical and allocated bytes and sets
-   `physical_reclamation_verified=true`; archived WAL is deliberately retained
-   for backup policy. Any other split error fails. Copy checkpoints contain 256
+   retired source group to be removed on every node and its physical namespace
+   to be empty on every node before resuming writes. Allocated storage must not
+   increase after the baseline, and at least one node must show a decrease;
+   cleanup that completed before the baseline is therefore accepted without a
+   later decrease. Measurements are taken after destination copy/rebalance and
+   after source teardown, excluding the destination's own write growth from the
+   comparison. The activity record includes before/after logical and allocated
+   bytes and sets `physical_reclamation_verified=true`; archived WAL is
+   deliberately retained for backup policy. Any other split error fails. Copy
+   checkpoints contain 256
    rows, up to 16 rows are copied concurrently, and each bounded step has 120
    seconds. Backup and migration use their existing mutual-exclusion barrier and
    are not forced to run simultaneously.

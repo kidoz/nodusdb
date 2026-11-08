@@ -97,6 +97,14 @@ impl ClusterNode {
             .local_index_entry_count(table, index)
     }
 
+    pub fn local_namespace_row_count(&self, group: &str) -> Result<usize> {
+        self.running
+            .as_ref()
+            .context("node is stopped")?
+            .handle
+            .local_namespace_row_count(group)
+    }
+
     pub async fn trigger_raft_snapshot(&self, group: &str) -> Result<()> {
         self.running
             .as_ref()

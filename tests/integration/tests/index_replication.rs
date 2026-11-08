@@ -282,18 +282,27 @@ async fn create_index_after_snapshot_catchup_replicates_every_entry() {
     wait_for_removal(&cluster, &group).await;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let storage_after = allocated_storage(&cluster).await;
-        if storage_before
+        let namespace_counts = cluster
+            .nodes
             .iter()
-            .zip(&storage_after)
-            .all(|((before_id, before), (after_id, after))| before_id == after_id && after < before)
-        {
+            .map(|node| node.local_namespace_row_count(&group))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let storage_after = allocated_storage(&cluster).await;
+        let empty = namespace_counts.iter().all(|count| *count == 0);
+        let no_growth = storage_before.iter().zip(&storage_after).all(
+            |((before_id, before), (after_id, after))| before_id == after_id && after <= before,
+        );
+        let reduced = storage_before.iter().zip(&storage_after).any(
+            |((before_id, before), (after_id, after))| before_id == after_id && after < before,
+        );
+        if empty && no_growth && reduced {
             println!("physical reclamation: before={storage_before:?}, after={storage_after:?}");
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "allocated storage did not fall on every node: before={storage_before:?}, after={storage_after:?}"
+            "physical reclamation did not converge: before={storage_before:?}, after={storage_after:?}, namespace_counts={namespace_counts:?}"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
