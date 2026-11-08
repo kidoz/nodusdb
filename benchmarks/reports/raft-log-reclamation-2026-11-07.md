@@ -199,6 +199,61 @@ two snapshot/purge cycles, restart catch-up, zero quiet queues, and exact rows
 on three nodes`. Two transient directory-scan errors are retained in the
 independent summary.
 
+## Physical namespace reclamation — 2026-11-08
+
+Retired-source cleanup now uses the existing atomic checkpoint protocol. After
+routing and Raft stop, each member omits the complete retired namespace from a
+new checkpoint, removes its snapshot files, and deletes non-live SSTables. Other
+namespaces and pending intents survive. Empty namespaces are no-ops, and retries
+remove files left by interrupted cleanup. The new recovery generation requires a
+fresh full backup before incremental or PITR extension; archived WAL is retained
+for backup policy. The implementation inherits the existing 128 MiB
+materialized-checkpoint limit.
+
+Process-exit tests pass before and after manifest publication, with and without
+WAL encryption. The release-mode replicated split regression passed in 601.46
+seconds and measured allocated storage immediately after destination catch-up and
+again after source teardown:
+
+| Node | Before | After | Reclaimed |
+| --- | ---: | ---: | ---: |
+| 1 | 74,489,856 | 15,622,144 | 58,867,712 bytes |
+| 2 | 18,296,832 | 15,613,952 | 2,682,880 bytes |
+| 3 | 20,897,792 | 15,593,472 | 5,304,320 bytes |
+
+The full drill passed in 2,460.916 seconds with exact 6,000 rows and one indexed
+result on every node, both snapshot/purge cycles, zero quiet-window queues, and
+roster-wide source teardown. Independent validation checked 984 events and 975
+storage sample sets. Its immediate pre/post-teardown measurements were:
+
+| Node | Before allocated | After allocated | Reclaimed | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 246,046,720 | 245,592,064 | 454,656 bytes | 0.18% |
+| 2 | 253,095,936 | 239,554,560 | 13,541,376 bytes | 5.35% |
+| 3 | 186,937,344 | 150,450,176 | 36,487,168 bytes | 19.52% |
+
+The first full attempt used a baseline from before destination copying and failed
+because destination growth exceeded source reclamation. It is preserved as
+`run-1` development evidence, not a passing result. The corrected comparison is
+entirely after destination copy/catch-up and before/after source teardown. No
+correctness assertion was weakened. The final run also retained zero JSON decode
+errors and backoff classification for every refusal and unknown-group 404.
+
+Evidence is under `target/namespace-reclamation-2026-11-08/`. SHA-256 values:
+
+- Events: `0e27f504e581525e3f17e954afc1c1142261ebe5498a7d9fb85a8ba168490f4c`
+- Drill summary: `db727c4b5bcb43c75406e26fe2b292ad13af00bc4661536fdde895acbad686c3`
+- Independent summary: `bfb01f1e89dbf5beef500e7c634d47596788d08441efe451b13e668b3fa5c223`
+- Console log: `17bf1c7d5f34b0c18b8246d3950bb50858cf68f24a0a0b75a4487a457d77b9e6`
+- Implementation patch: `3a5b3fe5181bade90444faeec73d1a82d42be512804b0c54a79a341fc1b4fae8`
+- Validator: `39b2f12223d110989244d7f6117fb7e0f9ec9cd9ac6cb5009f8d571a2268c595`
+- Focused regression log: `17470c00429021d182fee3472e6bf528ec377ed02c27afd81f98546c1ed0f700`
+
+Revalidate with `python3 -B target/namespace-reclamation-2026-11-08/summarize.py`.
+Expected output begins with `validated 984 events, 975 storage sample sets, two
+snapshot/purge cycles, restart catch-up, zero quiet queues, and exact rows on
+three nodes`.
+
 ## Artifacts and independent validation
 
 Generated evidence is under `target/raft-reclamation-2026-11-07/`:
@@ -236,10 +291,10 @@ artifact root but are not counted as passing evidence.
 
 ## Quality gates
 
-The latest source passed Clippy, formatting, partition and diff checks, and the
-full workspace suite: **1,066 tests passed, 0 failed, and 7 intentional ignores
-across 111 suites**. The focused roster regression, full follow-up drill, and
-independent artifact validators also passed. These are local working-tree
+The latest source passed Clippy, formatting, fault, partition and diff checks,
+and the full workspace suite: **1,070 tests passed, 0 failed, and 7 intentional
+ignores across 111 suites**. The focused roster regression, full follow-up drill,
+and independent artifact validators also passed. These are local working-tree
 results, not clean-checkout, hosted-CI, or release-candidate qualification.
 
 ## Limits
