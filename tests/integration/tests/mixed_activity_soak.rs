@@ -1186,6 +1186,7 @@ async fn execute(
     .await?;
 
     wait_for_acknowledged(&workload, TOTAL_INSERTS as u64).await?;
+    let mut sustained_run = None;
     if sustained_seconds > 0 {
         set_phase(&phase, "sustained_load");
         let started = Instant::now();
@@ -1207,6 +1208,13 @@ async fn execute(
             }
         }
         workload.stop_writes.store(true, Ordering::Relaxed);
+        sustained_run = Some((started, initial_acknowledged, storage_before));
+    }
+    workload.stop_reads.store(true, Ordering::Relaxed);
+    for worker in workers {
+        worker.await.context("workload worker panicked")??;
+    }
+    if let Some((started, initial_acknowledged, storage_before)) = sustained_run {
         let storage_after = allocated_storage(&cluster).await?;
         let elapsed = started.elapsed().as_secs_f64();
         let sustained = workload.acknowledged_count() - initial_acknowledged;
@@ -1218,10 +1226,6 @@ async fn execute(
             json!({"requested_seconds": sustained_seconds, "actual_seconds": elapsed, "acknowledged_inserts": sustained, "acknowledged_inserts_per_second": sustained as f64 / elapsed, "total_acknowledged": workload.acknowledged_count(), "storage_before": storage_detail(&storage_before), "storage_after": storage_detail(&storage_after), "production_budgets_met": null}),
         )
         .await?;
-    }
-    workload.stop_reads.store(true, Ordering::Relaxed);
-    for worker in workers {
-        worker.await.context("workload worker panicked")??;
     }
     parts.workload = workload.summary();
     set_phase(&phase, "quiescent");
