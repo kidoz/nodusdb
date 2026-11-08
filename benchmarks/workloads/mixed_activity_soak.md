@@ -26,6 +26,22 @@ directory must not already contain `events.jsonl`; existing evidence is never
 overwritten. Without the environment variable, a unique directory is created
 below `target/mixed-activity-soak/`.
 
+To continue the same read/write workload after the maintenance activities, set
+`NODUS_SOAK_SUSTAIN_SECONDS` to a nonnegative integer. The default is zero and
+preserves the bounded 6,000-row drill. For example, a one-hour evidence run is:
+
+```bash
+NODUS_SOAK_SUSTAIN_SECONDS=3600 \
+NODUS_SOAK_ARTIFACT_DIR=target/mixed-activity-sustained \
+cargo test --release --locked -p nodus_integration_tests \
+  --test mixed_activity_soak -- --ignored --nocapture
+```
+
+The sustained loop fails after 180 seconds without acknowledged write progress.
+Use 86,400 seconds only for the final 24-hour release-candidate run after the
+supported profile and budgets are approved. A timed run alone does not establish
+that run's acceptance criteria.
+
 ## Workload and schedule
 
 Four writers issue unique single-row inserts to the seed and one reader performs
@@ -80,8 +96,7 @@ Maintenance proceeds in this order while the workload continues:
    rows, up to 16 rows are copied concurrently, and each bounded step has 120
    seconds. Backup and migration use their existing mutual-exclusion barrier and
    are not forced to run simultaneously.
-8. Drain writers and readers, require Raft queue depths to return to zero, and
-   require every post-split data group to converge to the same applied index on
+8. Require every post-split data group to converge to the same applied index on
    every node. Only then create the secondary index, so its backfill cannot scan
    incomplete local rows. Require meta-group applied-index convergence after
    index creation before comparing follower index entries. Compare the complete
@@ -90,7 +105,11 @@ Maintenance proceeds in this order while the workload continues:
    duplicate, unexpected,
    and value-mismatched rows. A bounded per-node retry waits for the secondary-
    index lookup to return exactly one expected row.
-9. Continue sampling during a 10-second post-activity observation window.
+9. If `NODUS_SOAK_SUSTAIN_SECONDS` is nonzero, continue the workload for that
+   duration before the validation above. Record actual elapsed time, sustained
+   inserts and throughput, and before/after storage. Then drain writers and
+   readers and require Raft queue depths to return to zero.
+10. Continue sampling during a 10-second post-activity observation window.
 
 A `passed` summary covers only these executed activity and correctness checks.
 It does not assert long-term memory stabilization, bounded physical storage, an
@@ -103,7 +122,9 @@ events include success and operation-specific details. Samples are collected
 once per second and contain elapsed and wall-clock time, phase, process RSS and
 allocator bytes, and per-node Prometheus and physical-storage samples. A stopped
 node has null `metrics` and an error string. Unsupported process-resource
-collection also produces null, not zero.
+collection also produces null, not zero. An optional `sustained_load` activity
+adds actual elapsed seconds, acknowledged inserts and inserts per second, total
+acknowledged rows, before/after storage, and a null `production_budgets_met`.
 
 Each node's `storage.usage.logical_bytes` sums regular-file lengths in its whole
 persistent data directory. On Unix, `storage.usage.allocated_bytes` sums
@@ -119,9 +140,11 @@ Raft payload gauge and from one another.
 `summary.json` contains schema version, run identity, source/build metadata,
 workload configuration and results, activity timings, exact-row validation,
 100-millisecond process RSS/allocator summaries, storage-sampling semantics,
-and resource assessment. The `bounded_memory`, `bounded_queues`, and
-`production_budgets_met` verdicts remain null.
-`raft_log_reclamation_observed` records only the observed purge activity.
+and resource assessment. Configuration includes `sustained_load_seconds`;
+workload results separately count `sustained_insert_count` beyond the initial
+6,000. The `bounded_memory`, `bounded_queues`, and `production_budgets_met`
+verdicts remain null. `raft_log_reclamation_observed` records only the observed
+purge activity.
 
 ## Limits
 

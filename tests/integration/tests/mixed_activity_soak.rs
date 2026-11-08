@@ -30,7 +30,9 @@ struct Workload {
     reads: AtomicU64,
     read_retries: AtomicU64,
     stop_reads: AtomicBool,
+    stop_writes: AtomicBool,
     pause_writes: AtomicBool,
+    sustained: bool,
     write_errors: Mutex<Vec<String>>,
     read_errors: Mutex<Vec<String>>,
     write_latency: LatencyRecorder,
@@ -38,7 +40,7 @@ struct Workload {
 }
 
 impl Workload {
-    fn new() -> Self {
+    fn new(sustained: bool) -> Self {
         Self {
             next_id: AtomicI32::new(1),
             acknowledged: Mutex::new(BTreeSet::new()),
@@ -48,7 +50,9 @@ impl Workload {
             reads: AtomicU64::new(0),
             read_retries: AtomicU64::new(0),
             stop_reads: AtomicBool::new(false),
+            stop_writes: AtomicBool::new(false),
             pause_writes: AtomicBool::new(false),
+            sustained,
             write_errors: Mutex::new(Vec::new()),
             read_errors: Mutex::new(Vec::new()),
             write_latency: LatencyRecorder::default(),
@@ -90,6 +94,7 @@ impl Workload {
         json!({
             "target_insert_count": TOTAL_INSERTS,
             "acknowledged_insert_count": self.acknowledged_count(),
+            "sustained_insert_count": self.acknowledged_count().saturating_sub(TOTAL_INSERTS as u64),
             "write_attempts": self.write_attempts.load(Ordering::Relaxed),
             "write_retries": self.write_retries.load(Ordering::Relaxed),
             "recovered_uncertain_writes": self.recovered_uncertain_writes.load(Ordering::Relaxed),
@@ -180,11 +185,14 @@ async fn wait_for_acknowledged(workload: &Workload, target: u64) -> Result<()> {
 
 async fn writer(client: Arc<tokio_postgres::Client>, workload: Arc<Workload>) -> Result<()> {
     loop {
+        if workload.stop_writes.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         while workload.pause_writes.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let id = workload.next_id.fetch_add(1, Ordering::Relaxed);
-        if id > TOTAL_INSERTS {
+        if id > TOTAL_INSERTS && !workload.sustained {
             return Ok(());
         }
         let value = value_for(id);
@@ -903,6 +911,7 @@ async fn execute(
     artifact: Arc<SoakArtifact>,
     activities: &mut Vec<Value>,
     parts: &mut ReportParts,
+    sustained_seconds: u64,
 ) -> Result<()> {
     let repository = tempfile::tempdir()?;
     let certificates = tempfile::tempdir()?;
@@ -961,7 +970,7 @@ async fn execute(
         })
         .collect::<std::result::Result<Vec<(SocketAddr, PathBuf)>, _>>()?;
     let sampler = start_sampler(artifact.clone(), targets, phase.clone());
-    let workload = Arc::new(Workload::new());
+    let workload = Arc::new(Workload::new(sustained_seconds > 0));
     parts.workload_handle = Some(workload.clone());
     let mut clients = Vec::new();
     for _ in 0..5 {
@@ -1160,6 +1169,39 @@ async fn execute(
     .await?;
 
     wait_for_acknowledged(&workload, TOTAL_INSERTS as u64).await?;
+    if sustained_seconds > 0 {
+        set_phase(&phase, "sustained_load");
+        let started = Instant::now();
+        let storage_before = allocated_storage(&cluster).await?;
+        let initial_acknowledged = workload.acknowledged_count();
+        let mut last_progress = Instant::now();
+        let mut last_acknowledged = initial_acknowledged;
+        while started.elapsed() < Duration::from_secs(sustained_seconds) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let acknowledged = workload.acknowledged_count();
+            if acknowledged != last_acknowledged {
+                last_acknowledged = acknowledged;
+                last_progress = Instant::now();
+            }
+            if last_progress.elapsed() >= Duration::from_secs(180) {
+                bail!(
+                    "sustained workload made no acknowledged progress for 180 seconds; reached {acknowledged} inserts"
+                );
+            }
+        }
+        workload.stop_writes.store(true, Ordering::Relaxed);
+        let storage_after = allocated_storage(&cluster).await?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let sustained = workload.acknowledged_count() - initial_acknowledged;
+        record_activity(
+            &artifact,
+            activities,
+            "sustained_load",
+            started,
+            json!({"requested_seconds": sustained_seconds, "actual_seconds": elapsed, "acknowledged_inserts": sustained, "acknowledged_inserts_per_second": sustained as f64 / elapsed, "total_acknowledged": workload.acknowledged_count(), "storage_before": storage_detail(&storage_before), "storage_after": storage_detail(&storage_after), "production_budgets_met": null}),
+        )
+        .await?;
+    }
     workload.stop_reads.store(true, Ordering::Relaxed);
     for worker in workers {
         worker.await.context("workload worker panicked")??;
@@ -1197,7 +1239,7 @@ fn git_output(args: &[&str]) -> Option<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
-#[ignore = "bounded PR2 mixed-activity drill; run explicitly"]
+#[ignore = "bounded mixed-activity drill; run explicitly"]
 #[serial_test::serial(cluster)]
 async fn mixed_activity_smoke_drill() {
     let _ = tracing_subscriber::fmt()
@@ -1205,11 +1247,25 @@ async fn mixed_activity_smoke_drill() {
             "nodus_raftstore=error,nodus_raftstore::migration=info,nodus_server=error,nodus_server::migration_coordinator=warn,openraft=error",
         )
         .try_init();
+    let sustained_seconds = std::env::var("NODUS_SOAK_SUSTAIN_SECONDS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("NODUS_SOAK_SUSTAIN_SECONDS must be a nonnegative integer")
+        })
+        .unwrap_or(0);
     let artifact = Arc::new(SoakArtifact::from_environment().unwrap());
     let resources = ProcessResourceMonitor::start();
     let mut activities = Vec::new();
     let mut parts = ReportParts::default();
-    let result = execute(artifact.clone(), &mut activities, &mut parts).await;
+    let result = execute(
+        artifact.clone(),
+        &mut activities,
+        &mut parts,
+        sustained_seconds,
+    )
+    .await;
     if let Some(workload) = &parts.workload_handle {
         parts.workload = workload.summary();
     }
@@ -1239,6 +1295,7 @@ async fn mixed_activity_smoke_drill() {
             "raft_election_timeout_max_ms": 1200,
             "write_path": "legacy",
             "total_insert_target": TOTAL_INSERTS,
+            "sustained_load_seconds": sustained_seconds,
             "value_bytes_excluding_id_prefix": VALUE_BYTES,
             "snapshot_policy_logs_since_last": 5000,
             "install_snapshot_timeout_ms": 30000,

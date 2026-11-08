@@ -70,8 +70,9 @@ reported without a floor.
 Scheduled soak and full-load workflows are deferred. Run the bounded
 [mixed-activity soak](../../benchmarks/workloads/mixed_activity_soak.md)
 locally with `just bench-soak`, and use the full-scale benchmark command above
-for manual captures. The 24-hour release-candidate soak remains a manual step
-on the supported deployment profile.
+for manual captures. `NODUS_SOAK_SUSTAIN_SECONDS` optionally continues the same
+workload for a timed evidence window. The 24-hour release-candidate soak remains
+a manual step on the supported deployment profile after budgets are approved.
 
 ## Measure the external Iceberg reader
 
