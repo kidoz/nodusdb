@@ -132,14 +132,26 @@ Evidence is under `target/sustained-load-2026-11-08/`. SHA-256 values:
 
 - Events: `977634835545f514bb1ad5e904e3158153ab659638740f22b874ec9e8639d2e6`
 - Drill summary: `3d420af40ddb9d5dcc853243c355f1383d0c0b7977be9658cc0fd8e0300c8219`
-- Independent summary: `f1471e1ce14cf99cdff2746968bba06e5656f7523cde071baffc44b29a1f9334`
+- Original independent summary: `f1471e1ce14cf99cdff2746968bba06e5656f7523cde071baffc44b29a1f9334`
+- Duration-independent validation report: `0a029f21487fc414eea9a8812f9b7dccd9bc39129a38fc3fdd58f58f296acf1a`
 - Console log: `10668c48acdd2c47291ed83b7eaeb54e414b39b72458cf3350e9fd50d3d17ceb`
 - Implementation patch: `cbdd73e858aab699862664942fa1ae0b471b9ffaa992b8d262fa02f07906def5`
-- Validator: `6dd53d4d4b76a0c26ff739e92713e4b359eb2ed93c172b921012d272dba46a78`
+- Original validator: `6dd53d4d4b76a0c26ff739e92713e4b359eb2ed93c172b921012d272dba46a78`
 
-Revalidate with `python3 -B target/sustained-load-2026-11-08/summarize.py`.
-Expected output begins with `validated 997 events, 987 storage sample sets, 17
-sustained samples, and exact 6156 rows on three nodes`.
+Revalidate with the repository tool:
+
+```bash
+python3 -B tools/testing/soak_validate.py \
+  target/sustained-load-2026-11-08/run-4 \
+  --console-log target/sustained-load-2026-11-08/run-4-console.log \
+  --expected-sustained-seconds 60 \
+  --output target/sustained-load-2026-11-08/run-4-validation-repeated.json
+```
+
+Expected output begins with `PASSED: 997 events, 17 sustained samples, expected
+rows=6156, correctness failures=0`. The original one-off validator and its hash
+remain listed for historical provenance; the repository tool adds streaming
+resource trends and does not change the unapproved budget status.
 
 ## Remaining limits
 

@@ -149,6 +149,32 @@ workload results separately count `sustained_insert_count` beyond the initial
 verdicts remain null. `raft_log_reclamation_observed` records only the observed
 purge activity.
 
+### Independent validation
+
+Validate a completed run and assert its requested sustained duration independently
+of the test process:
+
+```bash
+python3 -B tools/testing/soak_validate.py target/mixed-activity-sustained \
+  --expected-sustained-seconds 3600
+```
+
+Use `86400` for the 24-hour run so a shorter invocation cannot be mistaken for
+the intended evidence. Add `--console-log PATH` when stdout/stderr was captured;
+this additionally checks transport-error classification and JSON decoding errors.
+The report is written to `RUN_DIR/validation.json` by default. `--output PATH`
+selects another location. Existing reports are not overwritten.
+
+The validator streams events and logs rather than retaining the full artifacts.
+It checks activity success, exact dynamic row totals and secondary indexes,
+reclamation, requested duration, and drained quiet-window queues. It reports
+start/end/delta/extrema and least-squares per-second and per-hour trends for
+sustained RSS, allocator use, logical and allocated storage, available volume,
+and queue depths, plus retry rates and transport-error counts. Sustained trends
+require at least two usable samples; this establishes measurement completeness,
+not stabilization. All budget, bounded-resource, stabilization, and error-budget
+verdicts remain null until maintainers define acceptance thresholds.
+
 ## Limits
 
 - Backup creation and verification are exercised; this drill does not restore
