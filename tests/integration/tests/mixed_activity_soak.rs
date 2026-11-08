@@ -803,18 +803,20 @@ async fn validate_on_every_node(
                         .join("\n"),
                     Err(error) => pg_error(error),
                 };
-                let ready = match client
+                let (ready, ready_error) = match client
                     .query(
                         "SELECT i.indisready FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid WHERE c.relname = $1",
                         &[&"mixed_activity_value_idx"],
                     )
                     .await
                 {
-                    Ok(rows) => rows
-                        .iter()
-                        .map(|row| row.get::<_, bool>(0))
-                        .collect::<Vec<_>>(),
-                    Err(_) => vec![],
+                    Ok(rows) => (
+                        rows.iter()
+                            .map(|row| row.get::<_, bool>(0))
+                            .collect::<Vec<_>>(),
+                        String::new(),
+                    ),
+                    Err(error) => (vec![], pg_error(error)),
                 };
                 let entry_counts = cluster
                     .nodes
@@ -826,8 +828,23 @@ async fn validate_on_every_node(
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let mut meta_applied = Vec::new();
+                let mut catalogs = Vec::new();
+                for node_index in 0..cluster.nodes.len() {
+                    meta_applied.push(
+                        data_group_applied(cluster, node_index, "shard-meta")
+                            .await
+                            .map_or_else(|error| json!(error.to_string()), |value| json!(value)),
+                    );
+                    catalogs.push(
+                        cluster
+                            .admin_get(node_index, "/api/v1/catalog/table?name=mixed_activity_soak")
+                            .await
+                            .unwrap_or_else(|error| json!(error.to_string())),
+                    );
+                }
                 bail!(
-                    "node {} indexed lookup did not return one expected row: {indexed_detail}; entries={entry_counts:?}; ready={ready:?}; plan={plan}",
+                    "node {} indexed lookup did not return one expected row: {indexed_detail}; entries={entry_counts:?}; ready={ready:?}; ready_error={ready_error}; meta_applied={meta_applied:?}; catalogs={catalogs:?}; plan={plan}",
                     index + 1
                 );
             }
