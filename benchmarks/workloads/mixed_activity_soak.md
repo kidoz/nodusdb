@@ -26,6 +26,11 @@ directory must not already contain `events.jsonl`; existing evidence is never
 overwritten. Without the environment variable, a unique directory is created
 below `target/mixed-activity-soak/`.
 
+Prevent host sleep for the whole run: a sleeping host freezes Raft timers and
+can fail the drill after hours of otherwise successful work (the 2026-11-10
+first attempt failed this way). On macOS wrap the command with
+`caffeinate -isu`.
+
 To continue the same read/write workload after the maintenance activities, set
 `NODUS_SOAK_SUSTAIN_SECONDS` to a nonnegative integer. The default is zero and
 preserves the bounded 6,000-row drill. For example, a one-hour evidence run is:
